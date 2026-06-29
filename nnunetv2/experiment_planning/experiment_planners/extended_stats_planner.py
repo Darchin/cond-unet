@@ -2,7 +2,7 @@ import numpy as np
 from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import ExperimentPlanner
 
 
-class ExtendedStatsExperimentPlanner(ExperimentPlanner):
+class ExtendedExperimentPlanner(ExperimentPlanner):
 
     PERCENTILES = [10, 25, 33, 50, 66, 75, 90]
 
