@@ -1,4 +1,4 @@
-from nnunetv2.experiment_planning.experiment_planners.extended_stats_planner import ExtendedExperimentPlanner
+from nnunetv2.experiment_planning.experiment_planners.extended_planner import ExtendedExperimentPlanner
 
 class PhaseOnePlanner(ExtendedExperimentPlanner):
     def plan_experiment(self):
