@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from nnunetv2.training.nnUNetTrainer.variants.benchmarking import nnUNetTrainer_Computation_Metrics
+from nnunetv2.training.nnUNetTrainer.variants.benchmarking.nnUNetTrainer_Computation_Metrics import nnUNetTrainerComputationMetrics
 
 
 class LinearWarmupCosineAnnealingLR:
@@ -41,7 +41,7 @@ class LinearWarmupCosineAnnealingLR:
         return self._last_lr
 
 
-class nnUNetTrainerAdamW(nnUNetTrainer_Computation_Metrics):
+class nnUNetTrainerAdamW(nnUNetTrainerComputationMetrics):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
