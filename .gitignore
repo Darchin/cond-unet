@@ -118,3 +118,6 @@ ENV/
 
 CLAUDE.md
 AGENTS.md
+
+# nnU-Net raw/preprocessing/results directories
+nnUNet_*/
