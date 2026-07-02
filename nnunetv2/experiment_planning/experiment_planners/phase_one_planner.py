@@ -1,9 +1,7 @@
-from nnunetv2.experiment_planning.experiment_planners.extended_planner import ExtendedExperimentPlanner
+from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import ExperimentPlanner
 
-class PhaseOnePlanner(ExtendedExperimentPlanner):
+class PhaseOnePlanner(ExperimentPlanner):
     def plan_experiment(self):
-        super().plan_experiment()
-        
         plans = super().plan_experiment()
         
         plans['configurations'] = {
