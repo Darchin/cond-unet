@@ -5,6 +5,9 @@ from nnunetv2.training.network_architecture.cond_unet import (
     SqueezeAndExcitationBlock,
     Router,
     CondPWConv,
+    DepthwiseConvBlock,
+    InvertedBottleneckBlock,
+    StackedCondInvertedBottleneckBlocks,
 )
 
 
@@ -129,3 +132,85 @@ class TestCondUNetBlocks(unittest.TestCase):
         # N = 2 * 4 * 4 = 32
         self.assertEqual(weight.shape, (32, 16, 8))
         self.assertEqual(bias.shape, (32, 16))
+
+    def test_depthwise_conv_block_forward(self):
+        conv_op = torch.nn.Conv2d
+        norm_op = torch.nn.BatchNorm2d
+        nonlin = torch.nn.ReLU
+        block = DepthwiseConvBlock(
+            conv_op=conv_op,
+            channels=16,
+            kernel_size=3,
+            stride=1,
+            norm_op=norm_op,
+            nonlin=nonlin,
+        )
+        x = torch.randn(2, 16, 8, 8)
+        out = block(x)
+        self.assertEqual(out.shape, (2, 16, 8, 8))
+
+    def test_inverted_bottleneck_block_forward(self):
+        conv_op = torch.nn.Conv2d
+        norm_op = torch.nn.BatchNorm2d
+        nonlin = torch.nn.ReLU
+        
+        # Standard block
+        block_std = InvertedBottleneckBlock(
+            conv_op=conv_op,
+            input_channels=8,
+            output_channels=8,
+            kernel_size=3,
+            stride=1,
+            norm_op=norm_op,
+            nonlin=nonlin,
+            expansion_ratio=2.0,
+        )
+        x = torch.randn(2, 8, 8, 8)
+        out = block_std(x)
+        self.assertEqual(out.shape, (2, 8, 8, 8))
+
+        # Block with SE and CC
+        block_se_cc = InvertedBottleneckBlock(
+            conv_op=conv_op,
+            input_channels=8,
+            output_channels=8,
+            kernel_size=3,
+            stride=1,
+            norm_op=norm_op,
+            nonlin=nonlin,
+            expansion_ratio=2.0,
+            num_experts=3,
+            cc_reduction=0.25,
+            se_reduction=0.25,
+            se=True,
+            cc=True,
+            num_groups=2,
+        )
+        out = block_se_cc(x)
+        self.assertEqual(out.shape, (2, 8, 8, 8))
+
+    def test_stacked_cond_inverted_bottleneck_blocks_forward(self):
+        conv_op = torch.nn.Conv2d
+        norm_op = torch.nn.BatchNorm2d
+        nonlin = torch.nn.ReLU
+        
+        stacked = StackedCondInvertedBottleneckBlocks(
+            n_blocks=3,
+            conv_op=conv_op,
+            input_channels=8,
+            output_channels=16,
+            kernel_size=3,
+            initial_stride=2,
+            norm_op=norm_op,
+            nonlin=nonlin,
+            expansion_ratio=2.0,
+            num_experts=3,
+            cc_reduction=0.25,
+            se_reduction=0.25,
+            se_config=[True, False, True],
+            cc_config=[False, True, True],
+            num_groups=2,
+        )
+        x = torch.randn(2, 8, 16, 16)
+        out = stacked(x)
+        self.assertEqual(out.shape, (2, 16, 8, 8))

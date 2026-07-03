@@ -596,9 +596,38 @@ def _expertify_pointwise(
     conv_block.all_modules[0] = conditional_conv
 
 
+class DepthwiseConvBlock(nn.Module):
+    """Depthwise separable convolution block: DW Conv -> Norm -> Activation."""
+
+    def __init__(
+        self,
+        conv_op: Type[_ConvNd],
+        channels: int,
+        kernel_size: Union[int, List[int], Tuple[int, ...]],
+        stride: Union[int, List[int], Tuple[int, ...]],
+        norm_op: Union[None, Type[nn.Module]] = None,
+        norm_op_kwargs: dict = None,
+        nonlin: Union[None, Type[nn.Module]] = None,
+        nonlin_kwargs: dict = None,
+    ):
+        super().__init__()
+        norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
+        nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
+        self.conv = conv_op(
+            channels, channels, kernel_size, stride,
+            padding=_same_padding(kernel_size),
+            groups=channels, bias=False,
+        )
+        self.norm = norm_op(channels, **norm_op_kwargs) if norm_op is not None else nn.Identity()
+        self.nonlin = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.nonlin(self.norm(self.conv(x)))
+
+
 class InvertedBottleneckBlock(nn.Module):
     """Inverted bottleneck with optional pointwise routing and squeeze-and-excitation.
-    
+
     The basic underlying block format is: PW -> Norm/Act -> DW -> Norm/Act -> PW -> Norm.
     Bias is set to False for all these convolutions as they have a proceeding normalization layer.
     """
@@ -616,11 +645,11 @@ class InvertedBottleneckBlock(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        cc_mlp_reduction: float = 0.125,
+        cc_reduction: float = 0.125,
         tile_size: Union[None, Sequence[int]] = None,
-        se_mlp_reduction: float = 0.125,
-        enable_se: bool = False,
-        use_cc: bool = False,
+        se_reduction: float = 0.125,
+        se: bool = False,
+        cc: bool = False,
         num_groups: int = 1,
     ):
         super().__init__()
@@ -640,20 +669,13 @@ class InvertedBottleneckBlock(nn.Module):
             conv_op, input_channels, self.expanded_channels, 1, 1, False,
             norm_op, norm_op_kwargs, None, None, nonlin, nonlin_kwargs
         )
-        
+
         # Depthwise DW: DW -> Norm/Act
-        self.depthwise_conv = conv_op(
-            self.expanded_channels,
-            self.expanded_channels,
-            kernel_size,
-            self.stride,
-            padding=_same_padding(kernel_size),
-            groups=self.expanded_channels,
-            bias=False,
+        self.depthwise = DepthwiseConvBlock(
+            conv_op, self.expanded_channels, kernel_size, self.stride,
+            norm_op, norm_op_kwargs, nonlin, nonlin_kwargs,
         )
-        self.depthwise_norm = norm_op(self.expanded_channels, **norm_op_kwargs) if norm_op is not None else nn.Identity()
-        self.depthwise_nonlin = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
-        
+
         # PW projection: PW -> Norm
         self.project = ConvDropoutNormReLU(
             conv_op, self.expanded_channels, output_channels, 1, 1, False,
@@ -661,12 +683,12 @@ class InvertedBottleneckBlock(nn.Module):
         )
         self.add_identity = input_channels == output_channels and all(i == 1 for i in self.stride)
 
-        self.num_experts = num_experts if use_cc else 0
-        self.num_groups = num_groups if use_cc else 1
-        if use_cc:
+        self.num_experts = num_experts if cc else 0
+        self.num_groups = num_groups if cc else 1
+        if cc:
             if num_experts <= 0:
                 raise ValueError(
-                    f"CondConv is enabled (use_cc=True) but num_experts is {num_experts}. "
+                    f"CondConv is enabled (cc=True) but num_experts is {num_experts}. "
                     "num_experts must be greater than 0 to configure a dynamic mixture of experts."
                 )
             if num_groups <= 0:
@@ -677,14 +699,14 @@ class InvertedBottleneckBlock(nn.Module):
                 )
 
             self.router = Router(
-                input_channels, num_experts * num_groups, cc_mlp_reduction, nonlin, nonlin_kwargs, tile_size
+                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs, tile_size
             )
             _expertify_pointwise(
-                self.expand, num_experts, cc_mlp_reduction, nonlin, nonlin_kwargs,
+                self.expand, num_experts, cc_reduction, nonlin, nonlin_kwargs,
                 num_groups=num_groups, group_on_out=True
             )
             _expertify_pointwise(
-                self.project, num_experts, cc_mlp_reduction, nonlin, nonlin_kwargs,
+                self.project, num_experts, cc_reduction, nonlin, nonlin_kwargs,
                 num_groups=num_groups, group_on_out=False
             )
         else:
@@ -695,11 +717,11 @@ class InvertedBottleneckBlock(nn.Module):
             if tile_size is None
             else tuple(max(1, tile // step) for tile, step in zip(tile_size, self.stride))
         )
-        self.se = (
+        self.se_block = (
             SqueezeAndExcitationBlock(
-                output_channels, se_mlp_reduction, nonlin, nonlin_kwargs, se_tile_size
+                output_channels, se_reduction, nonlin, nonlin_kwargs, se_tile_size
             )
-            if enable_se
+            if se
             else nn.Identity()
         )
 
@@ -708,14 +730,14 @@ class InvertedBottleneckBlock(nn.Module):
         if self.router is not None:
             scores = self.router(x)
             x = _forward_routed_conv_block(self.expand, x, scores)
-            x = self.depthwise_nonlin(self.depthwise_norm(self.depthwise_conv(x)))
+            x = self.depthwise(x)
             x = _forward_routed_conv_block(self.project, x, scores)
         else:
             x = self.expand(x)
-            x = self.depthwise_nonlin(self.depthwise_norm(self.depthwise_conv(x)))
+            x = self.depthwise(x)
             x = self.project(x)
-            
-        x = self.se(x)
+
+        x = self.se_block(x)
         if self.add_identity:
             x = x + residual
         return x
@@ -747,9 +769,9 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        cc_mlp_reduction: float = 0.125,
+        cc_reduction: float = 0.125,
         tile_size: Union[None, Sequence[int]] = None,
-        se_mlp_reduction: float = 0.125,
+        se_reduction: float = 0.125,
         se_config: List[bool] = None,
         cc_config: List[bool] = None,
         num_groups: int = 1,
@@ -783,11 +805,11 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 nonlin_kwargs=nonlin_kwargs,
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
-                cc_mlp_reduction=cc_mlp_reduction,
+                cc_reduction=cc_reduction,
                 tile_size=block_tile_size,
-                se_mlp_reduction=se_mlp_reduction,
-                enable_se=block_se,
-                use_cc=block_cc,
+                se_reduction=se_reduction,
+                se=block_se,
+                cc=block_cc,
                 num_groups=num_groups,
             )
 
