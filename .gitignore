@@ -121,3 +121,6 @@ AGENTS.md
 
 # nnU-Net raw/preprocessing/results directories
 nnUNet_*/
+
+# Personal development notes
+notes/
