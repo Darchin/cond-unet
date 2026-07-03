@@ -372,6 +372,63 @@ class CondPWConv(nn.Module):
             bound = 1 / math.sqrt(self.in_channels)
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def _blend_experts(
+        self, flat_scores: torch.Tensor
+    ) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
+        """Blend expert weights and biases using routing scores.
+
+        Args:
+            flat_scores: Shape ``[N, num_experts * num_groups]`` where N is either
+                the batch size (global routing) or batch_size * num_tiles (tiled routing).
+
+        Returns:
+            weight: ``[N, out_channels, in_channels]``
+            bias: ``[N, out_channels]`` or None
+        """
+        N = flat_scores.shape[0]
+
+        if self.num_groups == 1:
+            weight = torch.mm(flat_scores, self.weight.flatten(1)).reshape(
+                N, self.out_channels, self.in_channels
+            )
+            bias = torch.mm(flat_scores, self.bias) if self.bias is not None else None
+            return weight, bias
+
+        G = self.num_groups
+        E = self.num_experts
+        scores_grouped = flat_scores.reshape(N, G, E)
+
+        if self.group_on_out:
+            C_out_g = self.out_channels // G
+            w_reshaped = self.weight.reshape(E, G, C_out_g, self.in_channels)
+            w_permuted = w_reshaped.permute(1, 0, 2, 3).reshape(G, E, -1)
+            blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
+            weight = blended.squeeze(2).reshape(N, self.out_channels, self.in_channels)
+            if self.bias is not None:
+                b_reshaped = self.bias.reshape(E, G, C_out_g).permute(1, 0, 2)
+                blended_bias = torch.matmul(scores_grouped.unsqueeze(2), b_reshaped.unsqueeze(0))
+                bias = blended_bias.squeeze(2).reshape(N, self.out_channels)
+            else:
+                bias = None
+        else:
+            C_in_g = self.in_channels // G
+            w_reshaped = self.weight.reshape(E, self.out_channels, G, C_in_g)
+            w_permuted = w_reshaped.permute(2, 0, 1, 3).reshape(G, E, -1)
+            blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
+            weight = (
+                blended.squeeze(2)
+                .reshape(N, G, self.out_channels, C_in_g)
+                .permute(0, 2, 1, 3)
+                .reshape(N, self.out_channels, self.in_channels)
+            )
+            if self.bias is not None:
+                scores_mean = scores_grouped.mean(dim=1)
+                bias = torch.mm(scores_mean, self.bias)
+            else:
+                bias = None
+
+        return weight, bias
+
     def forward(self, x: torch.Tensor, scores: torch.Tensor = None) -> torch.Tensor:
         if scores is None:
             if self.router is None:
@@ -380,52 +437,15 @@ class CondPWConv(nn.Module):
 
         batch_size = x.shape[0]
 
-        # Sample-level routing: scores is of shape [batch_size, num_groups * num_experts]
+        # Sample-level routing: scores is [batch_size, num_groups * num_experts]
         if scores.ndim == 2:
-            if self.num_groups == 1:
-                weight = torch.mm(scores, self.weight.flatten(1)).reshape(
-                    batch_size, self.out_channels, self.in_channels
-                )
-                output = torch.bmm(weight, x.flatten(2))
-                if self.bias is not None:
-                    mixed_bias = torch.mm(scores, self.bias)
-                    output = output + mixed_bias.unsqueeze(-1)
-            else:
-                N = batch_size
-                G = self.num_groups
-                E = self.num_experts
-                scores_grouped = scores.reshape(N, G, E)
-                if self.group_on_out:
-                    C_out_g = self.out_channels // G
-                    w_reshaped = self.weight.reshape(E, G, C_out_g, self.in_channels)
-                    w_permuted = w_reshaped.permute(1, 0, 2, 3).reshape(G, E, -1)
-                    blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
-                    weight = blended.squeeze(2).reshape(N, self.out_channels, self.in_channels)
-                    if self.bias is not None:
-                        b_reshaped = self.bias.reshape(E, G, C_out_g).permute(1, 0, 2)
-                        blended_bias = torch.matmul(scores_grouped.unsqueeze(2), b_reshaped.unsqueeze(0))
-                        mixed_bias = blended_bias.squeeze(2).reshape(N, self.out_channels)
-                    else:
-                        mixed_bias = None
-                else:
-                    C_in_g = self.in_channels // G
-                    w_reshaped = self.weight.reshape(E, self.out_channels, G, C_in_g)
-                    w_permuted = w_reshaped.permute(2, 0, 1, 3).reshape(G, E, -1)
-                    blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
-                    weight = blended.squeeze(2).reshape(N, G, self.out_channels, C_in_g).permute(0, 2, 1, 3).reshape(N, self.out_channels, self.in_channels)
-                    if self.bias is not None:
-                        scores_mean = scores_grouped.mean(dim=1)
-                        mixed_bias = torch.mm(scores_mean, self.bias)
-                    else:
-                        mixed_bias = None
-
-                output = torch.bmm(weight, x.flatten(2))
-                if mixed_bias is not None:
-                    output = output + mixed_bias.unsqueeze(-1)
-
+            weight, bias = self._blend_experts(scores)
+            output = torch.bmm(weight, x.flatten(2))
+            if bias is not None:
+                output = output + bias.unsqueeze(-1)
             return output.reshape(batch_size, self.out_channels, *x.shape[2:])
 
-        # Region/Patch-level routing: scores is of shape [batch_size, *grid_shape, num_groups * num_experts]
+        # Region/Patch-level routing: scores is [batch_size, *grid_shape, num_groups * num_experts]
         grid_shape = scores.shape[1:-1]
         if scores.shape[0] != batch_size or len(grid_shape) != self.spatial_dims:
             raise ValueError("router score grid does not match the convolution input")
@@ -447,46 +467,11 @@ class CondPWConv(nn.Module):
         )
 
         flat_scores = scores.reshape(-1, self.num_experts * self.num_groups)
+        weight, bias = self._blend_experts(flat_scores)
 
-        if self.num_groups == 1:
-            weight = torch.mm(flat_scores, self.weight.flatten(1)).reshape(
-                -1, self.out_channels, self.in_channels
-            )
-            output = torch.bmm(weight, tiled_input)
-            if self.bias is not None:
-                output.add_(torch.mm(flat_scores, self.bias).unsqueeze(-1))
-        else:
-            N = flat_scores.shape[0]
-            G = self.num_groups
-            E = self.num_experts
-            scores_grouped = flat_scores.reshape(N, G, E)
-            if self.group_on_out:
-                C_out_g = self.out_channels // G
-                w_reshaped = self.weight.reshape(E, G, C_out_g, self.in_channels)
-                w_permuted = w_reshaped.permute(1, 0, 2, 3).reshape(G, E, -1)
-                blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
-                weight = blended.squeeze(2).reshape(N, self.out_channels, self.in_channels)
-                if self.bias is not None:
-                    b_reshaped = self.bias.reshape(E, G, C_out_g).permute(1, 0, 2)
-                    blended_bias = torch.matmul(scores_grouped.unsqueeze(2), b_reshaped.unsqueeze(0))
-                    mixed_bias = blended_bias.squeeze(2).reshape(N, self.out_channels)
-                else:
-                    mixed_bias = None
-            else:
-                C_in_g = self.in_channels // G
-                w_reshaped = self.weight.reshape(E, self.out_channels, G, C_in_g)
-                w_permuted = w_reshaped.permute(2, 0, 1, 3).reshape(G, E, -1)
-                blended = torch.matmul(scores_grouped.unsqueeze(2), w_permuted.unsqueeze(0))
-                weight = blended.squeeze(2).reshape(N, G, self.out_channels, C_in_g).permute(0, 2, 1, 3).reshape(N, self.out_channels, self.in_channels)
-                if self.bias is not None:
-                    scores_mean = scores_grouped.mean(dim=1)
-                    mixed_bias = torch.mm(scores_mean, self.bias)
-                else:
-                    mixed_bias = None
-
-            output = torch.bmm(weight, tiled_input)
-            if mixed_bias is not None:
-                output.add_(mixed_bias.unsqueeze(-1))
+        output = torch.bmm(weight, tiled_input)
+        if bias is not None:
+            output.add_(bias.unsqueeze(-1))
 
         tiled_shape = [batch_size, *grid_shape, self.out_channels, *tile_shape]
         channel_axis = 1 + self.spatial_dims
