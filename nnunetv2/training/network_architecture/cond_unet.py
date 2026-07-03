@@ -1179,6 +1179,9 @@ class CondUNetDecoder(nn.Module):
         return output
 
 
+_sentinel = object()
+
+
 class CondUNet(AbstractDynamicNetworkArchitectures):
     def __init__(
         self,
@@ -1201,10 +1204,26 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         deep_supervision: bool = False,
         encoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
         decoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
-        upsample_mode: str = "linear",
-        stem: Union[StemConfig, dict, None] = None,
-        se: Union[SEConfig, dict, None] = None,
-        cc: Union[CCConfig, dict, None] = None,
+        upsample_mode: str = _sentinel,
+        stem: Union[StemConfig, dict, None] = _sentinel,
+        se: Union[SEConfig, dict, None] = _sentinel,
+        cc: Union[CCConfig, dict, None] = _sentinel,
+        # Legacy parameters for backwards-compatibility:
+        encoder_se: Union[bool, List[bool], List[List[bool]], None] = None,
+        decoder_se: Union[bool, List[bool], List[List[bool]], None] = None,
+        se_mlp_reduction: Optional[float] = None,
+        tile_size: Union[None, List[int], Tuple[int, ...]] = None,
+        encoder_cc: Union[bool, List[bool], List[List[bool]], None] = None,
+        decoder_cc: Union[bool, List[bool], List[List[bool]], None] = None,
+        cc_mlp_reduction: Optional[float] = None,
+        encoder_num_experts: Optional[IntConfig] = None,
+        decoder_num_experts: Optional[IntConfig] = None,
+        encoder_num_groups: Optional[IntConfig] = None,
+        decoder_num_groups: Optional[IntConfig] = None,
+        stem_channels: Optional[int] = None,
+        stem_kernel_size: Optional[KernelConfig] = None,
+        stem_stride: Optional[KernelConfig] = None,
+        linear_upsampling: Optional[bool] = None,
     ):
         super().__init__()
         self.key_to_encoder = "encoder.stages"
@@ -1219,6 +1238,127 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
                 f"features_per_stage must be explicitly provided as a sequence of integers, "
                 f"not a single integer: {features_per_stage}"
             )
+
+        # Check if new parameters were explicitly provided
+        stem_provided = stem is not _sentinel
+        se_provided = se is not _sentinel
+        cc_provided = cc is not _sentinel
+        upsample_mode_provided = upsample_mode is not _sentinel
+
+        # If not provided, assign defaults
+        if not stem_provided:
+            stem = None
+        if not se_provided:
+            se = None
+        if not cc_provided:
+            cc = None
+        if not upsample_mode_provided:
+            upsample_mode = "linear"
+
+        # Check if legacy parameters are provided (not None)
+        legacy_params_provided = {
+            "encoder_se": encoder_se,
+            "decoder_se": decoder_se,
+            "se_mlp_reduction": se_mlp_reduction,
+            "tile_size": tile_size,
+            "encoder_cc": encoder_cc,
+            "decoder_cc": decoder_cc,
+            "cc_mlp_reduction": cc_mlp_reduction,
+            "encoder_num_experts": encoder_num_experts,
+            "decoder_num_experts": decoder_num_experts,
+            "encoder_num_groups": encoder_num_groups,
+            "decoder_num_groups": decoder_num_groups,
+            "stem_channels": stem_channels,
+            "stem_kernel_size": stem_kernel_size,
+            "stem_stride": stem_stride,
+            "linear_upsampling": linear_upsampling,
+        }
+        provided_legacy = [k for k, v in legacy_params_provided.items() if v is not None]
+
+        if provided_legacy:
+            import warnings
+            warnings.warn(
+                f"Legacy flat parameters {provided_legacy} are deprecated and will be removed in a future version. "
+                "Please use 'stem', 'se', or 'cc' configuration objects instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # Check for conflicts between new and legacy parameters for the same feature
+        # 1. Stem
+        legacy_stem = (stem_channels, stem_kernel_size, stem_stride)
+        if stem_provided and any(v is not None for v in legacy_stem):
+            raise ValueError(
+                "Cannot specify both the new 'stem' configuration and legacy stem parameters "
+                f"('stem_channels', 'stem_kernel_size', 'stem_stride')."
+            )
+
+        # 2. SE
+        legacy_se = (encoder_se, decoder_se, se_mlp_reduction)
+        if se_provided and (any(v is not None for v in legacy_se) or tile_size is not None):
+            raise ValueError(
+                "Cannot specify both the new 'se' configuration and legacy SE parameters "
+                "('encoder_se', 'decoder_se', 'se_mlp_reduction', 'tile_size')."
+            )
+
+        # 3. CC
+        legacy_cc = (
+            encoder_cc,
+            decoder_cc,
+            cc_mlp_reduction,
+            encoder_num_experts,
+            decoder_num_experts,
+            encoder_num_groups,
+            decoder_num_groups,
+        )
+        if cc_provided and (any(v is not None for v in legacy_cc) or tile_size is not None):
+            raise ValueError(
+                "Cannot specify both the new 'cc' configuration and legacy CC parameters "
+                "('encoder_cc', 'decoder_cc', 'cc_mlp_reduction', 'encoder_num_experts', "
+                "'decoder_num_experts', 'encoder_num_groups', 'decoder_num_groups', 'tile_size')."
+            )
+
+        # 4. Upsampling
+        if upsample_mode_provided and linear_upsampling is not None:
+            raise ValueError(
+                "Cannot specify both the new 'upsample_mode' and legacy 'linear_upsampling' parameters."
+            )
+
+        # Map legacy parameters to new configurations if they were not provided
+        if not stem_provided:
+            s_channels = stem_channels
+            s_kernel_size = stem_kernel_size if stem_kernel_size is not None else 3
+            s_stride = stem_stride if stem_stride is not None else 1
+            stem = StemConfig(channels=s_channels, kernel_size=s_kernel_size, stride=s_stride)
+
+        if not se_provided:
+            enc_se = encoder_se if encoder_se is not None else False
+            dec_se = decoder_se if decoder_se is not None else False
+            red_se = se_mlp_reduction if se_mlp_reduction is not None else 0.125
+            se = SEConfig(reduction=red_se, encoder=enc_se, decoder=dec_se, tile_size=tile_size)
+
+        if not cc_provided:
+            enc_cc = encoder_cc if encoder_cc is not None else False
+            dec_cc = decoder_cc if decoder_cc is not None else False
+            red_cc = cc_mlp_reduction if cc_mlp_reduction is not None else 0.125
+            num_exp_enc = encoder_num_experts if encoder_num_experts is not None else 0
+            num_exp_dec = decoder_num_experts if decoder_num_experts is not None else 0
+            num_grp_enc = encoder_num_groups if encoder_num_groups is not None else 1
+            num_grp_dec = decoder_num_groups if decoder_num_groups is not None else 1
+            cc = CCConfig(
+                reduction=red_cc,
+                encoder=enc_cc,
+                decoder=dec_cc,
+                encoder_num_experts=num_exp_enc,
+                decoder_num_experts=num_exp_dec,
+                encoder_num_groups=num_grp_enc,
+                decoder_num_groups=num_grp_dec,
+                tile_size=tile_size,
+            )
+
+        if not upsample_mode_provided:
+            if linear_upsampling is not None:
+                upsample_mode = "linear" if linear_upsampling else "transposed"
 
         # Normalize config dataclasses (supports dict from JSON plans)
         stem = _normalize_config(stem, StemConfig)

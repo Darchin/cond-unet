@@ -234,3 +234,66 @@ class TestCondUNetIntegration:
                 se={"encoder": True, "tile_size": [16, 16]},
                 cc={"encoder": True, "encoder_num_experts": 2, "tile_size": [8, 8]},
             )
+
+    def test_legacy_flat_parameters_compatibility(self):
+        # 1. Test instantiating with legacy flat parameters maps correctly and runs a forward pass
+        with pytest.warns(DeprecationWarning):
+            model = _make_base_model(
+                encoder_se=True,
+                decoder_se=True,
+                se_mlp_reduction=0.25,
+                tile_size=[16, 16],
+                encoder_cc=True,
+                decoder_cc=True,
+                cc_mlp_reduction=0.25,
+                encoder_num_experts=2,
+                decoder_num_experts=2,
+                encoder_num_groups=2,
+                decoder_num_groups=2,
+                stem_channels=8,
+                stem_kernel_size=5,
+                stem_stride=2,
+                linear_upsampling=False,
+            )
+        
+        # Verify the configurations were mapped correctly internally
+        # Check stem
+        assert model.encoder.stem.convs[0].conv.out_channels == 8
+        assert model.encoder.stem.convs[0].conv.kernel_size == (5, 5)
+        assert model.encoder.stem.convs[0].conv.stride == (2, 2)
+        
+        # Check upsample_mode (linear_upsampling=False => upsample_mode="transposed")
+        assert model.decoder.upsample_mode == "transposed"
+        
+        # Verify forward pass works
+        x = torch.randn(1, 1, 32, 32)
+        out = model(x)
+        assert out.shape == (1, 2, 32, 32)
+
+        # 2. Test conflict: stem config and legacy stem parameters
+        with pytest.raises(ValueError, match="Cannot specify both.*stem"):
+            _make_base_model(
+                stem={"channels": 8},
+                stem_channels=8,
+            )
+
+        # 3. Test conflict: se config and legacy se parameters
+        with pytest.raises(ValueError, match="Cannot specify both.*se"):
+            _make_base_model(
+                se={"encoder": True},
+                encoder_se=True,
+            )
+
+        # 4. Test conflict: cc config and legacy cc parameters
+        with pytest.raises(ValueError, match="Cannot specify both.*cc"):
+            _make_base_model(
+                cc={"encoder": True, "encoder_num_experts": 2},
+                encoder_cc=True,
+            )
+
+        # 5. Test conflict: upsample_mode and legacy linear_upsampling
+        with pytest.raises(ValueError, match="Cannot specify both.*upsample_mode"):
+            _make_base_model(
+                upsample_mode="transposed",
+                linear_upsampling=True,
+            )
