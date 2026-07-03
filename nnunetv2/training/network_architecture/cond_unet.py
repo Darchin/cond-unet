@@ -1,4 +1,5 @@
 import math
+import warnings
 from numbers import Real
 from typing import List, Sequence, Tuple, Type, Union
 
@@ -1276,7 +1277,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         provided_legacy = [k for k, v in legacy_params_provided.items() if v is not None]
 
         if provided_legacy:
-            import warnings
             warnings.warn(
                 f"Legacy flat parameters {provided_legacy} are deprecated and will be removed in a future version. "
                 "Please use 'stem', 'se', or 'cc' configuration objects instead.",

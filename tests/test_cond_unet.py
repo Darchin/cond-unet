@@ -109,6 +109,45 @@ class TestExpandIntParam:
         assert _expand_int_param(0, 2, "test", min_value=0) == [0, 0]
 
 
+class TestExpandBlockConfig:
+    def test_scalar_bool(self):
+        assert _expand_block_config(True, 3, [2, 1, 3], "test") == [
+            [True, True],
+            [True],
+            [True, True, True],
+        ]
+
+    def test_list_of_bools(self):
+        assert _expand_block_config([True, False, True], 3, [2, 1, 3], "test") == [
+            [True, True],
+            [False],
+            [True, True, True],
+        ]
+
+    def test_nested_list_of_bools(self):
+        assert _expand_block_config([[True, False], [False], [True, True, False]], 3, [2, 1, 3], "test") == [
+            [True, False],
+            [False],
+            [True, True, False],
+        ]
+
+    def test_invalid_type_raises(self):
+        with pytest.raises(ValueError, match="must be a boolean or a sequence"):
+            _expand_block_config(42, 3, [2, 1, 3], "test")
+
+    def test_invalid_stage_count_raises(self):
+        with pytest.raises(ValueError, match="Expected.*to contain exactly 3 values"):
+            _expand_block_config([True, False], 3, [2, 1, 3], "test")
+
+    def test_invalid_block_count_raises(self):
+        with pytest.raises(ValueError, match="Expected.*to contain exactly 2 values"):
+            _expand_block_config([[True, False, True], [False], [True, True, False]], 3, [2, 1, 3], "test")
+
+    def test_non_boolean_values_raises(self):
+        with pytest.raises(ValueError, match="All values.*must be booleans"):
+            _expand_block_config([[True, "not_a_bool"], [False], [True, True, False]], 3, [2, 1, 3], "test")
+
+
 # --- Module tests ---
 
 class TestTiledPoolMLP:
