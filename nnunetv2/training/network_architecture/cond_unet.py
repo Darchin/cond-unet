@@ -195,6 +195,66 @@ def _interpolation_mode(conv_op: Type[_ConvNd]) -> str:
     return "linear"
 
 
+class TiledPoolMLP(nn.Module):
+    """Pool-then-MLP module with optional spatial tiling.
+
+    When ``tile_size`` is None, performs global average pooling (standard behavior).
+    When provided, the input is partitioned into a grid of tiles and each tile is
+    pooled and processed independently, enabling spatially-varying attention/routing.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        reduction: float,
+        nonlin: Union[None, Type[nn.Module]],
+        nonlin_kwargs: dict = None,
+        final_activation: Union[None, Type[nn.Module]] = nn.Sigmoid,
+        tile_size: Union[None, Sequence[int]] = None,
+    ):
+        super().__init__()
+        if reduction <= 0:
+            raise ValueError("reduction must be greater than 0")
+        if tile_size is not None and any(tile <= 0 for tile in tile_size):
+            raise ValueError("tile_size values must be greater than 0")
+        self.tile_size = None if tile_size is None else tuple(tile_size)
+        hidden_channels = max(1, round(input_channels * reduction))
+        nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
+        activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
+        layers = [
+            nn.Linear(input_channels, hidden_channels),
+            activation,
+            nn.Linear(hidden_channels, output_channels),
+        ]
+        if final_activation is not None:
+            layers.append(final_activation())
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns pooled MLP output.
+
+        - Global mode: shape ``[B, output_channels]``
+        - Tiled mode: shape ``[B, *grid_shape, output_channels]``
+        """
+        spatial_dims = x.ndim - 2
+        if self.tile_size is None:
+            return self.mlp(x.mean(dim=tuple(range(2, x.ndim))))
+
+        if len(self.tile_size) != spatial_dims:
+            raise ValueError(
+                f"tile_size has {len(self.tile_size)} dimensions, expected {spatial_dims}"
+            )
+        output_grid = tuple(
+            max(1, spatial_size // tile_size)
+            for spatial_size, tile_size in zip(x.shape[2:], self.tile_size)
+        )
+        adaptive_avg_pool = (
+            F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d
+        )[spatial_dims - 1]
+        return self.mlp(adaptive_avg_pool(x, output_grid).movedim(1, -1))
+
+
 class SqueezeAndExcitationBlock(nn.Module):
     """Squeeze-and-excitation with independently recalibrated spatial tiles."""
 
@@ -207,39 +267,17 @@ class SqueezeAndExcitationBlock(nn.Module):
         tile_size: Union[None, Sequence[int]] = None,
     ):
         super().__init__()
-        if reduction <= 0:
-            raise ValueError("reduction must be greater than 0")
-        if tile_size is not None and any(tile <= 0 for tile in tile_size):
-            raise ValueError("tile_size values must be greater than 0")
-        self.tile_size = None if tile_size is None else tuple(tile_size)
-        hidden_channels = max(1, round(channels * reduction))
-        nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
-        activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, hidden_channels),
-            activation,
-            nn.Linear(hidden_channels, channels),
-            nn.Sigmoid(),
+        self.pool_mlp = TiledPoolMLP(
+            channels, channels, reduction, nonlin, nonlin_kwargs,
+            final_activation=nn.Sigmoid, tile_size=tile_size,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        spatial_dims = x.ndim - 2
-        if self.tile_size is None:
-            scale = self.mlp(x.mean(dim=tuple(range(2, x.ndim))))
+        scale = self.pool_mlp(x)
+        if self.pool_mlp.tile_size is None:
+            spatial_dims = x.ndim - 2
             return x * scale.reshape(x.shape[0], x.shape[1], *([1] * spatial_dims))
-        if len(self.tile_size) != spatial_dims:
-            raise ValueError(
-                f"tile_size has {len(self.tile_size)} dimensions, expected {spatial_dims}"
-            )
-
-        output_grid = tuple(
-            max(1, spatial_size // tile_size)
-            for spatial_size, tile_size in zip(x.shape[2:], self.tile_size)
-        )
-        adaptive_avg_pool = (F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d)[
-            spatial_dims - 1
-        ]
-        scale = self.mlp(adaptive_avg_pool(x, output_grid).movedim(1, -1)).movedim(-1, 1)
+        scale = scale.movedim(-1, 1)
         scale = F.interpolate(scale, size=x.shape[2:], mode="nearest")
         return x * scale
 
@@ -251,43 +289,20 @@ class Router(nn.Module):
         self,
         input_channels: int,
         num_experts: int,
-        router_reduction: float,
+        reduction: float,
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
         tile_size: Union[None, Sequence[int]] = None,
     ):
         super().__init__()
-        if router_reduction <= 0:
-            raise ValueError("router_reduction must be greater than 0")
-        if tile_size is not None and any(tile <= 0 for tile in tile_size):
-            raise ValueError("tile_size values must be greater than 0")
-        self.tile_size = None if tile_size is None else tuple(tile_size)
-        hidden_channels = max(1, round(input_channels * router_reduction))
-        nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
-        activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_channels, hidden_channels),
-            activation,
-            nn.Linear(hidden_channels, num_experts),
-            nn.Sigmoid(),
+        self.pool_mlp = TiledPoolMLP(
+            input_channels, num_experts, reduction, nonlin, nonlin_kwargs,
+            final_activation=nn.Sigmoid, tile_size=tile_size,
         )
+        self.tile_size = self.pool_mlp.tile_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tile_size is None:
-            return self.mlp(x.mean(dim=tuple(range(2, x.ndim))))
-        if len(self.tile_size) != x.ndim - 2:
-            raise ValueError(
-                f"tile_size has {len(self.tile_size)} dimensions, expected {x.ndim - 2}"
-            )
-
-        output_grid = tuple(
-            max(1, spatial_size // tile_size)
-            for spatial_size, tile_size in zip(x.shape[2:], self.tile_size)
-        )
-        adaptive_avg_pool = (F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d)[
-            x.ndim - 3
-        ]
-        return self.mlp(adaptive_avg_pool(x, output_grid).movedim(1, -1))
+        return self.pool_mlp(x)
 
 
 class CondPWConv(nn.Module):
