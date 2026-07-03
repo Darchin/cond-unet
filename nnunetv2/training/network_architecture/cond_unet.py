@@ -846,7 +846,7 @@ class CondUNetEncoder(nn.Module):
         conv_op: Type[_ConvNd],
         kernel_sizes: Union[int, List[int], Tuple[int, ...]],
         strides: Union[int, List[int], Tuple[int, ...]],
-        encoder_n_blocks_per_stage: Union[int, List[int], Tuple[int, ...]],
+        n_blocks_per_stage: Union[int, List[int], Tuple[int, ...]],
         conv_bias: bool = False,
         norm_op: Union[None, Type[nn.Module]] = None,
         norm_op_kwargs: dict = None,
@@ -854,17 +854,17 @@ class CondUNetEncoder(nn.Module):
         dropout_op_kwargs: dict = None,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
-        encoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
+        expansion_ratio: Union[float, Sequence[float]] = 3.0,
         return_skips: bool = True,
         stem_channels: int = None,
         stem_kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
-        cc_mlp_reduction: float = 0.125,
+        cc_reduction: float = 0.125,
         tile_size: Union[None, Sequence[int]] = None,
-        se_mlp_reduction: float = 0.125,
-        encoder_se: Union[bool, List[bool], List[List[bool]]] = False,
-        encoder_cc: Union[bool, List[bool], List[List[bool]]] = False,
+        se_reduction: float = 0.125,
+        se: BoolConfig = False,
+        cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
     ):
         super().__init__()
@@ -877,43 +877,45 @@ class CondUNetEncoder(nn.Module):
         if len(features_per_stage) != n_stages:
             raise ValueError(f"features_per_stage must contain exactly {n_stages} values")
 
-        encoder_n_blocks_per_stage = (
-            [encoder_n_blocks_per_stage] * n_stages
-            if isinstance(encoder_n_blocks_per_stage, int)
-            else list(encoder_n_blocks_per_stage)
+        n_blocks_per_stage = (
+            [n_blocks_per_stage] * n_stages
+            if isinstance(n_blocks_per_stage, int)
+            else list(n_blocks_per_stage)
         )
         strides = [strides] * n_stages if isinstance(strides, int) else list(strides)
-        if len(encoder_n_blocks_per_stage) != n_stages:
-            raise ValueError(f"encoder_n_blocks_per_stage must contain exactly {n_stages} values")
+        if len(n_blocks_per_stage) != n_stages:
+            raise ValueError(f"n_blocks_per_stage must contain exactly {n_stages} values")
         if len(strides) != n_stages:
             raise ValueError(f"strides must contain exactly {n_stages} values")
         kernel_sizes = _normalize_kernel_sizes(
             conv_op, kernel_sizes, n_stages, [3] * convert_conv_op_to_dim(conv_op)
         )
         self.num_experts = _expand_int_param(
-            num_experts, n_stages, "encoder_num_experts", min_value=0
+            num_experts, n_stages, "num_experts", min_value=0
         )
         self.num_groups = _expand_int_param(
-            num_groups, n_stages, "encoder_num_groups", min_value=1
+            num_groups, n_stages, "num_groups", min_value=1
         )
         self.expansion_ratios = _expand_expansion_ratios(
-            encoder_expansion_ratio, n_stages, "encoder_expansion_ratio"
+            expansion_ratio, n_stages, "expansion_ratio"
         )
 
         # Generate structural configs for SE and CC blocks
         self.se_config = _expand_block_config(
-            encoder_se, n_stages, encoder_n_blocks_per_stage, "encoder_se"
+            se, n_stages, n_blocks_per_stage, "se"
         )
         self.cc_config = _expand_block_config(
-            encoder_cc, n_stages, encoder_n_blocks_per_stage, "encoder_cc"
+            cc, n_stages, n_blocks_per_stage, "cc"
         )
 
         # Validate that stages using CondConv have valid expert counts
         for stage_idx in range(n_stages):
             if any(self.cc_config[stage_idx]) and self.num_experts[stage_idx] <= 0:
                 raise ValueError(
-                    f"CondConv is enabled in encoder stage {stage_idx} (block-level configs: {self.cc_config[stage_idx]}), "
-                    f"but num_experts for this stage is {self.num_experts[stage_idx]}. It must be greater than 0."
+                    f"CondConv is enabled in encoder stage {stage_idx} "
+                    f"(block-level configs: {self.cc_config[stage_idx]}), "
+                    f"but num_experts for this stage is {self.num_experts[stage_idx]}. "
+                    f"It must be greater than 0."
                 )
 
         stem_channels = features_per_stage[0] if stem_channels is None else stem_channels
@@ -931,7 +933,7 @@ class CondUNetEncoder(nn.Module):
             ]
         else:
             current_tile_size = None
-        
+
         # Stem applies no non-linearity (only Conv + Norm)
         self.stem = StackedConvBlocks(
             1,
@@ -962,23 +964,23 @@ class CondUNetEncoder(nn.Module):
                 stage_tile_sizes.append(tuple(current_tile_size))
             stages.append(
                 StackedCondInvertedBottleneckBlocks(
-                    encoder_n_blocks_per_stage[stage_idx],
-                    conv_op,
-                    stage_input_channels,
-                    features_per_stage[stage_idx],
-                    kernel_sizes[stage_idx],
-                    strides[stage_idx],
-                    norm_op,
-                    norm_op_kwargs,
-                    nonlin,
-                    nonlin_kwargs,
-                    self.expansion_ratios[stage_idx],
-                    self.num_experts[stage_idx],
-                    cc_mlp_reduction,
-                    current_tile_size,
-                    se_mlp_reduction,
-                    self.se_config[stage_idx],
-                    self.cc_config[stage_idx],
+                    n_blocks=n_blocks_per_stage[stage_idx],
+                    conv_op=conv_op,
+                    input_channels=stage_input_channels,
+                    output_channels=features_per_stage[stage_idx],
+                    kernel_size=kernel_sizes[stage_idx],
+                    initial_stride=strides[stage_idx],
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    expansion_ratio=self.expansion_ratios[stage_idx],
+                    num_experts=self.num_experts[stage_idx],
+                    cc_reduction=cc_reduction,
+                    tile_size=current_tile_size,
+                    se_reduction=se_reduction,
+                    se_config=self.se_config[stage_idx],
+                    cc_config=self.cc_config[stage_idx],
                     num_groups=self.num_groups[stage_idx],
                 )
             )
@@ -1021,67 +1023,70 @@ class CondUNetDecoder(nn.Module):
         self,
         encoder: CondUNetEncoder,
         num_classes: int,
-        decoder_n_blocks_per_stage: Union[int, Tuple[int, ...], List[int]],
+        n_blocks_per_stage: Union[int, Tuple[int, ...], List[int]],
         deep_supervision: bool,
-        decoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
+        expansion_ratio: Union[float, Sequence[float]] = 3.0,
         num_experts: Union[int, Sequence[int]] = 0,
-        cc_mlp_reduction: float = 0.125,
-        linear_upsampling: bool = True,
-        se_mlp_reduction: float = 0.125,
-        decoder_se: Union[bool, List[bool], List[List[bool]]] = False,
-        decoder_cc: Union[bool, List[bool], List[List[bool]]] = False,
+        cc_reduction: float = 0.125,
+        upsample_mode: str = "linear",
+        se_reduction: float = 0.125,
+        se: BoolConfig = False,
+        cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
     ):
         super().__init__()
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
-        self.linear_upsampling = linear_upsampling
-        self.mode = _interpolation_mode(encoder.conv_op)
+        self.upsample_mode = upsample_mode
+        self.interp_mode = _interpolation_mode(encoder.conv_op)
         n_stages_encoder = len(encoder.output_channels)
         _validate_native_resolution_decoder(encoder.strides)
-        decoder_n_blocks_per_stage = (
-            [decoder_n_blocks_per_stage] * (n_stages_encoder - 1)
-            if isinstance(decoder_n_blocks_per_stage, int)
-            else list(decoder_n_blocks_per_stage)
+        n_blocks_per_stage = (
+            [n_blocks_per_stage] * (n_stages_encoder - 1)
+            if isinstance(n_blocks_per_stage, int)
+            else list(n_blocks_per_stage)
         )
-        if len(decoder_n_blocks_per_stage) != n_stages_encoder - 1:
+        if len(n_blocks_per_stage) != n_stages_encoder - 1:
             raise ValueError(
-                f"decoder_n_blocks_per_stage must contain exactly {n_stages_encoder - 1} values"
+                f"n_blocks_per_stage must contain exactly {n_stages_encoder - 1} values"
             )
         self.num_experts = _expand_int_param(
-            num_experts, n_stages_encoder - 1, "decoder_num_experts", min_value=0
+            num_experts, n_stages_encoder - 1, "num_experts", min_value=0
         )
         self.num_groups = _expand_int_param(
-            num_groups, n_stages_encoder - 1, "decoder_num_groups", min_value=1
+            num_groups, n_stages_encoder - 1, "num_groups", min_value=1
         )
         self.expansion_ratios = _expand_expansion_ratios(
-            decoder_expansion_ratio, n_stages_encoder - 1, "decoder_expansion_ratio"
+            expansion_ratio, n_stages_encoder - 1, "expansion_ratio"
         )
 
         # Generate structural configs for SE and CC blocks
         self.se_config = _expand_block_config(
-            decoder_se, n_stages_encoder - 1, decoder_n_blocks_per_stage, "decoder_se"
+            se, n_stages_encoder - 1, n_blocks_per_stage, "se"
         )
         self.cc_config = _expand_block_config(
-            decoder_cc, n_stages_encoder - 1, decoder_n_blocks_per_stage, "decoder_cc"
+            cc, n_stages_encoder - 1, n_blocks_per_stage, "cc"
         )
 
         # Validate that stages using CondConv have valid expert counts
         for stage_idx in range(n_stages_encoder - 1):
             if any(self.cc_config[stage_idx]) and self.num_experts[stage_idx] <= 0:
                 raise ValueError(
-                    f"CondConv is enabled in decoder stage {stage_idx} (block-level configs: {self.cc_config[stage_idx]}), "
-                    f"but num_experts for this stage is {self.num_experts[stage_idx]}. It must be greater than 0."
+                    f"CondConv is enabled in decoder stage {stage_idx} "
+                    f"(block-level configs: {self.cc_config[stage_idx]}), "
+                    f"but num_experts for this stage is {self.num_experts[stage_idx]}. "
+                    f"It must be greater than 0."
                 )
 
         stages = []
         upsamplers = []
         transpconv_op = get_matching_convtransp(conv_op=encoder.conv_op)
+        use_linear = upsample_mode == "linear"
         for s in range(1, n_stages_encoder):
             input_features_below = encoder.output_channels[-s]
             input_features_skip = encoder.output_channels[-(s + 1)]
-            if linear_upsampling:
+            if use_linear:
                 upsamplers.append(nn.Identity())
                 stage_input_channels = input_features_below + input_features_skip
             else:
@@ -1099,25 +1104,25 @@ class CondUNetDecoder(nn.Module):
             target_stage_idx = n_stages_encoder - s - 1
             stages.append(
                 StackedCondInvertedBottleneckBlocks(
-                    decoder_n_blocks_per_stage[s - 1],
-                    encoder.conv_op,
-                    stage_input_channels,
-                    input_features_skip,
-                    encoder.kernel_sizes[target_stage_idx],
-                    1,
-                    encoder.norm_op,
-                    encoder.norm_op_kwargs,
-                    encoder.nonlin,
-                    encoder.nonlin_kwargs,
-                    self.expansion_ratios[s - 1],
-                    self.num_experts[s - 1],
-                    cc_mlp_reduction,
-                    None
+                    n_blocks=n_blocks_per_stage[s - 1],
+                    conv_op=encoder.conv_op,
+                    input_channels=stage_input_channels,
+                    output_channels=input_features_skip,
+                    kernel_size=encoder.kernel_sizes[target_stage_idx],
+                    initial_stride=1,
+                    norm_op=encoder.norm_op,
+                    norm_op_kwargs=encoder.norm_op_kwargs,
+                    nonlin=encoder.nonlin,
+                    nonlin_kwargs=encoder.nonlin_kwargs,
+                    expansion_ratio=self.expansion_ratios[s - 1],
+                    num_experts=self.num_experts[s - 1],
+                    cc_reduction=cc_reduction,
+                    tile_size=None
                     if encoder.stage_tile_sizes is None
                     else encoder.stage_tile_sizes[target_stage_idx],
-                    se_mlp_reduction,
-                    self.se_config[s - 1],
-                    self.cc_config[s - 1],
+                    se_reduction=se_reduction,
+                    se_config=self.se_config[s - 1],
+                    cc_config=self.cc_config[s - 1],
                     num_groups=self.num_groups[s - 1],
                 )
             )
@@ -1143,9 +1148,9 @@ class CondUNetDecoder(nn.Module):
         x = skips[-1]
         for stage_idx, stage in enumerate(self.stages):
             skip = skips[-(stage_idx + 2)]
-            if self.linear_upsampling:
+            if self.upsample_mode == "linear":
                 x = F.interpolate(
-                    x, size=skip.shape[2:], mode=self.mode, align_corners=False
+                    x, size=skip.shape[2:], mode=self.interp_mode, align_corners=False
                 )
             else:
                 x = self.upsamplers[stage_idx](x)
@@ -1165,7 +1170,7 @@ class CondUNetDecoder(nn.Module):
         for stage_idx, stage in enumerate(self.stages):
             skip_size = skip_sizes[-(stage_idx + 1)]
             output += stage.compute_conv_feature_map_size(skip_size)
-            if not self.linear_upsampling:
+            if self.upsample_mode != "linear":
                 output += np.prod(
                     [self.encoder.output_channels[-(stage_idx + 2)], *skip_size],
                     dtype=np.int64,
@@ -1196,21 +1201,10 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         deep_supervision: bool = False,
         encoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
         decoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
-        stem_channels: int = None,
-        stem_kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
-        stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
-        encoder_num_experts: Union[int, List[int], Tuple[int, ...]] = 0,
-        decoder_num_experts: Union[int, List[int], Tuple[int, ...]] = 0,
-        linear_upsampling: bool = True,
-        tile_size: Union[None, List[int], Tuple[int, ...]] = None,
-        encoder_se: Union[bool, List[bool], List[List[bool]]] = False,
-        decoder_se: Union[bool, List[bool], List[List[bool]]] = False,
-        encoder_cc: Union[bool, List[bool], List[List[bool]]] = False,
-        decoder_cc: Union[bool, List[bool], List[List[bool]]] = False,
-        se_mlp_reduction: float = 0.125,
-        cc_mlp_reduction: float = 0.125,
-        encoder_num_groups: Union[int, List[int], Tuple[int, ...]] = 1,
-        decoder_num_groups: Union[int, List[int], Tuple[int, ...]] = 1,
+        upsample_mode: str = "linear",
+        stem: Union[StemConfig, dict, None] = None,
+        se: Union[SEConfig, dict, None] = None,
+        cc: Union[CCConfig, dict, None] = None,
     ):
         super().__init__()
         self.key_to_encoder = "encoder.stages"
@@ -1226,13 +1220,24 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
                 f"not a single integer: {features_per_stage}"
             )
 
-        encoder_expansion_ratios = _expand_expansion_ratios(
-            encoder_expansion_ratio, n_stages, "encoder_expansion_ratio"
-        )
-        decoder_expansion_ratios = _expand_expansion_ratios(
-            decoder_expansion_ratio, n_stages - 1, "decoder_expansion_ratio"
-        )
-        
+        # Normalize config dataclasses (supports dict from JSON plans)
+        stem = _normalize_config(stem, StemConfig)
+        se = _normalize_config(se, SEConfig)
+        cc = _normalize_config(cc, CCConfig)
+
+        # Resolve tile_size: both addons can specify it independently, but they
+        # must agree if both are non-None (encoder tracks a single tile grid).
+        if (
+            se.tile_size is not None
+            and cc.tile_size is not None
+            and list(se.tile_size) != list(cc.tile_size)
+        ):
+            raise ValueError(
+                f"se.tile_size ({se.tile_size}) and cc.tile_size ({cc.tile_size}) must match "
+                "when both are specified. Use the same tile_size for both, or set one to None."
+            )
+        tile_size = se.tile_size if se.tile_size is not None else cc.tile_size
+
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,
             n_stages=n_stages,
@@ -1240,7 +1245,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             conv_op=conv_op,
             kernel_sizes=kernel_sizes,
             strides=strides,
-            encoder_n_blocks_per_stage=encoder_n_blocks_per_stage,
+            n_blocks_per_stage=encoder_n_blocks_per_stage,
             conv_bias=conv_bias,
             norm_op=norm_op,
             norm_op_kwargs=norm_op_kwargs,
@@ -1248,32 +1253,32 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             dropout_op_kwargs=dropout_op_kwargs,
             nonlin=nonlin,
             nonlin_kwargs=nonlin_kwargs,
-            encoder_expansion_ratio=encoder_expansion_ratios,
+            expansion_ratio=encoder_expansion_ratio,
             return_skips=True,
-            stem_channels=stem_channels,
-            stem_kernel_size=stem_kernel_size,
-            stem_stride=stem_stride,
-            num_experts=encoder_num_experts,
-            cc_mlp_reduction=cc_mlp_reduction,
+            stem_channels=stem.channels,
+            stem_kernel_size=stem.kernel_size,
+            stem_stride=stem.stride,
+            num_experts=cc.encoder_num_experts,
+            cc_reduction=cc.reduction,
             tile_size=tile_size,
-            se_mlp_reduction=se_mlp_reduction,
-            encoder_se=encoder_se,
-            encoder_cc=encoder_cc,
-            num_groups=encoder_num_groups,
+            se_reduction=se.reduction,
+            se=se.encoder,
+            cc=cc.encoder,
+            num_groups=cc.encoder_num_groups,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
             num_classes=num_classes,
-            decoder_n_blocks_per_stage=decoder_n_blocks_per_stage,
+            n_blocks_per_stage=decoder_n_blocks_per_stage,
             deep_supervision=deep_supervision,
-            decoder_expansion_ratio=decoder_expansion_ratios,
-            num_experts=decoder_num_experts,
-            cc_mlp_reduction=cc_mlp_reduction,
-            linear_upsampling=linear_upsampling,
-            se_mlp_reduction=se_mlp_reduction,
-            decoder_se=decoder_se,
-            decoder_cc=decoder_cc,
-            num_groups=decoder_num_groups,
+            expansion_ratio=decoder_expansion_ratio,
+            num_experts=cc.decoder_num_experts,
+            cc_reduction=cc.reduction,
+            upsample_mode=upsample_mode,
+            se_reduction=se.reduction,
+            se=se.decoder,
+            cc=cc.decoder,
+            num_groups=cc.decoder_num_groups,
         )
 
     def forward(self, x: torch.Tensor):
@@ -1296,6 +1301,9 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         InitWeights_He(1e-2)(module)
+        # Zero-init the projection norm for residual blocks so that the residual
+        # path starts as identity. This is safe because CondPWConv is not a
+        # subclass of _ConvNd, so InitWeights_He above does not touch it.
         if (
             isinstance(module, InvertedBottleneckBlock)
             and module.add_identity

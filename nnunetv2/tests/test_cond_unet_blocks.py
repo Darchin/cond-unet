@@ -8,6 +8,12 @@ from nnunetv2.training.network_architecture.cond_unet import (
     DepthwiseConvBlock,
     InvertedBottleneckBlock,
     StackedCondInvertedBottleneckBlocks,
+    CondUNetEncoder,
+    CondUNetDecoder,
+    CondUNet,
+    SEConfig,
+    CCConfig,
+    StemConfig,
 )
 
 
@@ -214,3 +220,82 @@ class TestCondUNetBlocks(unittest.TestCase):
         x = torch.randn(2, 8, 16, 16)
         out = stacked(x)
         self.assertEqual(out.shape, (2, 16, 8, 8))
+
+    def test_cond_unet_encoder_decoder_and_network(self):
+        # 1. Test parameter rename features_per_stage error handling in CondUNet and Encoder
+        with self.assertRaises(TypeError):
+            CondUNet(
+                input_channels=1, n_stages=4,
+                features_per_stage=32, # should be list/tuple
+                conv_op=torch.nn.Conv2d,
+                kernel_sizes=3, strides=[[1,1],[2,2],[2,2],[2,2]],
+                encoder_n_blocks_per_stage=2,
+                num_classes=3,
+                decoder_n_blocks_per_stage=2,
+            )
+
+        # 2. Test tile_size conflict in CondUNet
+        with self.assertRaisesRegex(ValueError, "must match when both are specified"):
+            CondUNet(
+                input_channels=1, n_stages=4,
+                features_per_stage=[32, 64, 128, 256],
+                conv_op=torch.nn.Conv2d,
+                kernel_sizes=3, strides=[[1,1],[2,2],[2,2],[2,2]],
+                encoder_n_blocks_per_stage=2,
+                num_classes=3,
+                decoder_n_blocks_per_stage=2,
+                se={'tile_size': (4, 4)},
+                cc={'tile_size': (8, 8)},
+            )
+
+        # 3. Test validation for CondConv encoder stage with 0 experts
+        with self.assertRaisesRegex(ValueError, "CondConv is enabled in encoder stage.*but num_experts.*is 0"):
+            CondUNetEncoder(
+                input_channels=1, n_stages=4,
+                features_per_stage=[32, 64, 128, 256],
+                conv_op=torch.nn.Conv2d,
+                kernel_sizes=3, strides=[[1,1],[2,2],[2,2],[2,2]],
+                n_blocks_per_stage=2,
+                num_experts=0,
+                cc=True,
+            )
+
+        # 4. Test validation for CondConv decoder stage with 0 experts
+        encoder = CondUNetEncoder(
+            input_channels=1, n_stages=4,
+            features_per_stage=[32, 64, 128, 256],
+            conv_op=torch.nn.Conv2d,
+            kernel_sizes=3, strides=[[1,1],[2,2],[2,2],[2,2]],
+            n_blocks_per_stage=2,
+            num_experts=4,
+            cc=True,
+        )
+        with self.assertRaisesRegex(ValueError, "CondConv is enabled in decoder stage.*but num_experts.*is 0"):
+            CondUNetDecoder(
+                encoder=encoder,
+                num_classes=3,
+                n_blocks_per_stage=2,
+                deep_supervision=False,
+                num_experts=0,
+                cc=True,
+            )
+
+        # 5. Full forward pass with valid complex configs
+        model = CondUNet(
+            input_channels=1, n_stages=4,
+            features_per_stage=[32, 64, 128, 256],
+            conv_op=torch.nn.Conv2d,
+            kernel_sizes=3, strides=[[1,1],[2,2],[2,2],[2,2]],
+            encoder_n_blocks_per_stage=2,
+            num_classes=3,
+            decoder_n_blocks_per_stage=2,
+            norm_op=torch.nn.InstanceNorm2d,
+            nonlin=torch.nn.LeakyReLU,
+            stem=StemConfig(channels=16, kernel_size=3, stride=1),
+            se=SEConfig(encoder=True, decoder=True, reduction=0.25, tile_size=(8, 8)),
+            cc=CCConfig(encoder=True, decoder=True, encoder_num_experts=2, decoder_num_experts=2, tile_size=(8, 8)),
+        )
+        x = torch.randn(1, 1, 32, 32)
+        out = model(x)
+        self.assertEqual(out.shape, (1, 3, 32, 32))
+
