@@ -267,10 +267,12 @@ class TestCondUNetIntegration:
                 cc={"encoder": True, "encoder_num_experts": 0}
             )
 
-    def test_mismatched_tile_sizes_raises(self):
-        with pytest.raises(ValueError, match="tile_size"):
-            _make_base_model(
-                se={"encoder": True, "tile_size": [16, 16]},
-                cc={"encoder": True, "encoder_num_experts": 2, "tile_size": [8, 8]},
-            )
+    def test_different_tile_sizes_supported(self):
+        model = _make_base_model(
+            se={"encoder": True, "tile_size": [16, 16]},
+            cc={"encoder": True, "encoder_num_experts": 2, "tile_size": [8, 8]},
+        )
+        x = torch.randn(1, 1, 32, 32)
+        out = model(x)
+        assert out.shape == (1, 2, 32, 32)
 

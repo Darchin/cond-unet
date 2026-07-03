@@ -647,7 +647,8 @@ class InvertedBottleneckBlock(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc_reduction: float = 0.125,
-        tile_size: Union[None, Sequence[int]] = None,
+        se_tile_size: Union[None, Sequence[int]] = None,
+        cc_tile_size: Union[None, Sequence[int]] = None,
         se_reduction: float = 0.125,
         se: bool = False,
         cc: bool = False,
@@ -700,7 +701,7 @@ class InvertedBottleneckBlock(nn.Module):
                 )
 
             self.router = Router(
-                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs, tile_size
+                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs, cc_tile_size
             )
             _expertify_pointwise(
                 self.expand, num_experts, cc_reduction, nonlin, nonlin_kwargs,
@@ -713,14 +714,14 @@ class InvertedBottleneckBlock(nn.Module):
         else:
             self.router = None
 
-        se_tile_size = (
+        se_tile_size_scaled = (
             None
-            if tile_size is None
-            else tuple(max(1, tile // step) for tile, step in zip(tile_size, self.stride))
+            if se_tile_size is None
+            else tuple(max(1, tile // step) for tile, step in zip(se_tile_size, self.stride))
         )
         self.se_block = (
             SqueezeAndExcitationBlock(
-                output_channels, se_reduction, nonlin, nonlin_kwargs, se_tile_size
+                output_channels, se_reduction, nonlin, nonlin_kwargs, se_tile_size_scaled
             )
             if se
             else nn.Identity()
@@ -771,7 +772,8 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc_reduction: float = 0.125,
-        tile_size: Union[None, Sequence[int]] = None,
+        se_tile_size: Union[None, Sequence[int]] = None,
+        cc_tile_size: Union[None, Sequence[int]] = None,
         se_reduction: float = 0.125,
         se_config: List[bool] = None,
         cc_config: List[bool] = None,
@@ -793,7 +795,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         if len(cc_config) != n_blocks:
             raise ValueError(f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})")
 
-        def make_block(in_channels: int, stride, block_tile_size, block_se: bool, block_cc: bool):
+        def make_block(in_channels: int, stride, block_se_tile_size, block_cc_tile_size, block_se: bool, block_cc: bool):
             return InvertedBottleneckBlock(
                 conv_op=conv_op,
                 input_channels=in_channels,
@@ -807,7 +809,8 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
                 cc_reduction=cc_reduction,
-                tile_size=block_tile_size,
+                se_tile_size=block_se_tile_size,
+                cc_tile_size=block_cc_tile_size,
                 se_reduction=se_reduction,
                 se=block_se,
                 cc=block_cc,
@@ -819,12 +822,15 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 input_channels,
                 initial_stride,
                 None
-                if tile_size is None
-                else tuple(tile * stride for tile, stride in zip(tile_size, self.initial_stride)),
+                if se_tile_size is None
+                else tuple(tile * stride for tile, stride in zip(se_tile_size, self.initial_stride)),
+                None
+                if cc_tile_size is None
+                else tuple(tile * stride for tile, stride in zip(cc_tile_size, self.initial_stride)),
                 se_config[0],
                 cc_config[0],
             ),
-            *[make_block(output_channels, 1, tile_size, se_config[i], cc_config[i]) for i in range(1, n_blocks)],
+            *[make_block(output_channels, 1, se_tile_size, cc_tile_size, se_config[i], cc_config[i]) for i in range(1, n_blocks)],
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -862,7 +868,8 @@ class CondUNetEncoder(nn.Module):
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
         cc_reduction: float = 0.125,
-        tile_size: Union[None, Sequence[int]] = None,
+        se_tile_size: Union[None, Sequence[int]] = None,
+        cc_tile_size: Union[None, Sequence[int]] = None,
         se_reduction: float = 0.125,
         se: BoolConfig = False,
         cc: BoolConfig = False,
@@ -922,18 +929,22 @@ class CondUNetEncoder(nn.Module):
         stem_channels = features_per_stage[0] if stem_channels is None else stem_channels
         self.stem_kernel_size = maybe_convert_scalar_to_list(conv_op, stem_kernel_size)
         self.stem_stride = maybe_convert_scalar_to_list(conv_op, stem_stride)
-        if tile_size is not None:
-            if len(tile_size) != convert_conv_op_to_dim(conv_op):
-                raise ValueError(
-                    f"tile_size must contain exactly {convert_conv_op_to_dim(conv_op)} values"
-                )
-            if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in tile_size):
-                raise ValueError("tile_size values must be positive integers")
-            current_tile_size = [
-                max(1, tile // stride) for tile, stride in zip(tile_size, self.stem_stride)
-            ]
-        else:
-            current_tile_size = None
+
+        def process_tile_size(t_size, name):
+            if t_size is not None:
+                if len(t_size) != convert_conv_op_to_dim(conv_op):
+                    raise ValueError(
+                        f"{name} must contain exactly {convert_conv_op_to_dim(conv_op)} values"
+                    )
+                if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in t_size):
+                    raise ValueError(f"{name} values must be positive integers")
+                return [
+                    max(1, tile // stride) for tile, stride in zip(t_size, self.stem_stride)
+                ]
+            return None
+
+        current_se_tile_size = process_tile_size(se_tile_size, "se_tile_size")
+        current_cc_tile_size = process_tile_size(cc_tile_size, "cc_tile_size")
 
         # Stem applies no non-linearity (only Conv + Norm)
         self.stem = StackedConvBlocks(
@@ -953,16 +964,24 @@ class CondUNetEncoder(nn.Module):
         )
 
         stages = []
-        stage_tile_sizes = []
+        stage_se_tile_sizes = []
+        stage_cc_tile_sizes = []
         stage_input_channels = stem_channels
         for stage_idx in range(n_stages):
-            if current_tile_size is not None:
-                stage_stride = maybe_convert_scalar_to_list(conv_op, strides[stage_idx])
-                current_tile_size = [
+            stage_stride = maybe_convert_scalar_to_list(conv_op, strides[stage_idx])
+            if current_se_tile_size is not None:
+                current_se_tile_size = [
                     max(1, tile // stride)
-                    for tile, stride in zip(current_tile_size, stage_stride)
+                    for tile, stride in zip(current_se_tile_size, stage_stride)
                 ]
-                stage_tile_sizes.append(tuple(current_tile_size))
+                stage_se_tile_sizes.append(tuple(current_se_tile_size))
+            if current_cc_tile_size is not None:
+                current_cc_tile_size = [
+                    max(1, tile // stride)
+                    for tile, stride in zip(current_cc_tile_size, stage_stride)
+                ]
+                stage_cc_tile_sizes.append(tuple(current_cc_tile_size))
+
             stages.append(
                 StackedCondInvertedBottleneckBlocks(
                     n_blocks=n_blocks_per_stage[stage_idx],
@@ -978,7 +997,8 @@ class CondUNetEncoder(nn.Module):
                     expansion_ratio=self.expansion_ratios[stage_idx],
                     num_experts=self.num_experts[stage_idx],
                     cc_reduction=cc_reduction,
-                    tile_size=current_tile_size,
+                    se_tile_size=current_se_tile_size,
+                    cc_tile_size=current_cc_tile_size,
                     se_reduction=se_reduction,
                     se_config=self.se_config[stage_idx],
                     cc_config=self.cc_config[stage_idx],
@@ -988,7 +1008,8 @@ class CondUNetEncoder(nn.Module):
             stage_input_channels = features_per_stage[stage_idx]
 
         self.stages = nn.ModuleList(stages)
-        self.stage_tile_sizes = None if tile_size is None else stage_tile_sizes
+        self.stage_se_tile_sizes = None if se_tile_size is None else stage_se_tile_sizes
+        self.stage_cc_tile_sizes = None if cc_tile_size is None else stage_cc_tile_sizes
         self.output_channels = features_per_stage
         self.strides = [maybe_convert_scalar_to_list(conv_op, stride) for stride in strides]
         self.return_skips = return_skips
@@ -1118,9 +1139,12 @@ class CondUNetDecoder(nn.Module):
                     expansion_ratio=self.expansion_ratios[s - 1],
                     num_experts=self.num_experts[s - 1],
                     cc_reduction=cc_reduction,
-                    tile_size=None
-                    if encoder.stage_tile_sizes is None
-                    else encoder.stage_tile_sizes[target_stage_idx],
+                    se_tile_size=None
+                    if encoder.stage_se_tile_sizes is None
+                    else encoder.stage_se_tile_sizes[target_stage_idx],
+                    cc_tile_size=None
+                    if encoder.stage_cc_tile_sizes is None
+                    else encoder.stage_cc_tile_sizes[target_stage_idx],
                     se_reduction=se_reduction,
                     se_config=self.se_config[s - 1],
                     cc_config=self.cc_config[s - 1],
@@ -1226,19 +1250,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         se = _normalize_config(se, SEConfig)
         cc = _normalize_config(cc, CCConfig)
 
-        # Resolve tile_size: both addons can specify it independently, but they
-        # must agree if both are non-None (encoder tracks a single tile grid).
-        if (
-            se.tile_size is not None
-            and cc.tile_size is not None
-            and list(se.tile_size) != list(cc.tile_size)
-        ):
-            raise ValueError(
-                f"se.tile_size ({se.tile_size}) and cc.tile_size ({cc.tile_size}) must match "
-                "when both are specified. Use the same tile_size for both, or set one to None."
-            )
-        tile_size = se.tile_size if se.tile_size is not None else cc.tile_size
-
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,
             n_stages=n_stages,
@@ -1261,7 +1272,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_stride=stem.stride,
             num_experts=cc.encoder_num_experts,
             cc_reduction=cc.reduction,
-            tile_size=tile_size,
+            se_tile_size=se.tile_size,
+            cc_tile_size=cc.tile_size,
             se_reduction=se.reduction,
             se=se.encoder,
             cc=cc.encoder,
