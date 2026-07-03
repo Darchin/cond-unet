@@ -126,17 +126,6 @@ def _same_padding(kernel_size: Union[int, List[int], Tuple[int, ...]]) -> Union[
     return [(i - 1) // 2 for i in kernel_size]
 
 
-def _convert_conv_op_to_transposed(conv_op: Type[_ConvNd]) -> Type[nn.Module]:
-    dim = convert_conv_op_to_dim(conv_op)
-    if dim == 3:
-        return nn.ConvTranspose3d
-    if dim == 2:
-        return nn.ConvTranspose2d
-    if dim == 1:
-        return nn.ConvTranspose1d
-    raise ValueError(f"Unsupported convolution dimensionality: {dim}")
-
-
 def _transpose_output_padding(
     kernel_size: List[int],
     stride: List[int],
@@ -505,22 +494,17 @@ def _expand_expansion_ratios(
     return [float(item) for item in values]
 
 
-def _expand_num_experts(value: Union[int, Sequence[int]], n_stages: int, name: str) -> List[int]:
-    values = [value] * n_stages if isinstance(value, int) else list(value)
-    if len(values) != n_stages:
-        raise ValueError(f"{name} must contain exactly {n_stages} values, got {len(values)}")
-    if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in values):
-        raise ValueError(f"{name} values must be non-negative integers")
-    return values
-
-
-def _expand_num_groups(value: Union[int, Sequence[int]], n_stages: int, name: str) -> List[int]:
+def _expand_int_param(
+    value: Union[int, Sequence[int]], n_stages: int, name: str, *, min_value: int = 0
+) -> List[int]:
+    """Expand a scalar-or-sequence of ints to a per-stage list, validating >= min_value."""
     values = [value] * n_stages if isinstance(value, (int, np.integer)) else list(value)
     if len(values) != n_stages:
         raise ValueError(f"{name} must contain exactly {n_stages} values, got {len(values)}")
-    if any(not isinstance(item, (int, np.integer)) or isinstance(item, bool) or item <= 0 for item in values):
-        raise ValueError(f"{name} values must be positive integers greater than or equal to 1")
+    if any(not isinstance(item, (int, np.integer)) or isinstance(item, bool) or item < min_value for item in values):
+        raise ValueError(f"{name} values must be integers >= {min_value}")
     return [int(v) for v in values]
+
 
 
 def _expand_block_config(
@@ -884,11 +868,11 @@ class CondUNetEncoder(nn.Module):
         kernel_sizes = _normalize_kernel_sizes(
             conv_op, kernel_sizes, n_stages, [3] * convert_conv_op_to_dim(conv_op)
         )
-        self.num_experts = _expand_num_experts(
-            num_experts, n_stages, "encoder_num_experts"
+        self.num_experts = _expand_int_param(
+            num_experts, n_stages, "encoder_num_experts", min_value=0
         )
-        self.num_groups = _expand_num_groups(
-            num_groups, n_stages, "encoder_num_groups"
+        self.num_groups = _expand_int_param(
+            num_groups, n_stages, "encoder_num_groups", min_value=1
         )
         self.expansion_ratios = _expand_expansion_ratios(
             encoder_expansion_ratio, n_stages, "encoder_expansion_ratio"
@@ -1043,11 +1027,11 @@ class CondUNetDecoder(nn.Module):
             raise ValueError(
                 f"decoder_n_blocks_per_stage must contain exactly {n_stages_encoder - 1} values"
             )
-        self.num_experts = _expand_num_experts(
-            num_experts, n_stages_encoder - 1, "decoder_num_experts"
+        self.num_experts = _expand_int_param(
+            num_experts, n_stages_encoder - 1, "decoder_num_experts", min_value=0
         )
-        self.num_groups = _expand_num_groups(
-            num_groups, n_stages_encoder - 1, "decoder_num_groups"
+        self.num_groups = _expand_int_param(
+            num_groups, n_stages_encoder - 1, "decoder_num_groups", min_value=1
         )
         self.expansion_ratios = _expand_expansion_ratios(
             decoder_expansion_ratio, n_stages_encoder - 1, "decoder_expansion_ratio"
@@ -1118,7 +1102,7 @@ class CondUNetDecoder(nn.Module):
 
         self.stages = nn.ModuleList(stages)
         self.upsamplers = nn.ModuleList(upsamplers)
-        head_op = _convert_conv_op_to_transposed(encoder.conv_op)
+        head_op = get_matching_convtransp(conv_op=encoder.conv_op)
         head_padding = _same_padding(encoder.stem_kernel_size)
         head_output_padding = _transpose_output_padding(
             encoder.stem_kernel_size, encoder.stem_stride, head_padding
