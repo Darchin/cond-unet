@@ -20,6 +20,105 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+# Type aliases for config flexibility
+BoolConfig = Union[bool, List[bool], List[List[bool]]]
+IntConfig = Union[int, List[int], Tuple[int, ...]]
+KernelConfig = Union[int, List[int], Tuple[int, ...]]
+
+
+@dataclass
+class SEConfig:
+    """Squeeze-and-Excitation addon configuration.
+
+    Attributes:
+        reduction: MLP bottleneck ratio for the SE block.
+        encoder: Per-block SE enablement in the encoder. A single bool applies
+            globally; a list of bools applies per-stage; a nested list applies
+            per-block within each stage.
+        decoder: Same as ``encoder`` but for the decoder.
+        tile_size: Spatial tile size for tiled SE. None means global (standard) SE.
+    """
+    reduction: float = 0.125
+    encoder: BoolConfig = False
+    decoder: BoolConfig = False
+    tile_size: Union[None, List[int], Tuple[int, ...]] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SEConfig":
+        return cls(**d)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class CCConfig:
+    """CondConv (dense mixture-of-experts) addon configuration.
+
+    Attributes:
+        reduction: MLP bottleneck ratio for the expert router.
+        encoder: Per-block CC enablement in the encoder (same format as SEConfig).
+        decoder: Per-block CC enablement in the decoder.
+        encoder_num_experts: Number of experts per encoder stage (int or per-stage list).
+        decoder_num_experts: Number of experts per decoder stage.
+        encoder_num_groups: Channel-wise routing granularity per encoder stage.
+        decoder_num_groups: Channel-wise routing granularity per decoder stage.
+        tile_size: Spatial tile size for tiled routing. None means global routing.
+    """
+    reduction: float = 0.125
+    encoder: BoolConfig = False
+    decoder: BoolConfig = False
+    encoder_num_experts: IntConfig = 0
+    decoder_num_experts: IntConfig = 0
+    encoder_num_groups: IntConfig = 1
+    decoder_num_groups: IntConfig = 1
+    tile_size: Union[None, List[int], Tuple[int, ...]] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CCConfig":
+        return cls(**d)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class StemConfig:
+    """Downsampling stem configuration.
+
+    Attributes:
+        channels: Number of output channels for the stem. Defaults to
+            ``features_per_stage[0]`` when None.
+        kernel_size: Convolution kernel size for the stem.
+        stride: Convolution stride for the stem (controls initial downsampling).
+    """
+    channels: Optional[int] = None
+    kernel_size: KernelConfig = 3
+    stride: KernelConfig = 1
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StemConfig":
+        return cls(**d)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _normalize_config(value, config_class):
+    """Convert a plain dict to the corresponding config dataclass, or return as-is if already an instance."""
+    if value is None:
+        return config_class()
+    if isinstance(value, dict):
+        return config_class.from_dict(value)
+    if isinstance(value, config_class):
+        return value
+    raise TypeError(
+        f"Expected {config_class.__name__}, dict, or None, got {type(value).__name__}"
+    )
+
 
 def _same_padding(kernel_size: Union[int, List[int], Tuple[int, ...]]) -> Union[int, List[int]]:
     if isinstance(kernel_size, int):
