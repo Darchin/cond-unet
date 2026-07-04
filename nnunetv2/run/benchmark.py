@@ -48,7 +48,7 @@ def _clear_cuda_after_oom() -> None:
 def _matching_plan_files(plans_identifier: str, configuration: str) -> list[str]:
     if not nnUNet_preprocessed.is_set():
         raise RuntimeError(
-            "nnUNet_preprocessed is not set. Pass a plans JSON path with -pl or set nnUNet_preprocessed "
+            "nnUNet_preprocessed is not set. Pass a plans JSON path with -p/--plan or set nnUNet_preprocessed "
             "so the benchmark can discover plans by identifier."
         )
 
@@ -81,7 +81,7 @@ def resolve_plans_file(plans: str, configuration: str) -> str:
         formatted = "\n".join(f"  - {i}" for i in matches)
         raise RuntimeError(
             f"Configuration '{configuration}' with plans identifier '{plans}' is ambiguous. "
-            f"Pass one of these files directly via -pl:\n{formatted}"
+            f"Pass one of these files directly via -p/--plan:\n{formatted}"
         )
     return matches[0]
 
@@ -221,9 +221,9 @@ def benchmark(configuration: str,
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for nnUNetv2_benchmark, but torch.cuda.is_available() is False.")
     if num_warmup < 0:
-        raise ValueError("-nw must be >= 0")
+        raise ValueError("-nw/--num-warmup must be >= 0")
     if num_repeats < 1:
-        raise ValueError("-nr must be >= 1")
+        raise ValueError("-nr/--num-repeats must be >= 1")
 
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -302,30 +302,39 @@ def benchmark_entry() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark CUDA memory and forward/backward time for an nnU-Net v2 configuration."
     )
-    parser.add_argument("configuration", type=str, help="Configuration name from the plans file.")
     parser.add_argument(
-        "-pl",
+        "-p",
+        "--plan",
         type=str,
         default="nnUNetCondUNetPlans",
         help="Plans identifier to discover under nnUNet_preprocessed, or a direct path to a plans JSON file. "
              "Default: nnUNetCondUNetPlans",
     )
-    parser.add_argument("-nw", type=int, default=10, help="Number of warm-up steps. Default: 10")
-    parser.add_argument(
-        "-nr",
-        type=int,
-        default=25,
-        help="Number of measured repeats after warm-up. Default: 25",
-    )
     parser.add_argument(
         "-c",
+        "--config",
+        type=str,
+        required=True,
+        help="Configuration name from the plans file.",
+    )
+    parser.add_argument("-nw", "--num-warmup", type=int, default=25, help="Number of warm-up steps. Default: 25")
+    parser.add_argument(
+        "-nr",
+        "--num-repeats",
+        type=int,
+        default=100,
+        help="Number of measured repeats after warm-up. Default: 100",
+    )
+    parser.add_argument(
+        "-dc",
+        "--disable-compilation",
         action="store_true",
-        help="Enable torch.compile(dynamic=False). The flag is passed through torch.compile's disable parameter.",
+        help="Disable torch.compile(dynamic=False). Compilation is enabled by default.",
     )
     args = parser.parse_args()
 
     try:
-        benchmark(args.configuration, args.pl, args.nw, args.nr, args.c)
+        benchmark(args.config, args.plan, args.num_warmup, args.num_repeats, not args.disable_compilation)
     except BenchmarkOOM as error:
         print(f"ERROR: {error}", file=sys.stderr)
         raise SystemExit(2) from error
