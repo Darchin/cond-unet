@@ -118,10 +118,10 @@ ENV/
 !documentation/assets/scribble_example.png
 
 CLAUDE.md
-AGENTS.md
+# AGENTS.md - tracked since the agent instructions are prone to change
 
 # nnU-Net raw/preprocessing/results directories
 nnUNet_*/
 
-# Personal development notes
-notes/
+# Development notes - tracked for now since they might change
+# notes/
