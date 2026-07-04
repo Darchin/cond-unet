@@ -82,8 +82,18 @@ class CondUNetPlanner(ExperimentPlanner):
         target_spacing = np.asarray(target_spacing, dtype=float)
         reference_spacing = float(np.min(median_spacing))
         reference_axes = np.isclose(median_spacing, reference_spacing)
-        stride = np.ceil(reference_spacing * stem_factor / target_spacing).astype(int)
-        stride = np.clip(stride, 1, stem_factor)
+        reference_post_stem_spacing = reference_spacing * stem_factor
+        stride = np.ones_like(target_spacing, dtype=int)
+        stride_candidates = np.arange(1, stem_factor + 1, dtype=int)
+
+        for axis in range(len(target_spacing)):
+            post_stem_spacing = target_spacing[axis] * stride_candidates
+            anisotropy = np.maximum(
+                post_stem_spacing / reference_post_stem_spacing,
+                reference_post_stem_spacing / post_stem_spacing,
+            )
+            stride[axis] = int(stride_candidates[np.argmin(anisotropy)])
+
         stride[reference_axes] = stem_factor
         return stride
 
@@ -95,6 +105,11 @@ class CondUNetPlanner(ExperimentPlanner):
         post_stem_stride = np.asarray([2 ** post_stem_downsampling_stages] * len(stem_stride), dtype=int)
         patch_size_unit = (np.asarray(stem_stride, dtype=int) * post_stem_stride * aspect_ratio).astype(int)
         return [int(i) for i in aspect_ratio], [int(i) for i in patch_size_unit]
+
+    @staticmethod
+    def compute_patch_size_unit_mm(patch_size_unit: List[int], target_spacing: np.ndarray) -> List[float]:
+        patch_size_unit_mm = np.asarray(patch_size_unit, dtype=float) * np.asarray(target_spacing, dtype=float)
+        return [float(i) for i in patch_size_unit_mm]
 
     @staticmethod
     def _transpose(spatial_values: Union[np.ndarray, List[int], List[float]],
@@ -200,6 +215,7 @@ class CondUNetPlanner(ExperimentPlanner):
             stem_stride_transposed,
             post_stem_downsampling_stages,
         )
+        patch_size_unit_mm = self.compute_patch_size_unit_mm(patch_size_unit, target_spacing_transposed)
         stem_stride_list = [int(i) for i in stem_stride_transposed]
         stem_kernel_size = [int(2 * i - 1) for i in stem_stride_list]
 
@@ -212,6 +228,7 @@ class CondUNetPlanner(ExperimentPlanner):
             "batch_size": self.UNet_min_batch_size,
             "patch_size": patch_size_unit,
             "patch_size_unit": patch_size_unit,
+            "patch_size_unit_mm": patch_size_unit_mm,
             "patch_size_multiplier": None,
             "patch_size_aspect_ratio": aspect_ratio,
             "median_image_size_in_voxels": [int(round(i)) for i in median_shape_transposed],

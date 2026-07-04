@@ -45,6 +45,15 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
 
         self.assertEqual(stem_stride.tolist(), [3, 1, 3])
 
+    def test_stem_stride_can_make_axis_finer_than_reference_post_stem_spacing(self):
+        stem_stride = CondUNetPlanner.determine_stem_stride(
+            median_spacing=[1.0, 2.0, 1.0],
+            target_spacing=[1.0, 1.3, 1.0],
+            stem_factor=3,
+        )
+
+        self.assertEqual(stem_stride.tolist(), [3, 2, 3])
+
     def test_patch_geometry_uses_physical_aspect_ratio_and_total_stride(self):
         aspect_ratio, patch_size_unit = CondUNetPlanner.compute_patch_geometry(
             target_spacing=[4.0, 1.0, 1.0],
@@ -55,6 +64,14 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
 
         self.assertEqual(aspect_ratio, [2, 1, 2])
         self.assertEqual(patch_size_unit, [32, 48, 96])
+
+    def test_patch_size_unit_mm_multiplies_patch_unit_by_spacing(self):
+        patch_size_unit_mm = CondUNetPlanner.compute_patch_size_unit_mm(
+            patch_size_unit=[32, 48, 96],
+            target_spacing=[4.0, 1.0, 1.5],
+        )
+
+        self.assertEqual(patch_size_unit_mm, [128.0, 48.0, 144.0])
 
     def test_architecture_uses_relu(self):
         planner = CondUNetPlanner.__new__(CondUNetPlanner)
@@ -94,6 +111,7 @@ class TestPlansManagerCondUNetConfig(unittest.TestCase):
                     "batch_size": 2,
                     "patch_size": [16, 32, 48],
                     "patch_size_unit": [16, 32, 48],
+                    "patch_size_unit_mm": [16.0, 32.0, 48.0],
                     "patch_size_multiplier": None,
                     "median_image_size_in_voxels": [128, 128, 128],
                     "spacing": [1.0, 1.0, 1.0],
