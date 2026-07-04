@@ -306,19 +306,21 @@ class PlansManager(object):
     def _merge_inherited_configuration(base_config: dict, child_config: dict) -> dict:
         base_config = deepcopy(base_config)
         child_config = deepcopy(child_config)
-        architecture = child_config.get('architecture')
-        if isinstance(architecture, dict) and architecture.get('merge_arch_kwargs', False):
-            parent_architecture = deepcopy(base_config.get('architecture', {}))
-            parent_arch_kwargs = deepcopy(parent_architecture.get('arch_kwargs', {}))
-            child_arch_kwargs = deepcopy(architecture.get('arch_kwargs', {}))
-            merged_architecture = parent_architecture
-            merged_architecture.update(architecture)
-            merged_architecture['arch_kwargs'] = parent_arch_kwargs
-            merged_architecture['arch_kwargs'].update(child_arch_kwargs)
-            child_config['architecture'] = merged_architecture
+        if child_config.get('nested_override', True):
+            return PlansManager._recursive_update(base_config, child_config)
 
         base_config.update(child_config)
         return base_config
+
+    @staticmethod
+    def _recursive_update(base: dict, child: dict) -> dict:
+        for key, child_value in child.items():
+            base_value = base.get(key)
+            if isinstance(base_value, dict) and isinstance(child_value, dict):
+                base[key] = PlansManager._recursive_update(base_value, child_value)
+            else:
+                base[key] = child_value
+        return base
 
     @staticmethod
     def _is_valid_patch_size_multiplier(value) -> bool:

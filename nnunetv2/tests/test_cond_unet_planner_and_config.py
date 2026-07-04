@@ -136,7 +136,7 @@ class TestPlansManagerCondUNetConfig(unittest.TestCase):
         self.assertEqual(config.use_mask_for_norm, [False])
         self.assertTrue(config.batch_dice)
 
-    def test_merge_arch_kwargs_and_derive_patch_size(self):
+    def test_nested_override_merges_child_values_and_derives_patch_size(self):
         plans = {
             "configurations": {
                 "2x": {
@@ -156,6 +156,10 @@ class TestPlansManagerCondUNetConfig(unittest.TestCase):
                         },
                         "_kw_requires_import": [],
                     },
+                    "trainer": {
+                        "initial_lr": 0.01,
+                        "weight_decay": 0.001,
+                    },
                     "required_for_training": [
                         "patch_size_multiplier",
                         "architecture.arch_kwargs.features_per_stage",
@@ -167,12 +171,14 @@ class TestPlansManagerCondUNetConfig(unittest.TestCase):
                     "inherits_from": "2x",
                     "patch_size_multiplier": 3,
                     "architecture": {
-                        "merge_arch_kwargs": True,
                         "arch_kwargs": {
                             "features_per_stage": [16, 32],
                             "encoder_n_blocks_per_stage": [1, 1],
                             "decoder_n_blocks_per_stage": [1],
                         },
+                    },
+                    "trainer": {
+                        "initial_lr": 0.001,
                     },
                 },
             }
@@ -184,7 +190,45 @@ class TestPlansManagerCondUNetConfig(unittest.TestCase):
         self.assertEqual(config.network_arch_class_name, "ParentNet")
         self.assertEqual(config.network_arch_init_kwargs["stem"]["stride"], [2, 2, 2])
         self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [16, 32])
+        self.assertEqual(config.trainer, {"initial_lr": 0.001, "weight_decay": 0.001})
         config.validate_required_for_training("child")
+
+    def test_nested_override_false_replaces_top_level_child_dicts(self):
+        plans = {
+            "configurations": {
+                "parent": {
+                    "architecture": {
+                        "network_class_name": "ParentNet",
+                        "arch_kwargs": {
+                            "stem": {"stride": [2, 2, 2], "kernel_size": [3, 3, 3]},
+                            "features_per_stage": [8, 16],
+                        },
+                        "_kw_requires_import": [],
+                    },
+                    "trainer": {
+                        "initial_lr": 0.01,
+                        "weight_decay": 0.001,
+                    },
+                },
+                "child": {
+                    "inherits_from": "parent",
+                    "nested_override": False,
+                    "architecture": {
+                        "arch_kwargs": {
+                            "features_per_stage": [16, 32],
+                        },
+                    },
+                    "trainer": {
+                        "initial_lr": 0.001,
+                    },
+                },
+            }
+        }
+
+        config = PlansManager(plans)._internal_resolve_configuration_inheritance("child")
+
+        self.assertEqual(config["architecture"], {"arch_kwargs": {"features_per_stage": [16, 32]}})
+        self.assertEqual(config["trainer"], {"initial_lr": 0.001})
 
     def test_incomplete_base_configuration_has_helpful_error(self):
         config = PlansManager({
