@@ -92,12 +92,22 @@ dev = [
     "pre-commit"
 ]
 intel_macos = [
-    "torch<2.3",
-    "numpy<2",
+    "torch<2.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "numpy<2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
 [tool.setuptools.packages.find]
 include = ["nnunetv2*"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [build-system]
 requires = ["setuptools>=67.8.0"]
