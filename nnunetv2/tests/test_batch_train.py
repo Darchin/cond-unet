@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -7,9 +8,14 @@ from batchgenerators.utilities.file_and_folder_operations import save_json
 from rich.console import Console
 
 from nnunetv2.run.batch_train import (
+    BatchTrainingAborted,
+    FinishedJob,
+    JobProgress,
     build_jobs,
     format_duration,
     parse_args,
+    render_finished_panel,
+    render_start_panel,
     resolve_plans_file,
     schedule_jobs,
     validate_requested_configurations,
@@ -21,12 +27,30 @@ class FakeProcess:
     def __init__(self, returncode=0, running_polls=0):
         self.returncode = returncode
         self.running_polls = running_polls
+        self.terminated = False
+        self.killed = False
 
     def poll(self):
+        if self.terminated:
+            return -15
+        if self.killed:
+            return -9
         if self.running_polls > 0:
             self.running_polls -= 1
             return None
         return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+
+def render_to_text(renderable) -> str:
+    console = Console(record=True, width=120, color_system=None)
+    console.print(renderable)
+    return console.export_text()
 
 
 class TestBatchTrain(unittest.TestCase):
@@ -59,6 +83,22 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual(visible_gpu_tokens("2, 4", 2), ["2", "4"])
         self.assertEqual(visible_gpu_tokens(None, 3), ["0", "1", "2"])
 
+    def test_start_panel_moves_config_and_fold_to_first_row(self):
+        text = render_to_text(render_start_panel(build_jobs(["2x"], [1])[0], "0"))
+
+        self.assertIn("START job 0/0 on GPU 0, config=2x, fold=1", text)
+
+    def test_finished_panel_reports_stage_elapsed_times(self):
+        job = build_jobs(["2x"], [0])[0]
+        progress = JobProgress(training_elapsed_seconds=3600, validation_elapsed_seconds=120)
+        result = FinishedJob(job, "0", 0, 3720, progress)
+
+        text = render_to_text(render_finished_panel(result))
+
+        self.assertIn("DONE job 0/0 on GPU 0, config=2x, fold=0", text)
+        self.assertIn("TRAINING finished in 1h 0m", text)
+        self.assertIn("VALIDATION finished in 0h 2m", text)
+
     def test_resolve_plan_path_accepts_direct_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             plans_file = os.path.join(tmpdir, "plans.json")
@@ -90,7 +130,7 @@ class TestBatchTrain(unittest.TestCase):
         launches = []
         returncodes = [0, 1, 0, 0]
 
-        def launcher(job, gpu, plans_file, trainer_name, disable_tta):
+        def launcher(job, gpu, plans_file, trainer_name, disable_tta, progress_file=None):
             launches.append((job.index, gpu, plans_file, trainer_name, disable_tta))
             return FakeProcess(returncodes[job.index])
 
@@ -120,6 +160,77 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual([i[1] for i in launches], ["0", "1", "0", "1"])
         self.assertTrue(all(i[4] for i in launches))
         self.assertEqual([i.returncode for i in results], [0, 1, 0, 0])
+
+    def test_scheduler_consumes_worker_progress_events(self):
+        jobs = build_jobs(["2x"], [0])
+
+        def launcher(job, gpu, plans_file, trainer_name, disable_tta, progress_file=None):
+            with open(progress_file, "w", encoding="utf-8") as f:
+                for event in [
+                    {"event": "training_started", "completed": 0, "total": 5},
+                    {"event": "training_progress", "completed": 5, "total": 5},
+                    {"event": "training_finished", "completed": 5, "total": 5, "elapsed_seconds": 300},
+                    {"event": "validation_started", "completed": 0, "total": 3},
+                    {"event": "validation_progress", "completed": 3, "total": 3},
+                    {"event": "validation_finished", "completed": 3, "total": 3, "elapsed_seconds": 60},
+                ]:
+                    f.write(json.dumps(event) + "\n")
+            return FakeProcess(0)
+
+        console = Console(file=open(os.devnull, "w"))
+        try:
+            results = schedule_jobs(
+                jobs,
+                ["0"],
+                "plans.json",
+                "nnUNetTrainer",
+                False,
+                console,
+                launcher=launcher,
+                monotonic=lambda: 0.0,
+                sleep=lambda _: None,
+            )
+        finally:
+            console.file.close()
+
+        self.assertEqual(results[0].progress.training_completed, 5)
+        self.assertEqual(results[0].progress.training_total, 5)
+        self.assertEqual(results[0].progress.training_elapsed_seconds, 300)
+        self.assertEqual(results[0].progress.validation_completed, 3)
+        self.assertEqual(results[0].progress.validation_total, 3)
+        self.assertEqual(results[0].progress.validation_elapsed_seconds, 60)
+
+    def test_scheduler_keyboard_interrupt_terminates_running_jobs(self):
+        jobs = build_jobs(["2x", "3x"], [0])
+        launched_processes = []
+
+        def launcher(job, gpu, plans_file, trainer_name, disable_tta, progress_file=None):
+            process = FakeProcess(returncode=0, running_polls=100)
+            launched_processes.append(process)
+            return process
+
+        def interrupted_sleep(_):
+            raise KeyboardInterrupt
+
+        console = Console(file=open(os.devnull, "w"))
+        try:
+            with self.assertRaises(BatchTrainingAborted):
+                schedule_jobs(
+                    jobs,
+                    ["0"],
+                    "plans.json",
+                    "nnUNetTrainer",
+                    False,
+                    console,
+                    launcher=launcher,
+                    monotonic=lambda: 0.0,
+                    sleep=interrupted_sleep,
+                )
+        finally:
+            console.file.close()
+
+        self.assertEqual(len(launched_processes), 1)
+        self.assertTrue(launched_processes[0].terminated)
 
 
 if __name__ == "__main__":

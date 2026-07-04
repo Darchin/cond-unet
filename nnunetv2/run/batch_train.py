@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os.path import abspath, dirname, isfile, join
 from typing import Callable, Sequence
 
 import torch
 from batchgenerators.utilities.file_and_folder_operations import load_json
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
+from rich.progress_bar import ProgressBar
 from rich.table import Table
+from rich.text import Text
 
 from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.run.run_training import maybe_load_checkpoint
@@ -31,11 +38,25 @@ class TrainingJob:
 
 
 @dataclass
+class JobProgress:
+    stage: str = "training"
+    training_completed: int = 0
+    training_total: int | None = None
+    validation_completed: int = 0
+    validation_total: int | None = None
+    training_elapsed_seconds: float | None = None
+    validation_elapsed_seconds: float | None = None
+
+
+@dataclass
 class RunningJob:
     job: TrainingJob
     gpu: str
     process: subprocess.Popen
     start_time: float
+    progress_file: str
+    progress_file_offset: int = 0
+    progress: JobProgress = field(default_factory=JobProgress)
 
 
 @dataclass(frozen=True)
@@ -44,12 +65,144 @@ class FinishedJob:
     gpu: str
     returncode: int
     elapsed_seconds: float
+    progress: JobProgress = field(default_factory=JobProgress)
+
+
+class BatchTrainingAborted(RuntimeError):
+    pass
+
+
+class ProgressEventWriter:
+    def __init__(self, progress_file: str, monotonic: Callable[[], float] = time.monotonic):
+        self.progress_file = progress_file
+        self.monotonic = monotonic
+        self.stage_start_times: dict[str, float] = {}
+
+    def __call__(self, event: str, completed: int | None = None, total: int | None = None) -> None:
+        now = self.monotonic()
+        stage = event.split("_", maxsplit=1)[0]
+        payload: dict[str, str | int | float] = {"event": event}
+        if completed is not None:
+            payload["completed"] = completed
+        if total is not None:
+            payload["total"] = total
+        if event.endswith("_started"):
+            self.stage_start_times[stage] = now
+        if event.endswith("_finished"):
+            payload["elapsed_seconds"] = now - self.stage_start_times.get(stage, now)
+
+        with open(self.progress_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
 def format_duration(seconds: float) -> str:
     minutes = max(0, int(seconds // 60))
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m"
+
+
+def job_header(status_markup: str, job: TrainingJob, gpu: str) -> str:
+    return (
+        f"{status_markup} [bold]job {job.index}/{job.total - 1}[/bold] on GPU [bold]{escape(gpu)}[/bold], "
+        f"config=[bold]{escape(job.configuration)}[/bold], fold=[bold]{job.fold}[/bold]"
+    )
+
+
+def render_progress_row(progress: JobProgress):
+    if progress.stage == "validation":
+        label = Text.from_markup("[bold blue]VALIDATION[/bold blue]")
+        completed = progress.validation_completed
+        total = progress.validation_total
+        style = "blue"
+    else:
+        label = Text.from_markup("[bold orange]TRAINING[/bold orange]")
+        completed = progress.training_completed
+        total = progress.training_total
+        style = "orange"
+
+    visible_total = max(total or 1, 1)
+    visible_completed = min(max(completed, 0), visible_total)
+    count = f"{completed}/{total}" if total is not None else f"{completed}/?"
+
+    row = Table.grid(expand=True)
+    row.add_column(width=11)
+    row.add_column(ratio=1)
+    row.add_column(width=10, justify="right")
+    row.add_row(
+        label,
+        ProgressBar(
+            total=visible_total,
+            completed=visible_completed,
+            width=None,
+            complete_style=style,
+            finished_style=style,
+            pulse_style=style,
+        ),
+        Text(count),
+    )
+    return row
+
+
+def render_running_panel(running_job: RunningJob) -> Panel:
+    return render_start_panel(running_job.job, running_job.gpu, running_job.progress)
+
+
+def render_start_panel(job: TrainingJob, gpu: str, progress: JobProgress | None = None) -> Panel:
+    return Panel(
+        Group(
+            Text.from_markup(job_header("[bold cyan]START[/bold cyan]", job, gpu)),
+            render_progress_row(progress or JobProgress()),
+        ),
+        border_style="cyan",
+    )
+
+
+def render_finished_panel(result: FinishedJob) -> Panel:
+    if result.returncode == 0:
+        status = "[bold green]DONE[/bold green]"
+        border_style = "green"
+    else:
+        status = f"[bold red]FAILED[/bold red] returncode=[bold]{result.returncode}[/bold]"
+        border_style = "red"
+
+    progress = result.progress
+    if progress.training_elapsed_seconds is None:
+        training = "[bold orange]TRAINING[/bold orange] not completed"
+    else:
+        training = (
+            f"[bold orange]TRAINING[/bold orange] finished in "
+            f"[bold]{format_duration(progress.training_elapsed_seconds)}[/bold]"
+        )
+    if progress.validation_elapsed_seconds is None:
+        validation = "[bold blue]VALIDATION[/bold blue] not completed"
+    else:
+        validation = (
+            f"[bold blue]VALIDATION[/bold blue] finished in "
+            f"[bold]{format_duration(progress.validation_elapsed_seconds)}[/bold]"
+        )
+
+    return Panel(
+        Group(
+            Text.from_markup(job_header(status, result.job, result.gpu)),
+            Text.from_markup(f"{training}    {validation}"),
+        ),
+        border_style=border_style,
+    )
+
+
+def render_abort_panel(running: Sequence[RunningJob]) -> Panel:
+    jobs = ", ".join(str(i.job.index) for i in running) if running else "none"
+    return Panel(
+        Text.from_markup(
+            f"[bold red]ABORT[/bold red] Keyboard interrupt received; gracefully terminating running jobs "
+            f"and stopping. running_jobs=[bold]{jobs}[/bold]"
+        ),
+        border_style="red",
+    )
+
+
+def render_running_jobs(running: Sequence[RunningJob]) -> Group:
+    return Group(*(render_running_panel(i) for i in running))
 
 
 def build_jobs(configurations: Sequence[str], folds: Sequence[int]) -> list[TrainingJob]:
@@ -122,7 +275,8 @@ def run_training_worker(plans_file: str,
                         configuration: str,
                         fold: int,
                         trainer_name: str,
-                        disable_tta: bool) -> None:
+                        disable_tta: bool,
+                        progress_file: str | None = None) -> None:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
@@ -137,6 +291,8 @@ def run_training_worker(plans_file: str,
         dataset_json=dataset_json,
         device=torch.device("cuda"),
     )
+    if progress_file is not None:
+        trainer.progress_callback = ProgressEventWriter(progress_file)
 
     maybe_load_checkpoint(trainer, continue_training=False, validation_only=False, pretrained_weights_file=None)
 
@@ -152,7 +308,8 @@ def make_worker_command(plans_file: str,
                         configuration: str,
                         fold: int,
                         trainer_name: str,
-                        disable_tta: bool) -> list[str]:
+                        disable_tta: bool,
+                        progress_file: str | None = None) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -169,6 +326,8 @@ def make_worker_command(plans_file: str,
     ]
     if disable_tta:
         command.append("--disable-tta")
+    if progress_file is not None:
+        command += ["--progress-file", progress_file]
     return command
 
 
@@ -176,44 +335,125 @@ def launch_job(job: TrainingJob,
                gpu: str,
                plans_file: str,
                trainer_name: str,
-               disable_tta: bool) -> subprocess.Popen:
+               disable_tta: bool,
+               progress_file: str | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     return subprocess.Popen(
-        make_worker_command(plans_file, job.configuration, job.fold, trainer_name, disable_tta),
+        make_worker_command(plans_file, job.configuration, job.fold, trainer_name, disable_tta, progress_file),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
+        start_new_session=True,
     )
 
 
 def log_start(console: Console, job: TrainingJob, gpu: str) -> None:
-    console.print(
-        Panel(
-            f"[bold cyan]START[/bold cyan] [bold]job {job.index}/{job.total - 1}[/bold] "
-            f"on GPU [bold]{gpu}[/bold]\n"
-            f"config=[bold]{job.configuration}[/bold] fold=[bold]{job.fold}[/bold]",
-            border_style="cyan",
-        )
-    )
+    console.print(render_start_panel(job, gpu))
 
 
 def log_finish(console: Console, result: FinishedJob) -> None:
-    if result.returncode == 0:
-        status = "[bold green]DONE[/bold green]"
-        border_style = "green"
-    else:
-        status = f"[bold red]FAILED[/bold red] returncode=[bold]{result.returncode}[/bold]"
-        border_style = "red"
-    console.print(
-        Panel(
-            f"{status} [bold]job {result.job.index}/{result.job.total - 1}[/bold] "
-            f"on GPU [bold]{result.gpu}[/bold]\n"
-            f"config=[bold]{result.job.configuration}[/bold] fold=[bold]{result.job.fold}[/bold] "
-            f"time=[bold]{format_duration(result.elapsed_seconds)}[/bold]",
-            border_style=border_style,
-        )
-    )
+    console.print(render_finished_panel(result))
+
+
+def create_progress_file() -> str:
+    progress_file = tempfile.NamedTemporaryFile(prefix="nnunet_batch_train_", suffix=".jsonl", delete=False)
+    try:
+        return progress_file.name
+    finally:
+        progress_file.close()
+
+
+def cleanup_progress_file(progress_file: str) -> None:
+    if not progress_file:
+        return
+    try:
+        os.unlink(progress_file)
+    except FileNotFoundError:
+        pass
+
+
+def read_progress_events(running_job: RunningJob) -> list[dict]:
+    if not running_job.progress_file or not isfile(running_job.progress_file):
+        return []
+
+    events = []
+    with open(running_job.progress_file, "r", encoding="utf-8") as f:
+        f.seek(running_job.progress_file_offset)
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        running_job.progress_file_offset = f.tell()
+    return events
+
+
+def apply_progress_event(progress: JobProgress, event: dict) -> None:
+    event_name = event.get("event")
+    if not isinstance(event_name, str):
+        return
+
+    if event_name.startswith("training_"):
+        progress.stage = "training"
+        if isinstance(event.get("completed"), int):
+            progress.training_completed = event["completed"]
+        if isinstance(event.get("total"), int):
+            progress.training_total = event["total"]
+        if event_name == "training_finished" and isinstance(event.get("elapsed_seconds"), (int, float)):
+            progress.training_elapsed_seconds = float(event["elapsed_seconds"])
+    elif event_name.startswith("validation_"):
+        progress.stage = "validation"
+        if isinstance(event.get("completed"), int):
+            progress.validation_completed = event["completed"]
+        if isinstance(event.get("total"), int):
+            progress.validation_total = event["total"]
+        if event_name == "validation_finished" and isinstance(event.get("elapsed_seconds"), (int, float)):
+            progress.validation_elapsed_seconds = float(event["elapsed_seconds"])
+
+
+def refresh_progress(running: Sequence[RunningJob]) -> None:
+    for running_job in running:
+        for event in read_progress_events(running_job):
+            apply_progress_event(running_job.progress, event)
+
+
+def signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
+    pid = getattr(process, "pid", None)
+    if pid is not None:
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+
+    if sig == signal.SIGTERM and hasattr(process, "terminate"):
+        process.terminate()
+    elif sig == signal.SIGKILL and hasattr(process, "kill"):
+        process.kill()
+
+
+def terminate_running_jobs(running: Sequence[RunningJob],
+                           monotonic: Callable[[], float] = time.monotonic,
+                           sleep: Callable[[float], None] = time.sleep,
+                           grace_seconds: float = 15.0) -> None:
+    for running_job in running:
+        signal_process_group(running_job.process, signal.SIGTERM)
+
+    deadline = monotonic() + grace_seconds
+    while monotonic() < deadline:
+        if all(running_job.process.poll() is not None for running_job in running):
+            return
+        sleep(0.2)
+
+    for running_job in running:
+        if running_job.process.poll() is None:
+            signal_process_group(running_job.process, signal.SIGKILL)
 
 
 def print_summary(console: Console, results: Sequence[FinishedJob]) -> None:
@@ -238,42 +478,63 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
                   trainer_name: str,
                   disable_tta: bool,
                   console: Console,
-                  launcher: Callable[[TrainingJob, str, str, str, bool], subprocess.Popen] = launch_job,
+                  launcher: Callable[[TrainingJob, str, str, str, bool, str | None], subprocess.Popen] = launch_job,
                   monotonic: Callable[[], float] = time.monotonic,
                   sleep: Callable[[float], None] = time.sleep,
-                  poll_interval: float = 5.0) -> list[FinishedJob]:
+                  poll_interval: float = 1.0) -> list[FinishedJob]:
     pending = list(jobs)
     free_gpus = list(gpu_tokens)
     running: list[RunningJob] = []
     results: list[FinishedJob] = []
+    progress_files: list[str] = []
 
-    while pending or running:
-        while pending and free_gpus:
-            gpu = free_gpus.pop(0)
-            job = pending.pop(0)
-            process = launcher(job, gpu, plans_file, trainer_name, disable_tta)
-            running.append(RunningJob(job, gpu, process, monotonic()))
-            log_start(console, job, gpu)
+    try:
+        with Live(render_running_jobs(running), console=console, refresh_per_second=4, transient=True) as live:
+            while pending or running:
+                while pending and free_gpus:
+                    gpu = free_gpus.pop(0)
+                    job = pending.pop(0)
+                    progress_file = create_progress_file()
+                    progress_files.append(progress_file)
+                    process = launcher(job, gpu, plans_file, trainer_name, disable_tta, progress_file)
+                    running.append(RunningJob(job, gpu, process, monotonic(), progress_file))
 
-        finished = []
-        for running_job in running:
-            returncode = running_job.process.poll()
-            if returncode is not None:
-                result = FinishedJob(
-                    running_job.job,
-                    running_job.gpu,
-                    returncode,
-                    monotonic() - running_job.start_time,
-                )
-                results.append(result)
-                finished.append(running_job)
-                free_gpus.append(running_job.gpu)
-                log_finish(console, result)
+                refresh_progress(running)
 
-        if finished:
-            running = [i for i in running if i not in finished]
-        elif running:
-            sleep(poll_interval)
+                finished = []
+                for running_job in running:
+                    returncode = running_job.process.poll()
+                    if returncode is not None:
+                        for event in read_progress_events(running_job):
+                            apply_progress_event(running_job.progress, event)
+                        result = FinishedJob(
+                            running_job.job,
+                            running_job.gpu,
+                            returncode,
+                            monotonic() - running_job.start_time,
+                            running_job.progress,
+                        )
+                        results.append(result)
+                        finished.append(running_job)
+                        free_gpus.append(running_job.gpu)
+                        live.console.print(render_finished_panel(result))
+
+                if finished:
+                    running = [i for i in running if i not in finished]
+                    for running_job in finished:
+                        cleanup_progress_file(running_job.progress_file)
+
+                live.update(render_running_jobs(running))
+
+                if not finished and running:
+                    sleep(poll_interval)
+    except KeyboardInterrupt as exc:
+        console.print(render_abort_panel(running))
+        terminate_running_jobs(running, monotonic=monotonic, sleep=sleep)
+        raise BatchTrainingAborted from exc
+    finally:
+        for progress_file in progress_files:
+            cleanup_progress_file(progress_file)
 
     return results
 
@@ -312,6 +573,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plans-file", help=argparse.SUPPRESS)
     parser.add_argument("--configuration", help=argparse.SUPPRESS)
     parser.add_argument("--fold", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--progress-file", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.worker:
@@ -327,7 +589,14 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.worker:
-        run_training_worker(args.plans_file, args.configuration, args.fold, args.trainer, args.disable_tta)
+        run_training_worker(
+            args.plans_file,
+            args.configuration,
+            args.fold,
+            args.trainer,
+            args.disable_tta,
+            args.progress_file,
+        )
         return 0
 
     console = Console()
@@ -344,7 +613,10 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
         f"[bold]Scheduling {len(jobs)} jobs[/bold] across [bold]{len(gpu_tokens)} GPUs[/bold] "
         f"with plans [bold]{plans_file}[/bold]"
     )
-    results = schedule_jobs(jobs, gpu_tokens, plans_file, args.trainer, args.disable_tta, console)
+    try:
+        results = schedule_jobs(jobs, gpu_tokens, plans_file, args.trainer, args.disable_tta, console)
+    except BatchTrainingAborted:
+        return 130
     print_summary(console, results)
     return 1 if any(i.returncode != 0 for i in results) else 0
 

@@ -7,7 +7,7 @@ import warnings
 from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
-from typing import Tuple, Union, List
+from typing import Callable, Tuple, Union, List
 
 import numpy as np
 import torch
@@ -185,6 +185,7 @@ class nnUNetTrainer(object):
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
+        self.progress_callback: Callable[[str, int | None, int | None], None] | None = None
 
         ### initializing stuff for remembering things and such
         self._best_ema = None
@@ -1193,6 +1194,10 @@ class nnUNetTrainer(object):
 
         self.current_epoch += 1
 
+    def report_progress(self, event: str, completed: int | None = None, total: int | None = None) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(event, completed, total)
+
     def save_checkpoint(self, filename: str) -> None:
         if self.local_rank == 0:
             if not self.disable_checkpointing:
@@ -1294,6 +1299,8 @@ class nnUNetTrainer(object):
 
             dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
                                              folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+            validation_total = len(dataset_val.identifiers)
+            self.report_progress("validation_started", 0, validation_total)
 
             next_stages = self.configuration_manager.next_stage_names
 
@@ -1386,6 +1393,7 @@ class nnUNetTrainer(object):
                             )
                         ))
                 # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+                self.report_progress("validation_progress", i + 1, validation_total)
                 if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
                     dist.barrier()
 
@@ -1414,9 +1422,11 @@ class nnUNetTrainer(object):
 
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
+        self.report_progress("validation_finished", validation_total, validation_total)
 
     def run_training(self):
         self.on_train_start()
+        self.report_progress("training_started", self.current_epoch, self.num_epochs)
 
         for epoch in range(self.current_epoch, self.num_epochs):
             self.on_epoch_start()
@@ -1435,5 +1445,7 @@ class nnUNetTrainer(object):
                 self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()
+            self.report_progress("training_progress", self.current_epoch, self.num_epochs)
 
         self.on_train_end()
+        self.report_progress("training_finished", self.num_epochs, self.num_epochs)
