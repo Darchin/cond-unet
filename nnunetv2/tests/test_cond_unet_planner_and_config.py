@@ -73,6 +73,11 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
 
         self.assertEqual(patch_size_unit_mm, [128.0, 48.0, 144.0])
 
+    def test_stem_kernel_size_is_clamped_to_minimum_three(self):
+        stem_kernel_size = CondUNetPlanner.compute_stem_kernel_size([1, 2, 3, 4])
+
+        self.assertEqual(stem_kernel_size, [3, 3, 5, 7])
+
     def test_architecture_uses_relu(self):
         planner = CondUNetPlanner.__new__(CondUNetPlanner)
 

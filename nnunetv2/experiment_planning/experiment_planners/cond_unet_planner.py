@@ -112,6 +112,10 @@ class CondUNetPlanner(ExperimentPlanner):
         return [float(i) for i in patch_size_unit_mm]
 
     @staticmethod
+    def compute_stem_kernel_size(stem_stride: List[int]) -> List[int]:
+        return [max(3, int(2 * i - 1)) for i in stem_stride]
+
+    @staticmethod
     def _transpose(spatial_values: Union[np.ndarray, List[int], List[float]],
                    transpose_forward: List[int]) -> np.ndarray:
         return np.asarray(spatial_values)[transpose_forward]
@@ -217,7 +221,7 @@ class CondUNetPlanner(ExperimentPlanner):
         )
         patch_size_unit_mm = self.compute_patch_size_unit_mm(patch_size_unit, target_spacing_transposed)
         stem_stride_list = [int(i) for i in stem_stride_transposed]
-        stem_kernel_size = [int(2 * i - 1) for i in stem_stride_list]
+        stem_kernel_size = self.compute_stem_kernel_size(stem_stride_list)
 
         n_stages = post_stem_downsampling_stages + 1
 
