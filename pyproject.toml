@@ -52,6 +52,7 @@ dependencies = [
     "batchgeneratorsv2>=0.3.2",
     "einops",
     "blosc2>=3.3.2",
+    "setuptools>=67.8.0",
     "triton"
 ]
 
