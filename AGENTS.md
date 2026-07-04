@@ -89,6 +89,15 @@ Expected CondUNet planning workflow:
 - It runs FP16 mixed-precision forward/backward passes with DiceCE loss and reports mean +/- std dev for peak step memory, forward time, backward time, and total time.
 - The benchmark requires CUDA and handles CUDA OOM by clearing CUDA memory and exiting with a concise error.
 
+## Batch Training Utility
+
+- Batch training scheduler: `nnunetv2/run/batch_train.py`.
+- Console entrypoint: `nnUNetv2_train_batch`.
+- It schedules one `nnUNetv2_train`-equivalent worker per visible GPU and starts queued jobs as GPUs become free.
+- Job order is configuration-major, then fold-minor: all requested folds for the first configuration, then all requested folds for the next configuration.
+- Defaults are tailored for this fork: `--plan nnUNetCondUNetPlans` and `--trainer nnUNetTrainerAdamW`.
+- `--disable-tta` disables validation test-time augmentation for all scheduled jobs; TTA remains enabled by default when the flag is omitted.
+
 ## Trainer Lookup
 
 - `nnunetv2/utilities/find_objects.py` and `nnunetv2/utilities/find_class_by_name.py` include local behavior around external trainer lookup via `nnUNet_extTrainer`.
