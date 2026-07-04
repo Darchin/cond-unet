@@ -12,9 +12,9 @@ from nnunetv2.preprocessing.resampling.default_resampling import compute_new_sha
 
 class CondUNetPlanner(ExperimentPlanner):
     presets = {
-        "2x": {"stem_factor": 2, "post_stem_downsampling_stages": 5},
-        "3x": {"stem_factor": 3, "post_stem_downsampling_stages": 4},
-        "4x": {"stem_factor": 4, "post_stem_downsampling_stages": 4},
+        "2x": {"stem_factor": 2, "post_stem_downsampling_stages": 4},
+        "3x": {"stem_factor": 3, "post_stem_downsampling_stages": 3},
+        "4x": {"stem_factor": 4, "post_stem_downsampling_stages": 3},
     }
     spacing_percentile_min = 25
     spacing_percentile_step = 5
@@ -151,7 +151,7 @@ class CondUNetPlanner(ExperimentPlanner):
                 "norm_op_kwargs": {"eps": 1e-5, "affine": True},
                 "dropout_op": None,
                 "dropout_op_kwargs": None,
-                "nonlin": "torch.nn.LeakyReLU",
+                "nonlin": "torch.nn.ReLU",
                 "nonlin_kwargs": {"inplace": True},
                 "upsample_mode": "linear",
                 "stem": {
@@ -160,6 +160,22 @@ class CondUNetPlanner(ExperimentPlanner):
                 },
             },
             "_kw_requires_import": ("conv_op", "norm_op", "dropout_op", "nonlin"),
+        }
+
+    def _base_configuration(self) -> dict:
+        resampling_data, resampling_data_kwargs, resampling_seg, resampling_seg_kwargs = self.determine_resampling()
+        resampling_softmax, resampling_softmax_kwargs = self.determine_segmentation_softmax_export_fn()
+        normalization_schemes, mask_is_used_for_norm = \
+            self.determine_normalization_scheme_and_whether_mask_is_used_for_norm()
+        return {
+            "normalization_schemes": normalization_schemes,
+            "use_mask_for_norm": mask_is_used_for_norm,
+            "resampling_fn_data": resampling_data.__name__,
+            "resampling_fn_seg": resampling_seg.__name__,
+            "resampling_fn_data_kwargs": resampling_data_kwargs,
+            "resampling_fn_seg_kwargs": resampling_seg_kwargs,
+            "resampling_fn_probabilities": resampling_softmax.__name__,
+            "resampling_fn_probabilities_kwargs": resampling_softmax_kwargs,
         }
 
     def _plan_for_preset(self, configuration_name: str, transpose_forward: List[int]) -> dict:
@@ -187,13 +203,10 @@ class CondUNetPlanner(ExperimentPlanner):
         stem_stride_list = [int(i) for i in stem_stride_transposed]
         stem_kernel_size = [int(2 * i - 1) for i in stem_stride_list]
 
-        resampling_data, resampling_data_kwargs, resampling_seg, resampling_seg_kwargs = self.determine_resampling()
-        resampling_softmax, resampling_softmax_kwargs = self.determine_segmentation_softmax_export_fn()
-        normalization_schemes, mask_is_used_for_norm = \
-            self.determine_normalization_scheme_and_whether_mask_is_used_for_norm()
         n_stages = post_stem_downsampling_stages + 1
 
         return {
+            "inherits_from": "base",
             "data_identifier": self.generate_data_identifier(configuration_name),
             "preprocessor_name": self.preprocessor_name,
             "batch_size": self.UNet_min_batch_size,
@@ -203,15 +216,7 @@ class CondUNetPlanner(ExperimentPlanner):
             "patch_size_aspect_ratio": aspect_ratio,
             "median_image_size_in_voxels": [int(round(i)) for i in median_shape_transposed],
             "spacing": [float(i) for i in target_spacing_transposed],
-            "normalization_schemes": normalization_schemes,
-            "use_mask_for_norm": mask_is_used_for_norm,
-            "resampling_fn_data": resampling_data.__name__,
-            "resampling_fn_seg": resampling_seg.__name__,
-            "resampling_fn_data_kwargs": resampling_data_kwargs,
-            "resampling_fn_seg_kwargs": resampling_seg_kwargs,
-            "resampling_fn_probabilities": resampling_softmax.__name__,
-            "resampling_fn_probabilities_kwargs": resampling_softmax_kwargs,
-            "batch_dice": False,
+            "batch_dice": True,
             "architecture": self._architecture(
                 len(target_spacing_transposed), n_stages, post_stem_downsampling_stages,
                 stem_stride_list, stem_kernel_size
@@ -231,10 +236,11 @@ class CondUNetPlanner(ExperimentPlanner):
             raise RuntimeError("CondUNetPlanner only generates 3D configurations.")
 
         transpose_forward, transpose_backward = self.determine_transpose()
-        configurations = {
+        configurations = {"base": self._base_configuration()}
+        configurations.update({
             name: self._plan_for_preset(name, transpose_forward)
             for name in self.presets
-        }
+        })
 
         median_shape = np.median(self.dataset_fingerprint["shapes_after_crop"], axis=0)[transpose_forward]
         median_spacing_transposed = median_spacing[transpose_forward]

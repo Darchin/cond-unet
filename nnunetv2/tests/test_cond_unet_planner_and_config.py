@@ -9,6 +9,11 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 
 class TestCondUNetPlannerHelpers(unittest.TestCase):
+    def test_presets_use_expected_stage_depths(self):
+        self.assertEqual(CondUNetPlanner.presets["2x"]["post_stem_downsampling_stages"], 4)
+        self.assertEqual(CondUNetPlanner.presets["3x"]["post_stem_downsampling_stages"], 3)
+        self.assertEqual(CondUNetPlanner.presets["4x"]["post_stem_downsampling_stages"], 3)
+
     def test_spacing_percentiles_are_json_friendly(self):
         percentiles = CondUNetFingerprintExtractor.compute_spacing_percentiles(
             [[1.0, 5.0, 1.0], [1.0, 3.0, 1.0]]
@@ -51,8 +56,63 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         self.assertEqual(aspect_ratio, [2, 1, 2])
         self.assertEqual(patch_size_unit, [32, 48, 96])
 
+    def test_architecture_uses_relu(self):
+        planner = CondUNetPlanner.__new__(CondUNetPlanner)
+
+        architecture = planner._architecture(
+            dim=3,
+            n_stages=5,
+            post_stem_downsampling_stages=4,
+            stem_stride=[2, 2, 2],
+            stem_kernel_size=[3, 3, 3],
+        )
+
+        self.assertEqual(architecture["arch_kwargs"]["nonlin"], "torch.nn.ReLU")
+        self.assertEqual(architecture["arch_kwargs"]["nonlin_kwargs"], {"inplace": True})
+        self.assertEqual(architecture["arch_kwargs"]["n_stages"], 5)
+        self.assertEqual(len(architecture["arch_kwargs"]["strides"]), 5)
+
 
 class TestPlansManagerCondUNetConfig(unittest.TestCase):
+    def test_preset_inherits_shared_preprocessing_keys_from_base(self):
+        plans = {
+            "configurations": {
+                "base": {
+                    "normalization_schemes": ["ZScoreNormalization"],
+                    "use_mask_for_norm": [False],
+                    "resampling_fn_data": "resample_data_or_seg_to_shape",
+                    "resampling_fn_seg": "resample_data_or_seg_to_shape",
+                    "resampling_fn_data_kwargs": {"is_seg": False},
+                    "resampling_fn_seg_kwargs": {"is_seg": True},
+                    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+                    "resampling_fn_probabilities_kwargs": {"is_seg": False},
+                },
+                "2x": {
+                    "inherits_from": "base",
+                    "data_identifier": "two_x",
+                    "preprocessor_name": "DefaultPreprocessor",
+                    "batch_size": 2,
+                    "patch_size": [16, 32, 48],
+                    "patch_size_unit": [16, 32, 48],
+                    "patch_size_multiplier": None,
+                    "median_image_size_in_voxels": [128, 128, 128],
+                    "spacing": [1.0, 1.0, 1.0],
+                    "batch_dice": True,
+                    "architecture": {
+                        "network_class_name": "ParentNet",
+                        "arch_kwargs": {"features_per_stage": None},
+                        "_kw_requires_import": [],
+                    },
+                },
+            }
+        }
+
+        config = PlansManager(plans).get_configuration("2x")
+
+        self.assertEqual(config.normalization_schemes, ["ZScoreNormalization"])
+        self.assertEqual(config.use_mask_for_norm, [False])
+        self.assertTrue(config.batch_dice)
+
     def test_merge_arch_kwargs_and_derive_patch_size(self):
         plans = {
             "configurations": {
