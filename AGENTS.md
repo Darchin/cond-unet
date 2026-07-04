@@ -81,6 +81,14 @@ Expected CondUNet planning workflow:
 - `nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py` and `nnunetv2/run/run_training.py` include local support for disabling test-time augmentation during post-training validation.
 - Preserve the training-script `--disable-tta` behavior when touching validation or training entrypoints.
 
+## Benchmark Utility
+
+- CUDA benchmark script: `nnunetv2/run/benchmark.py`.
+- Console entrypoint: `nnUNetv2_benchmark`.
+- The utility benchmarks model/data configurations with dummy tensors derived from configuration batch size, patch size, and input channels.
+- It runs FP16 mixed-precision forward/backward passes with DiceCE loss and reports mean +/- std dev for peak step memory, forward time, backward time, and total time.
+- The benchmark requires CUDA and handles CUDA OOM by clearing CUDA memory and exiting with a concise error.
+
 ## Trainer Lookup
 
 - `nnunetv2/utilities/find_objects.py` and `nnunetv2/utilities/find_class_by_name.py` include local behavior around external trainer lookup via `nnUNet_extTrainer`.
