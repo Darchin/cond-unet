@@ -1,7 +1,7 @@
 [project]
 name = "nnunetv2"
 version = "2.8.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.12"
 description = "nnU-Net is a framework for out-of-the box image segmentation."
 readme = "readme.md"
 license = { file = "LICENSE" }
@@ -83,6 +83,7 @@ nnUNetv2_convert_MSD_dataset = "nnunetv2.dataset_conversion.convert_MSD_dataset:
 
 [project.optional-dependencies]
 dev = [
+    "pytest",
     "pre-commit"
 ]
 intel_macos = [
@@ -99,7 +100,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py311"
 select = ["E", "F", "W"]
 ignore = ["F403", "F405", "E501", "E741", "E722"]
 
