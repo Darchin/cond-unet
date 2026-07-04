@@ -121,6 +121,7 @@ class nnUNetTrainer(object):
         logger_config = {"plans": plans, "configuration": configuration, "fold": fold, "dataset": dataset_json}
         self.plans_manager = PlansManager(plans)
         self.configuration_manager = self.plans_manager.get_configuration(configuration)
+        self.configuration_manager.validate_required_for_training(configuration)
         self.configuration_name = configuration
         self.dataset_json = dataset_json
         self.fold = fold

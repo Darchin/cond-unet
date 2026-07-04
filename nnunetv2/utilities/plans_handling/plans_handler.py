@@ -124,6 +124,14 @@ class ConfigurationManager(object):
         return self.configuration['patch_size']
 
     @property
+    def patch_size_unit(self) -> Union[List[int], None]:
+        return self.configuration.get('patch_size_unit')
+
+    @property
+    def patch_size_multiplier(self) -> Union[int, None]:
+        return self.configuration.get('patch_size_multiplier')
+
+    @property
     def median_image_size_in_voxels(self) -> List[int]:
         return self.configuration['median_image_size_in_voxels']
 
@@ -150,6 +158,48 @@ class ConfigurationManager(object):
     @property
     def network_arch_init_kwargs_req_import(self) -> Union[Tuple[str, ...], List[str]]:
         return self.configuration['architecture']['_kw_requires_import']
+
+    @property
+    def trainer(self) -> dict:
+        return self.configuration.get('trainer', {})
+
+    @property
+    def required_for_training(self) -> List[str]:
+        return self.configuration.get('required_for_training', [])
+
+    @staticmethod
+    def _get_nested_value(dct: dict, path: str):
+        cur = dct
+        for part in path.split('.'):
+            if not isinstance(cur, dict) or part not in cur:
+                return None, False
+            cur = cur[part]
+        return cur, True
+
+    @staticmethod
+    def _is_missing_required_value(value) -> bool:
+        return value is None or value == []
+
+    def validate_required_for_training(self, configuration_name: str = None) -> None:
+        missing = []
+        for path in self.required_for_training:
+            value, exists = self._get_nested_value(self.configuration, path)
+            if not exists or self._is_missing_required_value(value):
+                missing.append(path)
+
+        if self.patch_size_unit is not None:
+            multiplier = self.patch_size_multiplier
+            if not isinstance(multiplier, int) or isinstance(multiplier, bool) or multiplier < 1:
+                if 'patch_size_multiplier' not in missing:
+                    missing.append('patch_size_multiplier')
+
+        if missing:
+            config = '' if configuration_name is None else f" '{configuration_name}'"
+            raise RuntimeError(
+                f"Configuration{config} is incomplete and cannot be used for training or inference. "
+                f"Please create a child configuration or edit the plans file to provide valid values for: "
+                f"{missing}"
+            )
 
     @property
     def pool_op_kernel_sizes(self) -> Tuple[Tuple[int, ...], ...]:
@@ -248,8 +298,51 @@ class PlansManager(object):
                 visited = (*visited, configuration_name)
 
             base_config = self._internal_resolve_configuration_inheritance(parent_config_name, visited)
-            base_config.update(configuration)
-            configuration = base_config
+            configuration = self._merge_inherited_configuration(base_config, configuration)
+        configuration = self._resolve_patch_size_from_multiplier(configuration_name, configuration)
+        return configuration
+
+    @staticmethod
+    def _merge_inherited_configuration(base_config: dict, child_config: dict) -> dict:
+        base_config = deepcopy(base_config)
+        child_config = deepcopy(child_config)
+        architecture = child_config.get('architecture')
+        if isinstance(architecture, dict) and architecture.get('merge_arch_kwargs', False):
+            parent_architecture = deepcopy(base_config.get('architecture', {}))
+            parent_arch_kwargs = deepcopy(parent_architecture.get('arch_kwargs', {}))
+            child_arch_kwargs = deepcopy(architecture.get('arch_kwargs', {}))
+            merged_architecture = parent_architecture
+            merged_architecture.update(architecture)
+            merged_architecture['arch_kwargs'] = parent_arch_kwargs
+            merged_architecture['arch_kwargs'].update(child_arch_kwargs)
+            child_config['architecture'] = merged_architecture
+
+        base_config.update(child_config)
+        return base_config
+
+    @staticmethod
+    def _is_valid_patch_size_multiplier(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+    @classmethod
+    def _resolve_patch_size_from_multiplier(cls, configuration_name: str, configuration: dict) -> dict:
+        patch_size_unit = configuration.get('patch_size_unit')
+        patch_size_multiplier = configuration.get('patch_size_multiplier')
+        if patch_size_unit is None or not cls._is_valid_patch_size_multiplier(patch_size_multiplier):
+            return configuration
+
+        derived_patch_size = [int(i) * patch_size_multiplier for i in patch_size_unit]
+        existing_patch_size = configuration.get('patch_size')
+        if existing_patch_size is not None:
+            existing_patch_size = [int(i) for i in existing_patch_size]
+        patch_size_unit_as_int = [int(i) for i in patch_size_unit]
+        if existing_patch_size is not None and existing_patch_size not in (derived_patch_size, patch_size_unit_as_int):
+            raise RuntimeError(
+                f"Configuration {configuration_name} defines patch_size_multiplier={patch_size_multiplier}, "
+                f"which implies patch_size={derived_patch_size} from patch_size_unit={patch_size_unit_as_int}, "
+                f"but patch_size is explicitly set to {existing_patch_size}."
+            )
+        configuration['patch_size'] = derived_patch_size
         return configuration
 
     @lru_cache(maxsize=10)
