@@ -12,9 +12,36 @@ from nnunetv2.preprocessing.resampling.default_resampling import compute_new_sha
 
 class CondUNetPlanner(ExperimentPlanner):
     presets = {
-        "2x": {"stem_factor": 2, "post_stem_downsampling_stages": 4},
-        "3x": {"stem_factor": 3, "post_stem_downsampling_stages": 3},
-        "4x": {"stem_factor": 4, "post_stem_downsampling_stages": 3},
+        "2x": {
+            "stem_factor": 2,
+            "post_stem_downsampling_stages": 4,
+            "arch_kwargs": {
+                "encoder_n_blocks_per_stage": [2, 3, 3, 9, 3],
+                "decoder_n_blocks_per_stage": [1, 1, 1, 1],
+                "encoder_expansion_ratio": [2.0, 2.0, 4.0, 4.0, 4.0],
+                "decoder_expansion_ratio": 1.0,
+            },
+        },
+        "3x": {
+            "stem_factor": 3,
+            "post_stem_downsampling_stages": 3,
+            "arch_kwargs": {
+                "encoder_n_blocks_per_stage": [3, 3, 9, 3],
+                "decoder_n_blocks_per_stage": [1, 1, 1],
+                "encoder_expansion_ratio": [2.0, 4.0, 4.0, 4.0],
+                "decoder_expansion_ratio": 1.0,
+            },
+        },
+        "4x": {
+            "stem_factor": 4,
+            "post_stem_downsampling_stages": 3,
+            "arch_kwargs": {
+                "encoder_n_blocks_per_stage": [3, 3, 9, 3],
+                "decoder_n_blocks_per_stage": [1, 1, 1],
+                "encoder_expansion_ratio": [2.0, 4.0, 4.0, 4.0],
+                "decoder_expansion_ratio": 1.0,
+            },
+        },
     }
     spacing_percentile_min = 25
     spacing_percentile_step = 5
@@ -150,34 +177,38 @@ class CondUNetPlanner(ExperimentPlanner):
         return self._transpose(np.median(new_shapes, axis=0), transpose_forward)
 
     def _architecture(self, dim: int, n_stages: int, post_stem_downsampling_stages: int,
-                      stem_stride: List[int], stem_kernel_size: List[int]) -> dict:
+                      stem_stride: List[int], stem_kernel_size: List[int],
+                      arch_kwargs_defaults: dict = None) -> dict:
         conv_op = convert_dim_to_conv_op(dim)
         norm = get_matching_instancenorm(conv_op)
         stage_strides = [[1] * dim] + [[2] * dim for _ in range(post_stem_downsampling_stages)]
         kernel_sizes = [[3] * dim for _ in range(n_stages)]
+        arch_kwargs_defaults = {} if arch_kwargs_defaults is None else dict(arch_kwargs_defaults)
+        arch_kwargs = {
+            "n_stages": n_stages,
+            "features_per_stage": None,
+            "conv_op": conv_op.__module__ + "." + conv_op.__name__,
+            "kernel_sizes": kernel_sizes,
+            "strides": stage_strides,
+            "encoder_n_blocks_per_stage": None,
+            "decoder_n_blocks_per_stage": None,
+            "conv_bias": True,
+            "norm_op": norm.__module__ + "." + norm.__name__,
+            "norm_op_kwargs": {"eps": 1e-5, "affine": True},
+            "dropout_op": None,
+            "dropout_op_kwargs": None,
+            "nonlin": "torch.nn.ReLU",
+            "nonlin_kwargs": {"inplace": True},
+            "upsample_mode": "linear",
+            "stem": {
+                "stride": stem_stride,
+                "kernel_size": stem_kernel_size,
+            },
+        }
+        arch_kwargs.update(arch_kwargs_defaults)
         return {
             "network_class_name": "nnunetv2.training.network_architecture.cond_unet.CondUNet",
-            "arch_kwargs": {
-                "n_stages": n_stages,
-                "features_per_stage": None,
-                "conv_op": conv_op.__module__ + "." + conv_op.__name__,
-                "kernel_sizes": kernel_sizes,
-                "strides": stage_strides,
-                "encoder_n_blocks_per_stage": None,
-                "decoder_n_blocks_per_stage": None,
-                "conv_bias": True,
-                "norm_op": norm.__module__ + "." + norm.__name__,
-                "norm_op_kwargs": {"eps": 1e-5, "affine": True},
-                "dropout_op": None,
-                "dropout_op_kwargs": None,
-                "nonlin": "torch.nn.ReLU",
-                "nonlin_kwargs": {"inplace": True},
-                "upsample_mode": "linear",
-                "stem": {
-                    "stride": stem_stride,
-                    "kernel_size": stem_kernel_size,
-                },
-            },
+            "arch_kwargs": arch_kwargs,
             "_kw_requires_import": ("conv_op", "norm_op", "dropout_op", "nonlin"),
         }
 
@@ -240,16 +271,17 @@ class CondUNetPlanner(ExperimentPlanner):
             "batch_dice": True,
             "architecture": self._architecture(
                 len(target_spacing_transposed), n_stages, post_stem_downsampling_stages,
-                stem_stride_list, stem_kernel_size
+                stem_stride_list, stem_kernel_size, preset["arch_kwargs"]
             ),
             "trainer": dict(self.trainer_defaults),
             "required_for_training": [
                 "patch_size_multiplier",
                 "architecture.arch_kwargs.features_per_stage",
-                "architecture.arch_kwargs.encoder_n_blocks_per_stage",
-                "architecture.arch_kwargs.decoder_n_blocks_per_stage",
             ],
         }
+
+    def _additional_configurations(self) -> dict:
+        return {}
 
     def plan_experiment(self):
         median_spacing = np.median(np.vstack(self.dataset_fingerprint["spacings"]), axis=0)
@@ -262,6 +294,7 @@ class CondUNetPlanner(ExperimentPlanner):
             name: self._plan_for_preset(name, transpose_forward)
             for name in self.presets
         })
+        configurations.update(self._additional_configurations())
 
         median_shape = np.median(self.dataset_fingerprint["shapes_after_crop"], axis=0)[transpose_forward]
         median_spacing_transposed = median_spacing[transpose_forward]
@@ -293,3 +326,80 @@ class CondUNetPlanner(ExperimentPlanner):
         self.plans = plans
         self.save_plans(plans)
         return plans
+
+
+class PhaseOnePlanner(CondUNetPlanner):
+    phase_one_presets = {
+        "2x-s": {
+            "inherits_from": "2x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [32, 64, 128, 256, 512],
+        },
+        "2x-m": {
+            "inherits_from": "2x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [48, 96, 192, 384, 768],
+        },
+        "2x-l": {
+            "inherits_from": "2x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [64, 128, 256, 512, 1024],
+        },
+        "3x-s": {
+            "inherits_from": "3x",
+            "patch_size_multiplier": 8,
+            "features_per_stage": [48, 96, 192, 384],
+        },
+        "3x-m": {
+            "inherits_from": "3x",
+            "patch_size_multiplier": 8,
+            "features_per_stage": [64, 128, 256, 512],
+        },
+        "3x-l": {
+            "inherits_from": "3x",
+            "patch_size_multiplier": 8,
+            "features_per_stage": [96, 192, 384, 768],
+        },
+        "4x-s": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [64, 128, 256, 512],
+        },
+        "4x-m": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [96, 192, 384, 768],
+        },
+        "4x-l": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "features_per_stage": [128, 256, 512, 1024],
+        },
+    }
+
+    def __init__(self, dataset_name_or_id: Union[str, int],
+                 gpu_memory_target_in_gb: float = 8,
+                 preprocessor_name: str = "DefaultPreprocessor",
+                 plans_name: str = "nnUNetCondUNetPhaseOnePlans",
+                 overwrite_target_spacing: Union[List[float], Tuple[float, ...]] = None,
+                 suppress_transpose: bool = False):
+        super().__init__(dataset_name_or_id, gpu_memory_target_in_gb, preprocessor_name, plans_name,
+                         overwrite_target_spacing, suppress_transpose)
+
+    @classmethod
+    def _phase_one_configuration(cls, preset: dict) -> dict:
+        return {
+            "inherits_from": preset["inherits_from"],
+            "patch_size_multiplier": preset["patch_size_multiplier"],
+            "architecture": {
+                "arch_kwargs": {
+                    "features_per_stage": preset["features_per_stage"],
+                },
+            },
+        }
+
+    def _additional_configurations(self) -> dict:
+        return {
+            name: self._phase_one_configuration(preset)
+            for name, preset in self.phase_one_presets.items()
+        }

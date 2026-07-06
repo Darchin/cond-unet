@@ -3,16 +3,57 @@ import unittest
 from nnunetv2.experiment_planning.dataset_fingerprint.cond_unet_fingerprint_extractor import (
     CondUNetFingerprintExtractor,
 )
-from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import CondUNetPlanner
+from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import CondUNetPlanner, PhaseOnePlanner
 from nnunetv2.training.nnUNetTrainer.variants.optimizer.nnUNetTrainerAdamW import nnUNetTrainerAdamW
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 
 class TestCondUNetPlannerHelpers(unittest.TestCase):
+    @staticmethod
+    def _minimal_planner(planner_class=CondUNetPlanner):
+        planner = planner_class.__new__(planner_class)
+        planner.dataset_fingerprint = {
+            "spacing_percentiles": {
+                "50": [1.0, 1.0, 1.0],
+                "45": [1.0, 1.0, 1.0],
+                "40": [1.0, 1.0, 1.0],
+                "35": [1.0, 1.0, 1.0],
+                "30": [1.0, 1.0, 1.0],
+                "25": [1.0, 1.0, 1.0],
+            },
+            "spacings": [[1.0, 1.0, 1.0]],
+            "shapes_after_crop": [[128, 128, 128]],
+        }
+        planner.overwrite_target_spacing = None
+        planner.preprocessor_name = "DefaultPreprocessor"
+        planner.generate_data_identifier = lambda configuration_name: f"data_{configuration_name}"
+        return planner
+
     def test_presets_use_expected_stage_depths(self):
         self.assertEqual(CondUNetPlanner.presets["2x"]["post_stem_downsampling_stages"], 4)
         self.assertEqual(CondUNetPlanner.presets["3x"]["post_stem_downsampling_stages"], 3)
         self.assertEqual(CondUNetPlanner.presets["4x"]["post_stem_downsampling_stages"], 3)
+
+    def test_presets_use_expected_architecture_defaults(self):
+        self.assertEqual(
+            CondUNetPlanner.presets["2x"]["arch_kwargs"],
+            {
+                "encoder_n_blocks_per_stage": [2, 3, 3, 9, 3],
+                "decoder_n_blocks_per_stage": [1, 1, 1, 1],
+                "encoder_expansion_ratio": [2.0, 2.0, 4.0, 4.0, 4.0],
+                "decoder_expansion_ratio": 1.0,
+            },
+        )
+        for configuration_name in ("3x", "4x"):
+            self.assertEqual(
+                CondUNetPlanner.presets[configuration_name]["arch_kwargs"],
+                {
+                    "encoder_n_blocks_per_stage": [3, 3, 9, 3],
+                    "decoder_n_blocks_per_stage": [1, 1, 1],
+                    "encoder_expansion_ratio": [2.0, 4.0, 4.0, 4.0],
+                    "decoder_expansion_ratio": 1.0,
+                },
+            )
 
     def test_spacing_percentiles_are_json_friendly(self):
         percentiles = CondUNetFingerprintExtractor.compute_spacing_percentiles(
@@ -93,6 +134,85 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         self.assertEqual(architecture["arch_kwargs"]["nonlin_kwargs"], {"inplace": True})
         self.assertEqual(architecture["arch_kwargs"]["n_stages"], 5)
         self.assertEqual(len(architecture["arch_kwargs"]["strides"]), 5)
+
+    def test_preset_plan_applies_architecture_defaults(self):
+        planner = self._minimal_planner()
+
+        plan = planner._plan_for_preset("2x", [0, 1, 2])
+
+        self.assertEqual(plan["architecture"]["arch_kwargs"]["encoder_n_blocks_per_stage"], [2, 3, 3, 9, 3])
+        self.assertEqual(plan["architecture"]["arch_kwargs"]["decoder_n_blocks_per_stage"], [1, 1, 1, 1])
+        self.assertEqual(plan["architecture"]["arch_kwargs"]["encoder_expansion_ratio"], [2.0, 2.0, 4.0, 4.0, 4.0])
+        self.assertEqual(plan["architecture"]["arch_kwargs"]["decoder_expansion_ratio"], 1.0)
+        self.assertEqual(
+            plan["required_for_training"],
+            [
+                "patch_size_multiplier",
+                "architecture.arch_kwargs.features_per_stage",
+            ],
+        )
+
+    def test_phase_one_planner_generates_expected_child_configurations(self):
+        planner = PhaseOnePlanner.__new__(PhaseOnePlanner)
+
+        configurations = planner._additional_configurations()
+
+        self.assertEqual(
+            list(configurations),
+            [
+                "2x-s", "2x-m", "2x-l",
+                "3x-s", "3x-m", "3x-l",
+                "4x-s", "4x-m", "4x-l",
+            ],
+        )
+        self.assertEqual(configurations["2x-s"]["inherits_from"], "2x")
+        self.assertEqual(configurations["2x-s"]["patch_size_multiplier"], 6)
+        self.assertEqual(
+            configurations["2x-s"]["architecture"]["arch_kwargs"]["features_per_stage"],
+            [32, 64, 128, 256, 512],
+        )
+        self.assertEqual(configurations["3x-l"]["inherits_from"], "3x")
+        self.assertEqual(configurations["3x-l"]["patch_size_multiplier"], 8)
+        self.assertEqual(
+            configurations["3x-l"]["architecture"]["arch_kwargs"]["features_per_stage"],
+            [96, 192, 384, 768],
+        )
+        self.assertEqual(configurations["4x-l"]["inherits_from"], "4x")
+        self.assertEqual(configurations["4x-l"]["patch_size_multiplier"], 6)
+        self.assertEqual(
+            configurations["4x-l"]["architecture"]["arch_kwargs"]["features_per_stage"],
+            [128, 256, 512, 1024],
+        )
+
+    def test_phase_one_child_configuration_resolves_as_trainable(self):
+        planner = self._minimal_planner(PhaseOnePlanner)
+        plans = {
+            "configurations": {
+                "base": {
+                    "normalization_schemes": ["ZScoreNormalization"],
+                    "use_mask_for_norm": [False],
+                    "resampling_fn_data": "resample_data_or_seg_to_shape",
+                    "resampling_fn_seg": "resample_data_or_seg_to_shape",
+                    "resampling_fn_data_kwargs": {"is_seg": False},
+                    "resampling_fn_seg_kwargs": {"is_seg": True},
+                    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+                    "resampling_fn_probabilities_kwargs": {"is_seg": False},
+                },
+                "2x": planner._plan_for_preset("2x", [0, 1, 2]),
+                "2x-m": planner._additional_configurations()["2x-m"],
+            },
+        }
+
+        config = PlansManager(plans).get_configuration("2x-m")
+
+        self.assertEqual(config.patch_size, [192, 192, 192])
+        self.assertEqual(config.patch_size_multiplier, 6)
+        self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [48, 96, 192, 384, 768])
+        self.assertEqual(config.network_arch_init_kwargs["encoder_n_blocks_per_stage"], [2, 3, 3, 9, 3])
+        self.assertEqual(config.network_arch_init_kwargs["decoder_n_blocks_per_stage"], [1, 1, 1, 1])
+        self.assertEqual(config.network_arch_init_kwargs["encoder_expansion_ratio"], [2.0, 2.0, 4.0, 4.0, 4.0])
+        self.assertEqual(config.network_arch_init_kwargs["decoder_expansion_ratio"], 1.0)
+        config.validate_required_for_training("2x-m")
 
 
 class TestPlansManagerCondUNetConfig(unittest.TestCase):
