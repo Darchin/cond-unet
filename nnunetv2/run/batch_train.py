@@ -541,7 +541,7 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
 
 def get_visible_gpus() -> list[str]:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for nnUNetv2_train_batch, but torch.cuda.is_available() is False.")
+        raise RuntimeError("CUDA is required for nnUNetv2_batch_train, but torch.cuda.is_available() is False.")
     return visible_gpu_tokens(os.environ.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count())
 
 

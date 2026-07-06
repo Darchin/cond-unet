@@ -98,7 +98,7 @@ Expected CondUNet planning workflow:
 ## Batch Training Utility
 
 - Batch training scheduler: `nnunetv2/run/batch_train.py`.
-- Console entrypoint: `nnUNetv2_train_batch`.
+- Console entrypoint: `nnUNetv2_batch_train`.
 - It schedules one `nnUNetv2_train`-equivalent worker per visible GPU and starts queued jobs as GPUs become free.
 - Job order is configuration-major, then fold-minor: all requested folds for the first configuration, then all requested folds for the next configuration.
 - Defaults are tailored for this fork: `--plan nnUNetCondUNetPlans` and `--trainer nnUNetTrainerAdamW`.
