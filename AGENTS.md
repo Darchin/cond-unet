@@ -29,19 +29,18 @@
 - Default plans identifier: `nnUNetCondUNetPlans`.
 - Custom fingerprint extractor: `nnunetv2/experiment_planning/dataset_fingerprint/cond_unet_fingerprint_extractor.py`.
 - The fingerprint extractor adds `spacing_percentiles` to `dataset_fingerprint.json`; the planner requires this field and raises a helpful error if the standard extractor was used.
-- The planner is intentionally not fully automatic. It emits incomplete base presets that are suitable for preprocessing but not directly suitable for training.
+- The planner is intentionally not fully automatic. It emits incomplete base presets that are suitable for preprocessing but still require experiment-specific scale choices before training.
 
 Generated configurations:
 
 - `base`: incomplete shared preprocessing/resampling configuration.
-- `2x`: inherits from `base`, stem factor 2, 5 total stages including the stem.
-- `3x`: inherits from `base`, stem factor 3, 4 total stages including the stem.
-- `4x`: inherits from `base`, stem factor 4, 4 total stages including the stem.
+- `2x`, `3x`, and `4x`: inherit from `base` and represent the main downsampling-factor base presets.
 
 Preset behavior:
 
 - `batch_dice` defaults to `True`.
 - Generated architecture nonlinearity is `torch.nn.ReLU` with `{"inplace": True}`.
+- Base presets include default CondUNet block-depth and expansion-ratio choices; model width remains experiment-specific.
 - Stem kernel size is derived from stem stride with `kernel_size = 2 * stride - 1` per axis.
 - `patch_size_unit`, `patch_size_unit_mm`, `patch_size_aspect_ratio`, and `median_image_size_in_voxels` are emitted to help users choose manual patch sizes.
 - `patch_size_multiplier` is emitted as `null` intentionally. Users must create child configurations that set it before training.
@@ -54,6 +53,13 @@ Expected CondUNet planning workflow:
 3. Run preprocessing on the incomplete generated presets (`2x`, `3x`, `4x`).
 4. Add user configurations that inherit from those presets and fill in manual training details.
 5. Train using the completed child configurations.
+
+## Phase One Planner
+
+- Additional planner: `PhaseOnePlanner` in `nnunetv2/experiment_planning/experiment_planners/cond_unet_planner.py`.
+- Default plans identifier: `nnUNetCondUNetPhaseOnePlans`.
+- It builds on `CondUNetPlanner` and adds a small grid of trainable child configurations for the first ablation phase.
+- These child configurations inherit the preprocessing, geometry, architecture defaults, and trainer defaults from the base presets, then fill in patch-size multiplier and model-width choices.
 
 ## Plan Inheritance And Required Fields
 
