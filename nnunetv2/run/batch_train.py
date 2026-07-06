@@ -72,6 +72,9 @@ class BatchTrainingAborted(RuntimeError):
     pass
 
 
+JobPair = tuple[str, int]
+
+
 class ProgressEventWriter:
     def __init__(self, progress_file: str, monotonic: Callable[[], float] = time.monotonic):
         self.progress_file = progress_file
@@ -115,10 +118,10 @@ def render_progress_row(progress: JobProgress):
         total = progress.validation_total
         style = "blue"
     else:
-        label = Text.from_markup("[bold orange]TRAINING[/bold orange]")
+        label = Text.from_markup("[bold yellow]TRAINING[/bold yellow]")
         completed = progress.training_completed
         total = progress.training_total
-        style = "orange"
+        style = "yellow"
 
     visible_total = max(total or 1, 1)
     visible_completed = min(max(completed, 0), visible_total)
@@ -167,10 +170,10 @@ def render_finished_panel(result: FinishedJob) -> Panel:
 
     progress = result.progress
     if progress.training_elapsed_seconds is None:
-        training = "[bold orange]TRAINING[/bold orange] not completed"
+        training = "[bold yellow]TRAINING[/bold yellow] not completed"
     else:
         training = (
-            f"[bold orange]TRAINING[/bold orange] finished in "
+            f"[bold yellow]TRAINING[/bold yellow] finished in "
             f"[bold]{format_duration(progress.training_elapsed_seconds)}[/bold]"
         )
     if progress.validation_elapsed_seconds is None:
@@ -206,12 +209,45 @@ def render_running_jobs(running: Sequence[RunningJob]) -> Group:
 
 
 def build_jobs(configurations: Sequence[str], folds: Sequence[int]) -> list[TrainingJob]:
-    total = len(configurations) * len(folds)
+    return build_jobs_from_pairs([(configuration, fold) for configuration in configurations for fold in folds])
+
+
+def build_jobs_from_pairs(job_pairs: Sequence[JobPair]) -> list[TrainingJob]:
+    total = len(job_pairs)
     jobs = []
-    for configuration in configurations:
-        for fold in folds:
-            jobs.append(TrainingJob(len(jobs), total, configuration, fold))
+    for configuration, fold in job_pairs:
+        jobs.append(TrainingJob(len(jobs), total, configuration, fold))
     return jobs
+
+
+def apply_job_overrides(jobs: Sequence[TrainingJob],
+                        include: Sequence[JobPair] | None = None,
+                        exclude: Sequence[JobPair] | None = None) -> list[TrainingJob]:
+    include = include or ()
+    exclude = exclude or ()
+    excluded = set(exclude)
+
+    job_pairs: list[JobPair] = [(job.configuration, job.fold) for job in jobs]
+    seen: set[JobPair] = set(job_pairs)
+
+    for pair in include:
+        if pair not in seen:
+            job_pairs.append(pair)
+            seen.add(pair)
+
+    return build_jobs_from_pairs([pair for pair in job_pairs if pair not in excluded])
+
+
+def requested_configurations(configurations: Sequence[str],
+                             include: Sequence[JobPair] | None = None,
+                             exclude: Sequence[JobPair] | None = None) -> list[str]:
+    requested = []
+    seen = set()
+    for configuration in list(configurations) + [i[0] for i in include or ()] + [i[0] for i in exclude or ()]:
+        if configuration not in seen:
+            requested.append(configuration)
+            seen.add(configuration)
+    return requested
 
 
 def visible_gpu_tokens(cuda_visible_devices: str | None, device_count: int) -> list[str]:
@@ -222,6 +258,30 @@ def visible_gpu_tokens(cuda_visible_devices: str | None, device_count: int) -> l
         if len(tokens) >= device_count:
             return tokens[:device_count]
     return [str(i) for i in range(device_count)]
+
+
+def parse_job_pair(value: str) -> JobPair:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"invalid job pair {value!r}; expected CONFIG,FOLD, for example 3x-s,0"
+        )
+
+    configuration = parts[0].strip()
+    fold_text = parts[1].strip()
+    if not configuration or not fold_text:
+        raise argparse.ArgumentTypeError(
+            f"invalid job pair {value!r}; expected CONFIG,FOLD, for example 3x-s,0"
+        )
+
+    try:
+        fold = int(fold_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid fold in job pair {value!r}; expected an integer fold"
+        ) from exc
+
+    return configuration, fold
 
 
 def resolve_plans_file(dataset_name_or_id: str, plans: str) -> str:
@@ -489,7 +549,7 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
     progress_files: list[str] = []
 
     try:
-        with Live(render_running_jobs(running), console=console, refresh_per_second=4, transient=True) as live:
+        with Live(render_running_jobs(running), console=console, refresh_per_second=4, transient=False) as live:
             while pending or running:
                 while pending and free_gpus:
                     gpu = free_gpus.pop(0)
@@ -564,6 +624,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-c", "--configs", nargs="+", help="Configuration names.")
     parser.add_argument("-f", "--folds", nargs="+", type=int, help="Fold indices.")
     parser.add_argument(
+        "-i",
+        "--include",
+        nargs="+",
+        type=parse_job_pair,
+        default=(),
+        metavar="CONFIG,FOLD",
+        help="Additional individual jobs to schedule, for example: -i 3x-s,0 4x-m,1",
+    )
+    parser.add_argument(
+        "-e",
+        "--exclude",
+        nargs="+",
+        type=parse_job_pair,
+        default=(),
+        metavar="CONFIG,FOLD",
+        help="Individual jobs to remove from the schedule, for example: -e 3x-s,0 4x-m,1",
+    )
+    parser.add_argument(
         "--disable-tta",
         action="store_true",
         default=False,
@@ -602,13 +680,16 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
     console = Console()
     plans_file = resolve_plans_file(args.dataset, args.plan)
     validate_plans_dataset(plans_file, args.dataset)
-    validate_requested_configurations(plans_file, args.configs)
+    validate_requested_configurations(
+        plans_file,
+        requested_configurations(args.configs, args.include, args.exclude),
+    )
 
     gpu_tokens = get_visible_gpus()
     if not gpu_tokens:
         raise RuntimeError("No visible CUDA GPUs found.")
 
-    jobs = build_jobs(args.configs, args.folds)
+    jobs = apply_job_overrides(build_jobs(args.configs, args.folds), args.include, args.exclude)
     console.print(
         f"[bold]Scheduling {len(jobs)} jobs[/bold] across [bold]{len(gpu_tokens)} GPUs[/bold] "
         f"with plans [bold]{plans_file}[/bold]"

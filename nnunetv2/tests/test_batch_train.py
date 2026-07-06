@@ -11,11 +11,13 @@ from nnunetv2.run.batch_train import (
     BatchTrainingAborted,
     FinishedJob,
     JobProgress,
+    apply_job_overrides,
     build_jobs,
     format_duration,
     parse_args,
     render_finished_panel,
     render_start_panel,
+    requested_configurations,
     resolve_plans_file,
     schedule_jobs,
     validate_requested_configurations,
@@ -66,12 +68,70 @@ class TestBatchTrain(unittest.TestCase):
 
         self.assertTrue(args.disable_tta)
 
+    def test_parse_args_include_and_exclude_job_pairs(self):
+        args = parse_args([
+            "-d", "1",
+            "-c", "3x-s", "4x-m",
+            "-f", "0", "1",
+            "-i", "3x-s,0", "4x-m,1",
+            "-e", "3x-s,1",
+        ])
+
+        self.assertEqual(args.include, [("3x-s", 0), ("4x-m", 1)])
+        self.assertEqual(args.exclude, [("3x-s", 1)])
+
+    def test_parse_args_rejects_invalid_job_pair(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["-d", "1", "-c", "2x", "-f", "0", "-i", "2x"])
+
     def test_build_jobs_uses_config_then_fold_order(self):
         jobs = build_jobs(["2x", "3x"], [0, 1])
 
         self.assertEqual([(i.index, i.configuration, i.fold) for i in jobs],
                          [(0, "2x", 0), (1, "2x", 1), (2, "3x", 0), (3, "3x", 1)])
         self.assertEqual([i.total for i in jobs], [4, 4, 4, 4])
+
+    def test_apply_job_overrides_appends_included_jobs_without_duplicates(self):
+        jobs = apply_job_overrides(
+            build_jobs(["3x-s", "4x-m"], [0]),
+            include=[("3x-s", 0), ("4x-m", 1), ("2x-xs", 3)],
+        )
+
+        self.assertEqual(
+            [(i.index, i.total, i.configuration, i.fold) for i in jobs],
+            [
+                (0, 4, "3x-s", 0),
+                (1, 4, "4x-m", 0),
+                (2, 4, "4x-m", 1),
+                (3, 4, "2x-xs", 3),
+            ],
+        )
+
+    def test_apply_job_overrides_removes_excluded_jobs_after_include(self):
+        jobs = apply_job_overrides(
+            build_jobs(["3x-s", "4x-m"], [0, 1]),
+            include=[("5x-l", 2), ("3x-s", 1)],
+            exclude=[("3x-s", 1), ("5x-l", 2), ("unused", 0)],
+        )
+
+        self.assertEqual(
+            [(i.index, i.total, i.configuration, i.fold) for i in jobs],
+            [
+                (0, 3, "3x-s", 0),
+                (1, 3, "4x-m", 0),
+                (2, 3, "4x-m", 1),
+            ],
+        )
+
+    def test_requested_configurations_includes_override_configs_once(self):
+        self.assertEqual(
+            requested_configurations(
+                ["3x-s", "4x-m"],
+                include=[("4x-m", 1), ("5x-l", 0)],
+                exclude=[("3x-s", 2), ("6x-xl", 0)],
+            ),
+            ["3x-s", "4x-m", "5x-l", "6x-xl"],
+        )
 
     def test_format_duration(self):
         self.assertEqual(format_duration(0), "0h 0m")
@@ -212,25 +272,23 @@ class TestBatchTrain(unittest.TestCase):
         def interrupted_sleep(_):
             raise KeyboardInterrupt
 
-        console = Console(file=open(os.devnull, "w"))
-        try:
-            with self.assertRaises(BatchTrainingAborted):
-                schedule_jobs(
-                    jobs,
-                    ["0"],
-                    "plans.json",
-                    "nnUNetTrainer",
-                    False,
-                    console,
-                    launcher=launcher,
-                    monotonic=lambda: 0.0,
-                    sleep=interrupted_sleep,
-                )
-        finally:
-            console.file.close()
+        console = Console(record=True, width=120, color_system=None)
+        with self.assertRaises(BatchTrainingAborted):
+            schedule_jobs(
+                jobs,
+                ["0"],
+                "plans.json",
+                "nnUNetTrainer",
+                False,
+                console,
+                launcher=launcher,
+                monotonic=lambda: 0.0,
+                sleep=interrupted_sleep,
+            )
 
         self.assertEqual(len(launched_processes), 1)
         self.assertTrue(launched_processes[0].terminated)
+        self.assertIn("ABORT Keyboard interrupt received", console.export_text())
 
 
 if __name__ == "__main__":
