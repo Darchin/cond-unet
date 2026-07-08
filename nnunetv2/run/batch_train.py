@@ -6,13 +6,13 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from os.path import abspath, dirname, isabs, isfile, join
 from typing import Callable, Sequence
 
 import torch
 from batchgenerators.utilities.file_and_folder_operations import load_json
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
 from nnunetv2.paths import nnUNet_preprocessed
@@ -36,6 +36,7 @@ class RunningJob:
     gpu: str
     process: subprocess.Popen
     start_time: float
+    started_at: datetime
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,8 @@ class FinishedJob:
     gpu: str
     returncode: int
     elapsed_seconds: float
+    started_at: datetime
+    finished_at: datetime
 
 
 JobPair = tuple[str, int]
@@ -55,6 +58,45 @@ def format_duration(seconds: float) -> str:
     minutes = max(0, int(seconds // 60))
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m"
+
+
+def format_verbose_duration(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    hours, minutes = divmod(minutes, 60)
+    hour_label = "hour" if hours == 1 else "hours"
+    minute_label = "minute" if minutes == 1 else "minutes"
+    return f"[bold]{hours}[/bold] {hour_label} and [bold]{minutes}[/bold] {minute_label}"
+
+
+def format_log_timestamp(timestamp: datetime) -> str:
+    return timestamp.strftime("%Y-%m-%d at %H:%M")
+
+
+def format_job_progress(job: TrainingJob, gpu: str) -> str:
+    return f"job [bold]{job.index + 1}/{job.total}[/bold] on GPU [bold]{gpu}[/bold]"
+
+
+def format_job_configuration(job: TrainingJob) -> str:
+    return f"fold [bold]{job.fold}[/bold] of config [bold]{job.configuration}[/bold]"
+
+
+def format_start_message(job: TrainingJob, gpu: str, started_at: datetime) -> str:
+    return (
+        f"[bold cyan]STARTED[/bold cyan] {format_job_progress(job, gpu)} — "
+        f"{format_job_configuration(job)} — "
+        f"started on [bold]{format_log_timestamp(started_at)}[/bold]."
+    )
+
+
+def format_finish_message(result: FinishedJob) -> str:
+    status = "[bold green]FINISHED[/bold green]" if result.returncode == 0 else "[bold red]FAILED[/bold red]"
+    return (
+        f"{status} {format_job_progress(result.job, result.gpu)} — "
+        f"{format_job_configuration(result.job)} — "
+        f"started on [bold]{format_log_timestamp(result.started_at)}[/bold], "
+        f"finished on [bold]{format_log_timestamp(result.finished_at)}[/bold], "
+        f"took {format_verbose_duration(result.elapsed_seconds)} in total."
+    )
 
 
 def build_jobs(configurations: Sequence[str], folds: Sequence[int]) -> list[TrainingJob]:
@@ -413,33 +455,12 @@ def launch_job(job: TrainingJob,
     )
 
 
-def log_start(console: Console, job: TrainingJob, gpu: str) -> None:
-    console.print(
-        Panel(
-            f"[bold cyan]START[/bold cyan] [bold]job {job.index}/{job.total - 1}[/bold] "
-            f"on GPU [bold]{gpu}[/bold]\n"
-            f"config=[bold]{job.configuration}[/bold] fold=[bold]{job.fold}[/bold]",
-            border_style="cyan",
-        )
-    )
+def log_start(console: Console, job: TrainingJob, gpu: str, started_at: datetime) -> None:
+    console.print(format_start_message(job, gpu, started_at))
 
 
 def log_finish(console: Console, result: FinishedJob) -> None:
-    if result.returncode == 0:
-        status = "[bold green]DONE[/bold green]"
-        border_style = "green"
-    else:
-        status = f"[bold red]FAILED[/bold red] returncode=[bold]{result.returncode}[/bold]"
-        border_style = "red"
-    console.print(
-        Panel(
-            f"{status} [bold]job {result.job.index}/{result.job.total - 1}[/bold] "
-            f"on GPU [bold]{result.gpu}[/bold]\n"
-            f"config=[bold]{result.job.configuration}[/bold] fold=[bold]{result.job.fold}[/bold] "
-            f"time=[bold]{format_duration(result.elapsed_seconds)}[/bold]",
-            border_style=border_style,
-        )
-    )
+    console.print(format_finish_message(result))
 
 
 def print_summary(console: Console, results: Sequence[FinishedJob]) -> None:
@@ -466,6 +487,7 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
                   console: Console,
                   launcher: Callable[[TrainingJob, str, str, str, bool], subprocess.Popen] = launch_job,
                   monotonic: Callable[[], float] = time.monotonic,
+                  wall_clock: Callable[[], datetime] = datetime.now,
                   sleep: Callable[[float], None] = time.sleep,
                   poll_interval: float = 5.0) -> list[FinishedJob]:
     pending = list(jobs)
@@ -478,18 +500,22 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
             gpu = free_gpus.pop(0)
             job = pending.pop(0)
             process = launcher(job, gpu, plans_file, trainer_name, disable_tta)
-            running.append(RunningJob(job, gpu, process, monotonic()))
-            log_start(console, job, gpu)
+            started_at = wall_clock()
+            running.append(RunningJob(job, gpu, process, monotonic(), started_at))
+            log_start(console, job, gpu, started_at)
 
         finished = []
         for running_job in running:
             returncode = running_job.process.poll()
             if returncode is not None:
+                finished_at = wall_clock()
                 result = FinishedJob(
                     running_job.job,
                     running_job.gpu,
                     returncode,
                     monotonic() - running_job.start_time,
+                    running_job.started_at,
+                    finished_at,
                 )
                 results.append(result)
                 finished.append(running_job)

@@ -1,15 +1,20 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from batchgenerators.utilities.file_and_folder_operations import save_json
 from rich.console import Console
 
 from nnunetv2.run.batch_train import (
+    FinishedJob,
     apply_job_overrides,
     build_jobs,
     format_duration,
+    format_finish_message,
+    format_start_message,
+    format_verbose_duration,
     load_job_pairs_from_json,
     parse_args,
     requested_configurations,
@@ -257,6 +262,62 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual(format_duration(59), "0h 0m")
         self.assertEqual(format_duration(61), "0h 1m")
         self.assertEqual(format_duration(7260), "2h 1m")
+
+    def test_format_verbose_duration_pluralizes_hours_and_minutes(self):
+        self.assertEqual(format_verbose_duration(0), "[bold]0[/bold] hours and [bold]0[/bold] minutes")
+        self.assertEqual(format_verbose_duration(60), "[bold]0[/bold] hours and [bold]1[/bold] minute")
+        self.assertEqual(format_verbose_duration(3600), "[bold]1[/bold] hour and [bold]0[/bold] minutes")
+        self.assertEqual(format_verbose_duration(7260), "[bold]2[/bold] hours and [bold]1[/bold] minute")
+
+    def test_format_start_message_uses_single_line_classic_style(self):
+        job = build_jobs(["3x-m"], [3])[0]
+
+        self.assertEqual(
+            format_start_message(job, "2", datetime(2026, 7, 8, 16, 33)),
+            "[bold cyan]STARTED[/bold cyan] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
+            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
+            "started on [bold]2026-07-08 at 16:33[/bold].",
+        )
+
+    def test_format_finish_message_uses_finished_times_and_duration(self):
+        job = build_jobs(["3x-m"], [3])[0]
+        result = FinishedJob(
+            job=job,
+            gpu="2",
+            returncode=0,
+            elapsed_seconds=11640,
+            started_at=datetime(2026, 7, 8, 16, 33),
+            finished_at=datetime(2026, 7, 8, 19, 47),
+        )
+
+        self.assertEqual(
+            format_finish_message(result),
+            "[bold green]FINISHED[/bold green] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
+            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
+            "started on [bold]2026-07-08 at 16:33[/bold], "
+            "finished on [bold]2026-07-08 at 19:47[/bold], "
+            "took [bold]3[/bold] hours and [bold]14[/bold] minutes in total.",
+        )
+
+    def test_format_finish_message_uses_failed_status(self):
+        job = build_jobs(["3x-m"], [3])[0]
+        result = FinishedJob(
+            job=job,
+            gpu="2",
+            returncode=1,
+            elapsed_seconds=60,
+            started_at=datetime(2026, 7, 8, 16, 33),
+            finished_at=datetime(2026, 7, 8, 16, 34),
+        )
+
+        self.assertEqual(
+            format_finish_message(result),
+            "[bold red]FAILED[/bold red] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
+            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
+            "started on [bold]2026-07-08 at 16:33[/bold], "
+            "finished on [bold]2026-07-08 at 16:34[/bold], "
+            "took [bold]0[/bold] hours and [bold]1[/bold] minute in total.",
+        )
 
     def test_visible_gpu_tokens_respects_existing_cuda_visible_devices(self):
         self.assertEqual(visible_gpu_tokens("2, 4", 2), ["2", "4"])
