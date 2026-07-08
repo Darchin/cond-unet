@@ -147,7 +147,7 @@ class TestBatchTrain(unittest.TestCase):
             save_json(
                 [
                     {"configs": ["3x-s", "3x-m"], "folds": [0, 1, 2]},
-                    {"configs": "4x-m", "folds": 4},
+                    {"configs": ["4x-m"], "folds": [4]},
                 ],
                 json_file,
             )
@@ -165,7 +165,7 @@ class TestBatchTrain(unittest.TestCase):
                 ],
             )
 
-    def test_resolve_job_json_file_prefers_jobs_directory_for_relative_paths(self):
+    def test_resolve_job_json_file_resolves_bare_names_under_jobs_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             jobs_dir = os.path.join(tmpdir, "jobs")
             fallback_dir = os.path.join(tmpdir, "fallback")
@@ -178,15 +178,17 @@ class TestBatchTrain(unittest.TestCase):
 
             with patch("nnunetv2.run.batch_train.JOBS_DIR", jobs_dir), \
                     patch.object(os, "getcwd", return_value=fallback_dir):
-                self.assertEqual(resolve_job_json_file("phase-one.json"), jobs_file)
+                self.assertEqual(resolve_job_json_file("phase-one"), jobs_file)
 
-    def test_resolve_job_json_file_falls_back_to_absolute_path(self):
+    def test_resolve_job_json_file_treats_json_names_as_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             jobs_dir = os.path.join(tmpdir, "jobs")
             fallback_dir = os.path.join(tmpdir, "fallback")
             os.makedirs(jobs_dir)
             os.makedirs(fallback_dir)
+            jobs_file = os.path.join(jobs_dir, "phase-one.json")
             fallback_file = os.path.join(fallback_dir, "phase-one.json")
+            save_json([], jobs_file)
             save_json([], fallback_file)
 
             with patch("nnunetv2.run.batch_train.JOBS_DIR", jobs_dir), \
@@ -205,7 +207,7 @@ class TestBatchTrain(unittest.TestCase):
             save_json(
                 [
                     {"configs": ["3x-s", "3x-m"], "folds": [0]},
-                    {"configs": "3x-s", "folds": 0},
+                    {"configs": ["3x-s"], "folds": [0]},
                 ],
                 json_file,
             )
@@ -224,13 +226,13 @@ class TestBatchTrain(unittest.TestCase):
     def test_load_job_pairs_from_json_rejects_invalid_shapes(self):
         invalid_specs = [
             {"configs": "3x-s", "folds": 0},
-            [{"configs": [], "folds": 0}],
-            [{"configs": "3x-s", "folds": []}],
-            [{"configs": "", "folds": 0}],
-            [{"configs": [1], "folds": 0}],
-            [{"configs": "3x-s", "folds": [True]}],
+            [{"configs": [], "folds": [0]}],
+            [{"configs": ["3x-s"], "folds": []}],
+            [{"configs": [""], "folds": [0]}],
+            [{"configs": [1], "folds": [0]}],
+            [{"configs": ["3x-s"], "folds": [True]}],
             [{"configs": "3x-s"}],
-            [{"configs": "3x-s", "folds": 0, "priority": 1}],
+            [{"configs": ["3x-s"], "folds": [0], "priority": 1}],
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             for index, spec in enumerate(invalid_specs):

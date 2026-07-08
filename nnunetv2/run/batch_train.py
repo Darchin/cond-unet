@@ -135,20 +135,16 @@ def resolve_cli_job_pairs(configurations: Sequence[str] | None,
     return job_pairs
 
 
-def normalize_json_values(value: object,
-                          *,
-                          key: str,
-                          entry_index: int,
-                          expected_type: type) -> list:
+def validate_json_array(value: object,
+                        *,
+                        key: str,
+                        entry_index: int,
+                        expected_type: type) -> list:
     expected_name = expected_type.__name__
-    if type(value) is expected_type:
-        if expected_type is str and not value:
-            raise ValueError(f"Job JSON entry {entry_index} field {key!r} must not contain empty strings.")
-        return [value]
     if not isinstance(value, list):
         raise ValueError(
             f"Job JSON entry {entry_index} field {key!r} must be a "
-            f"{expected_name} or a list of {expected_name} values."
+            f"list of {expected_name} values."
         )
     if not value:
         raise ValueError(f"Job JSON entry {entry_index} field {key!r} must not be empty.")
@@ -183,13 +179,13 @@ def load_job_pairs_from_json(json_file: str) -> list[JobPair]:
         if "configs" not in entry or "folds" not in entry:
             raise ValueError(f"Job JSON entry {entry_index} must contain 'configs' and 'folds'.")
 
-        configurations = normalize_json_values(
+        configurations = validate_json_array(
             entry["configs"],
             key="configs",
             entry_index=entry_index,
             expected_type=str,
         )
-        folds = normalize_json_values(
+        folds = validate_json_array(
             entry["folds"],
             key="folds",
             entry_index=entry_index,
@@ -224,20 +220,16 @@ def load_job_pairs_from_json(json_file: str) -> list[JobPair]:
 
 
 def resolve_job_json_file(json_file: str) -> str:
-    if not isabs(json_file):
-        jobs_candidate = join(JOBS_DIR, json_file)
+    if not json_file.endswith(".json"):
+        jobs_candidate = abspath(join(JOBS_DIR, json_file + ".json"))
         if isfile(jobs_candidate):
-            return abspath(jobs_candidate)
+            return jobs_candidate
+        raise FileNotFoundError(f"Job JSON file does not exist in {JOBS_DIR}: {json_file}.json")
 
-    direct_candidate = abspath(json_file)
+    direct_candidate = json_file if isabs(json_file) else abspath(json_file)
     if isfile(direct_candidate):
         return direct_candidate
-
-    if isabs(json_file):
-        raise FileNotFoundError(f"Job JSON file does not exist: {json_file}")
-    raise FileNotFoundError(
-        f"Job JSON file does not exist in {JOBS_DIR} or at {direct_candidate}: {json_file}"
-    )
+    raise FileNotFoundError(f"Job JSON file does not exist: {direct_candidate}")
 
 
 def resolve_jobs(args: argparse.Namespace) -> list[TrainingJob]:
