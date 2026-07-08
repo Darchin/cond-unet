@@ -67,22 +67,176 @@ def build_jobs_from_pairs(job_pairs: Sequence[JobPair]) -> list[TrainingJob]:
     return jobs
 
 
+def format_job_pair(pair: JobPair) -> str:
+    return f"{pair[0]},{pair[1]}"
+
+
 def apply_job_overrides(jobs: Sequence[TrainingJob],
                         include: Sequence[JobPair] | None = None,
                         exclude: Sequence[JobPair] | None = None) -> list[TrainingJob]:
+    original_pairs = [(job.configuration, job.fold) for job in jobs]
+    return build_jobs_from_pairs(resolve_job_overrides(original_pairs, include, exclude))
+
+
+def resolve_job_overrides(original_pairs: Sequence[JobPair],
+                          include: Sequence[JobPair] | None = None,
+                          exclude: Sequence[JobPair] | None = None) -> list[JobPair]:
     include = include or ()
     exclude = exclude or ()
-    excluded = set(exclude)
+    original_pair_set = set(original_pairs)
+    exclude_set = set(exclude)
 
-    job_pairs: list[JobPair] = [(job.configuration, job.fold) for job in jobs]
-    seen: set[JobPair] = set(job_pairs)
+    include_exclude_overlap = [pair for pair in include if pair in exclude_set]
+    if include_exclude_overlap:
+        raise ValueError(
+            "Job pair(s) cannot appear in both include and exclude: "
+            + ", ".join(format_job_pair(pair) for pair in include_exclude_overlap)
+        )
 
+    included_existing = [pair for pair in include if pair in original_pair_set]
+    if included_existing:
+        raise ValueError(
+            "Included job pair(s) already exist in the original configuration/fold combinations: "
+            + ", ".join(format_job_pair(pair) for pair in included_existing)
+        )
+
+    excluded_missing = [pair for pair in exclude if pair not in original_pair_set]
+    if excluded_missing:
+        raise ValueError(
+            "Excluded job pair(s) do not exist in the original configuration/fold combinations: "
+            + ", ".join(format_job_pair(pair) for pair in excluded_missing)
+        )
+
+    resolved = [pair for pair in original_pairs if pair not in exclude_set]
+    seen_includes: set[JobPair] = set()
     for pair in include:
-        if pair not in seen:
-            job_pairs.append(pair)
-            seen.add(pair)
+        if pair in seen_includes:
+            continue
+        resolved.append(pair)
+        seen_includes.add(pair)
+    return resolved
 
-    return build_jobs_from_pairs([pair for pair in job_pairs if pair not in excluded])
+
+def resolve_cli_job_pairs(configurations: Sequence[str] | None,
+                          folds: Sequence[int] | None,
+                          include: Sequence[JobPair] | None = None,
+                          exclude: Sequence[JobPair] | None = None) -> list[JobPair]:
+    if (configurations is None) != (folds is None):
+        raise ValueError("Configuration names and fold indices must be provided together.")
+
+    original_pairs = [] if configurations is None else [
+        (configuration, fold) for configuration in configurations for fold in folds or ()
+    ]
+    job_pairs = resolve_job_overrides(original_pairs, include, exclude)
+    if not job_pairs:
+        raise ValueError("Resolved job list is empty.")
+    return job_pairs
+
+
+def normalize_json_values(value: object,
+                          *,
+                          key: str,
+                          entry_index: int,
+                          expected_type: type) -> list:
+    expected_name = expected_type.__name__
+    if type(value) is expected_type:
+        if expected_type is str and not value:
+            raise ValueError(f"Job JSON entry {entry_index} field {key!r} must not contain empty strings.")
+        return [value]
+    if not isinstance(value, list):
+        raise ValueError(
+            f"Job JSON entry {entry_index} field {key!r} must be a "
+            f"{expected_name} or a list of {expected_name} values."
+        )
+    if not value:
+        raise ValueError(f"Job JSON entry {entry_index} field {key!r} must not be empty.")
+    invalid = [i for i in value if type(i) is not expected_type]
+    if invalid:
+        raise ValueError(
+            f"Job JSON entry {entry_index} field {key!r} contains invalid value(s): {invalid!r}"
+        )
+    if expected_type is str:
+        empty = [i for i in value if not i]
+        if empty:
+            raise ValueError(f"Job JSON entry {entry_index} field {key!r} must not contain empty strings.")
+    return value
+
+
+def load_job_pairs_from_json(json_file: str) -> list[JobPair]:
+    job_specs = load_json(json_file)
+    if not isinstance(job_specs, list):
+        raise ValueError("Job JSON must contain a top-level array.")
+    if not job_specs:
+        raise ValueError("Job JSON must contain at least one job entry.")
+
+    job_pairs: list[JobPair] = []
+    seen_by_entry: dict[JobPair, int] = {}
+    for entry_index, entry in enumerate(job_specs):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Job JSON entry {entry_index} must be an object.")
+        extra_keys = sorted(set(entry) - {"configs", "folds"})
+        if extra_keys:
+            raise ValueError(f"Job JSON entry {entry_index} contains unsupported key(s): {extra_keys}")
+        if "configs" not in entry or "folds" not in entry:
+            raise ValueError(f"Job JSON entry {entry_index} must contain 'configs' and 'folds'.")
+
+        configurations = normalize_json_values(
+            entry["configs"],
+            key="configs",
+            entry_index=entry_index,
+            expected_type=str,
+        )
+        folds = normalize_json_values(
+            entry["folds"],
+            key="folds",
+            entry_index=entry_index,
+            expected_type=int,
+        )
+
+        entry_pairs: list[JobPair] = [(configuration, fold) for configuration in configurations for fold in folds]
+        entry_seen: set[JobPair] = set()
+        entry_duplicates = []
+        for pair in entry_pairs:
+            if pair in entry_seen:
+                entry_duplicates.append(pair)
+            entry_seen.add(pair)
+        if entry_duplicates:
+            raise ValueError(
+                f"Job JSON entry {entry_index} contains duplicate job pair(s): "
+                + ", ".join(format_job_pair(pair) for pair in entry_duplicates)
+            )
+
+        overlapping_pairs = [pair for pair in entry_pairs if pair in seen_by_entry]
+        if overlapping_pairs:
+            raise ValueError(
+                f"Job JSON entry {entry_index} overlaps earlier entries: "
+                + ", ".join(format_job_pair(pair) for pair in overlapping_pairs)
+            )
+
+        for pair in entry_pairs:
+            seen_by_entry[pair] = entry_index
+            job_pairs.append(pair)
+
+    return job_pairs
+
+
+def resolve_jobs(args: argparse.Namespace) -> list[TrainingJob]:
+    if args.json:
+        job_pairs = load_job_pairs_from_json(args.json)
+    else:
+        job_pairs = resolve_cli_job_pairs(args.configs, args.folds, args.include, args.exclude)
+    return build_jobs_from_pairs(job_pairs)
+
+
+def requested_configurations_from_jobs(jobs: Sequence[TrainingJob],
+                                       extra_pairs: Sequence[JobPair] | None = None) -> list[str]:
+    requested = []
+    seen = set()
+    for configuration in [job.configuration for job in jobs] + [pair[0] for pair in extra_pairs or ()]:
+        if configuration not in seen:
+            requested.append(configuration)
+            seen.add(configuration)
+    return requested
 
 
 def requested_configurations(configurations: Sequence[str],
@@ -362,6 +516,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-c", "--configs", nargs="+", help="Configuration names.")
     parser.add_argument("-f", "--folds", nargs="+", type=int, help="Fold indices.")
+    parser.add_argument("-j", "--json", help="Path to a JSON file describing ordered training jobs.")
     parser.add_argument(
         "-i",
         "--include",
@@ -395,9 +550,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.worker:
         missing = [i for i in ("plans_file", "configuration", "fold", "trainer") if getattr(args, i) is None]
     else:
-        missing = [i for i in ("dataset", "configs", "folds") if getattr(args, i) is None]
+        missing = [i for i in ("dataset",) if getattr(args, i) is None]
     if missing:
         parser.error("missing required argument(s): " + ", ".join("--" + i.replace("_", "-") for i in missing))
+    if not args.worker and args.json and any((args.configs, args.folds, args.include, args.exclude)):
+        parser.error("--json cannot be combined with --configs, --folds, --include, or --exclude")
     return args
 
 
@@ -409,18 +566,18 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
         return 0
 
     console = Console()
+    jobs = resolve_jobs(args)
     plans_file = resolve_plans_file(args.dataset, args.plan)
     validate_plans_dataset(plans_file, args.dataset)
     validate_requested_configurations(
         plans_file,
-        requested_configurations(args.configs, args.include, args.exclude),
+        requested_configurations_from_jobs(jobs, args.exclude),
     )
 
     gpu_tokens = get_visible_gpus()
     if not gpu_tokens:
         raise RuntimeError("No visible CUDA GPUs found.")
 
-    jobs = apply_job_overrides(build_jobs(args.configs, args.folds), args.include, args.exclude)
     console.print(
         f"[bold]Scheduling {len(jobs)} jobs[/bold] across [bold]{len(gpu_tokens)} GPUs[/bold] "
         f"with plans [bold]{plans_file}[/bold]"

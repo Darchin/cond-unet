@@ -10,8 +10,10 @@ from nnunetv2.run.batch_train import (
     apply_job_overrides,
     build_jobs,
     format_duration,
+    load_job_pairs_from_json,
     parse_args,
     requested_configurations,
+    resolve_cli_job_pairs,
     resolve_plans_file,
     schedule_jobs,
     validate_requested_configurations,
@@ -56,6 +58,24 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual(args.include, [("3x-s", 0), ("4x-m", 1)])
         self.assertEqual(args.exclude, [("3x-s", 1)])
 
+    def test_parse_args_accepts_include_without_configs_or_folds(self):
+        args = parse_args(["-d", "1", "-i", "3x-s,0"])
+
+        self.assertIsNone(args.configs)
+        self.assertIsNone(args.folds)
+        self.assertEqual(args.include, [("3x-s", 0)])
+
+    def test_parse_args_accepts_json_without_configs_or_folds(self):
+        args = parse_args(["-d", "1", "-j", "jobs.json"])
+
+        self.assertEqual(args.json, "jobs.json")
+        self.assertIsNone(args.configs)
+        self.assertIsNone(args.folds)
+
+    def test_parse_args_rejects_json_with_cli_job_arguments(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["-d", "1", "-j", "jobs.json", "-c", "2x", "-f", "0"])
+
     def test_parse_args_rejects_invalid_job_pair(self):
         with self.assertRaises(SystemExit):
             parse_args(["-d", "1", "-c", "2x", "-f", "0", "-i", "2x"])
@@ -67,11 +87,8 @@ class TestBatchTrain(unittest.TestCase):
                          [(0, "2x", 0), (1, "2x", 1), (2, "3x", 0), (3, "3x", 1)])
         self.assertEqual([i.total for i in jobs], [4, 4, 4, 4])
 
-    def test_apply_job_overrides_appends_included_jobs_without_duplicates(self):
-        jobs = apply_job_overrides(
-            build_jobs(["3x-s", "4x-m"], [0]),
-            include=[("3x-s", 0), ("4x-m", 1), ("2x-xs", 3)],
-        )
+    def test_apply_job_overrides_appends_included_jobs(self):
+        jobs = apply_job_overrides(build_jobs(["3x-s", "4x-m"], [0]), include=[("4x-m", 1), ("2x-xs", 3)])
 
         self.assertEqual(
             [(i.index, i.total, i.configuration, i.fold) for i in jobs],
@@ -83,21 +100,110 @@ class TestBatchTrain(unittest.TestCase):
             ],
         )
 
-    def test_apply_job_overrides_removes_excluded_jobs_after_include(self):
+    def test_apply_job_overrides_removes_excluded_jobs_before_include(self):
         jobs = apply_job_overrides(
             build_jobs(["3x-s", "4x-m"], [0, 1]),
-            include=[("5x-l", 2), ("3x-s", 1)],
-            exclude=[("3x-s", 1), ("5x-l", 2), ("unused", 0)],
+            include=[("5x-l", 2)],
+            exclude=[("3x-s", 1)],
         )
 
         self.assertEqual(
             [(i.index, i.total, i.configuration, i.fold) for i in jobs],
             [
-                (0, 3, "3x-s", 0),
-                (1, 3, "4x-m", 0),
-                (2, 3, "4x-m", 1),
+                (0, 4, "3x-s", 0),
+                (1, 4, "4x-m", 0),
+                (2, 4, "4x-m", 1),
+                (3, 4, "5x-l", 2),
             ],
         )
+
+    def test_resolve_cli_job_pairs_accepts_include_only(self):
+        self.assertEqual(resolve_cli_job_pairs(None, None, include=[("3x-s", 0)]), [("3x-s", 0)])
+
+    def test_resolve_cli_job_pairs_rejects_empty_jobs(self):
+        with self.assertRaisesRegex(ValueError, "empty"):
+            resolve_cli_job_pairs(None, None)
+
+    def test_resolve_cli_job_pairs_rejects_configs_without_folds(self):
+        with self.assertRaisesRegex(ValueError, "together"):
+            resolve_cli_job_pairs(["3x-s"], None)
+
+    def test_resolve_cli_job_pairs_rejects_include_already_in_original_jobs(self):
+        with self.assertRaisesRegex(ValueError, "already exist"):
+            resolve_cli_job_pairs(["3x-s"], [0], include=[("3x-s", 0)])
+
+    def test_resolve_cli_job_pairs_rejects_exclude_missing_from_original_jobs(self):
+        with self.assertRaisesRegex(ValueError, "do not exist"):
+            resolve_cli_job_pairs(["3x-s"], [0], exclude=[("4x-m", 0)])
+
+    def test_resolve_cli_job_pairs_rejects_include_exclude_overlap(self):
+        with self.assertRaisesRegex(ValueError, "both include and exclude"):
+            resolve_cli_job_pairs(["3x-s"], [0], include=[("4x-m", 0)], exclude=[("4x-m", 0)])
+
+    def test_load_job_pairs_from_json_expands_ordered_job_specs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_file = os.path.join(tmpdir, "jobs.json")
+            save_json(
+                [
+                    {"configs": ["3x-s", "3x-m"], "folds": [0, 1, 2]},
+                    {"configs": "4x-m", "folds": 4},
+                ],
+                json_file,
+            )
+
+            self.assertEqual(
+                load_job_pairs_from_json(json_file),
+                [
+                    ("3x-s", 0),
+                    ("3x-s", 1),
+                    ("3x-s", 2),
+                    ("3x-m", 0),
+                    ("3x-m", 1),
+                    ("3x-m", 2),
+                    ("4x-m", 4),
+                ],
+            )
+
+    def test_load_job_pairs_from_json_rejects_overlap_across_objects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_file = os.path.join(tmpdir, "jobs.json")
+            save_json(
+                [
+                    {"configs": ["3x-s", "3x-m"], "folds": [0]},
+                    {"configs": "3x-s", "folds": 0},
+                ],
+                json_file,
+            )
+
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                load_job_pairs_from_json(json_file)
+
+    def test_load_job_pairs_from_json_rejects_duplicate_pairs_inside_object(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_file = os.path.join(tmpdir, "jobs.json")
+            save_json([{"configs": ["3x-s", "3x-s"], "folds": [0]}], json_file)
+
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_job_pairs_from_json(json_file)
+
+    def test_load_job_pairs_from_json_rejects_invalid_shapes(self):
+        invalid_specs = [
+            {"configs": "3x-s", "folds": 0},
+            [{"configs": [], "folds": 0}],
+            [{"configs": "3x-s", "folds": []}],
+            [{"configs": "", "folds": 0}],
+            [{"configs": [1], "folds": 0}],
+            [{"configs": "3x-s", "folds": [True]}],
+            [{"configs": "3x-s"}],
+            [{"configs": "3x-s", "folds": 0, "priority": 1}],
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for index, spec in enumerate(invalid_specs):
+                json_file = os.path.join(tmpdir, f"jobs_{index}.json")
+                save_json(spec, json_file)
+
+                with self.assertRaises(ValueError):
+                    load_job_pairs_from_json(json_file)
 
     def test_requested_configurations_includes_override_configs_once(self):
         self.assertEqual(
