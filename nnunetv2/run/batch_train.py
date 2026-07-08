@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from os.path import abspath, dirname, isfile, join
+from os.path import abspath, dirname, isabs, isfile, join
 from typing import Callable, Sequence
 
 import torch
@@ -47,6 +47,8 @@ class FinishedJob:
 
 
 JobPair = tuple[str, int]
+PROJECT_ROOT = abspath(join(dirname(__file__), "..", ".."))
+JOBS_DIR = join(PROJECT_ROOT, "jobs")
 
 
 def format_duration(seconds: float) -> str:
@@ -163,6 +165,7 @@ def normalize_json_values(value: object,
 
 
 def load_job_pairs_from_json(json_file: str) -> list[JobPair]:
+    json_file = resolve_job_json_file(json_file)
     job_specs = load_json(json_file)
     if not isinstance(job_specs, list):
         raise ValueError("Job JSON must contain a top-level array.")
@@ -218,6 +221,23 @@ def load_job_pairs_from_json(json_file: str) -> list[JobPair]:
             job_pairs.append(pair)
 
     return job_pairs
+
+
+def resolve_job_json_file(json_file: str) -> str:
+    if not isabs(json_file):
+        jobs_candidate = join(JOBS_DIR, json_file)
+        if isfile(jobs_candidate):
+            return abspath(jobs_candidate)
+
+    direct_candidate = abspath(json_file)
+    if isfile(direct_candidate):
+        return direct_candidate
+
+    if isabs(json_file):
+        raise FileNotFoundError(f"Job JSON file does not exist: {json_file}")
+    raise FileNotFoundError(
+        f"Job JSON file does not exist in {JOBS_DIR} or at {direct_candidate}: {json_file}"
+    )
 
 
 def resolve_jobs(args: argparse.Namespace) -> list[TrainingJob]:

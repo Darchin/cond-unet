@@ -14,6 +14,7 @@ from nnunetv2.run.batch_train import (
     parse_args,
     requested_configurations,
     resolve_cli_job_pairs,
+    resolve_job_json_file,
     resolve_plans_file,
     schedule_jobs,
     validate_requested_configurations,
@@ -163,6 +164,40 @@ class TestBatchTrain(unittest.TestCase):
                     ("4x-m", 4),
                 ],
             )
+
+    def test_resolve_job_json_file_prefers_jobs_directory_for_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_dir = os.path.join(tmpdir, "jobs")
+            fallback_dir = os.path.join(tmpdir, "fallback")
+            os.makedirs(jobs_dir)
+            os.makedirs(fallback_dir)
+            jobs_file = os.path.join(jobs_dir, "phase-one.json")
+            fallback_file = os.path.join(fallback_dir, "phase-one.json")
+            save_json([], jobs_file)
+            save_json([], fallback_file)
+
+            with patch("nnunetv2.run.batch_train.JOBS_DIR", jobs_dir), \
+                    patch.object(os, "getcwd", return_value=fallback_dir):
+                self.assertEqual(resolve_job_json_file("phase-one.json"), jobs_file)
+
+    def test_resolve_job_json_file_falls_back_to_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_dir = os.path.join(tmpdir, "jobs")
+            fallback_dir = os.path.join(tmpdir, "fallback")
+            os.makedirs(jobs_dir)
+            os.makedirs(fallback_dir)
+            fallback_file = os.path.join(fallback_dir, "phase-one.json")
+            save_json([], fallback_file)
+
+            with patch("nnunetv2.run.batch_train.JOBS_DIR", jobs_dir), \
+                    patch.object(os, "getcwd", return_value=fallback_dir):
+                self.assertEqual(resolve_job_json_file("phase-one.json"), fallback_file)
+
+    def test_resolve_job_json_file_rejects_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("nnunetv2.run.batch_train.JOBS_DIR", os.path.join(tmpdir, "jobs")):
+                with self.assertRaises(FileNotFoundError):
+                    resolve_job_json_file("missing.json")
 
     def test_load_job_pairs_from_json_rejects_overlap_across_objects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
