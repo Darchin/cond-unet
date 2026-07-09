@@ -408,31 +408,31 @@ class PhaseOnePlanner(CondUNetPlanner):
 
 class PhaseTwoPlanner(CondUNetPlanner):
     phase_two_presets = {
-        "4x-l": {
+        "4x-m": {
             "inherits_from": "4x",
             "patch_size_multiplier": 6,
             "arch_kwargs": {
-                "features_per_stage": [128, 256, 512, 1024],
+                "features_per_stage": [96, 192, 384, 768],
             },
         },
-        "gse-enck": {
-            "inherits_from": "4x-l",
+        "4x-m-gse-enck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "se": {
                     "encoder": [False, True, True, True],
                 },
             },
         },
-        "gse-deck": {
-            "inherits_from": "4x-l",
+        "4x-m-gse-deck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "se": {
                     "decoder": [False, True, True],
                 },
             },
         },
-        "gse-enck-deck": {
-            "inherits_from": "4x-l",
+        "4x-m-gse-enck-deck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "se": {
                     "encoder": [False, True, True, True],
@@ -440,8 +440,8 @@ class PhaseTwoPlanner(CondUNetPlanner):
                 },
             },
         },
-        "gcc-enck": {
-            "inherits_from": "4x-l",
+        "4x-m-gcc-enck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "encoder": [False, True, True, True],
@@ -449,8 +449,8 @@ class PhaseTwoPlanner(CondUNetPlanner):
                 },
             },
         },
-        "gcc-deck": {
-            "inherits_from": "4x-l",
+        "4x-m-gcc-deck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "decoder": [False, True, True],
@@ -458,8 +458,8 @@ class PhaseTwoPlanner(CondUNetPlanner):
                 },
             },
         },
-        "gcc-enck-deck": {
-            "inherits_from": "4x-l",
+        "4x-m-gcc-enck-deck": {
+            "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "encoder": [False, True, True, True],

@@ -1,10 +1,25 @@
 [
     {
-        "configs": ["4x-l"],
-        "folds": [0, 1, 2, 3, 4]
+        "configs": [
+            "4x-l"
+        ],
+        "folds": [
+            4
+        ]
     },
     {
-        "configs": ["gse-enck", "gse-deck", "gcc-enck", "gcc-deck"],
-        "folds": [0, 1, 2, 3, 4]
+        "configs": [
+            "4x-m-gse-enck",
+            "4x-m-gse-deck",
+            "4x-m-gcc-enck",
+            "4x-m-gcc-deck"
+        ],
+        "folds": [
+            0,
+            1,
+            2,
+            3,
+            4
+        ]
     }
 ]
