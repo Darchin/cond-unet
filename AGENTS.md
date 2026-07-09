@@ -54,12 +54,10 @@ Expected CondUNet planning workflow:
 4. Add user configurations that inherit from those presets and fill in manual training details.
 5. Train using the completed child configurations.
 
-## Phase One Planner
+## Phase-specific Planners
 
-- Additional planner: `PhaseOnePlanner` in `nnunetv2/experiment_planning/experiment_planners/cond_unet_planner.py`.
-- Default plans identifier: `nnUNetCondUNetPhaseOnePlans`.
-- It builds on `CondUNetPlanner` and adds a small grid of trainable child configurations for the first ablation phase.
-- These child configurations inherit the preprocessing, geometry, architecture defaults, and trainer defaults from the base presets, then fill in patch-size multiplier and model-width choices.
+- Additional planners like: `PhaseOnePlanner` in `nnunetv2/experiment_planning/experiment_planners/cond_unet_planner.py`.
+- They build on `CondUNetPlanner` and add a small grid of trainable child configurations for the ablation phase that they represent.
 
 ## Plan Inheritance And Required Fields
 
