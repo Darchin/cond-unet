@@ -3,7 +3,11 @@ import unittest
 from nnunetv2.experiment_planning.dataset_fingerprint.cond_unet_fingerprint_extractor import (
     CondUNetFingerprintExtractor,
 )
-from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import CondUNetPlanner, PhaseOnePlanner
+from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import (
+    CondUNetPlanner,
+    PhaseOnePlanner,
+    PhaseTwoPlanner,
+)
 from nnunetv2.training.nnUNetTrainer.variants.optimizer.nnUNetTrainerAdamW import nnUNetTrainerAdamW
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
@@ -213,6 +217,122 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         self.assertEqual(config.network_arch_init_kwargs["encoder_expansion_ratio"], [2.0, 2.0, 4.0, 4.0, 4.0])
         self.assertEqual(config.network_arch_init_kwargs["decoder_expansion_ratio"], 1.0)
         config.validate_required_for_training("2x-m")
+
+    def test_phase_two_planner_generates_expected_child_configurations(self):
+        planner = PhaseTwoPlanner.__new__(PhaseTwoPlanner)
+
+        configurations = planner._additional_configurations()
+
+        self.assertEqual(
+            list(configurations),
+            [
+                "4x-l",
+                "gse-enck",
+                "gse-deck",
+                "gse-enck-deck",
+                "gcc-enck",
+                "gcc-deck",
+                "gcc-enck-deck",
+            ],
+        )
+        self.assertEqual(configurations["4x-l"]["inherits_from"], "4x")
+        self.assertEqual(configurations["4x-l"]["patch_size_multiplier"], 6)
+        self.assertEqual(
+            configurations["4x-l"]["architecture"]["arch_kwargs"]["features_per_stage"],
+            [128, 256, 512, 1024],
+        )
+        self.assertEqual(configurations["gse-enck"]["inherits_from"], "4x-l")
+        self.assertEqual(
+            configurations["gse-enck"]["architecture"]["arch_kwargs"]["se"],
+            {"encoder": [False, True, True, True]},
+        )
+        self.assertEqual(
+            configurations["gse-deck"]["architecture"]["arch_kwargs"]["se"],
+            {"decoder": [False, True, True]},
+        )
+        self.assertEqual(
+            configurations["gse-enck-deck"]["architecture"]["arch_kwargs"]["se"],
+            {
+                "encoder": [False, True, True, True],
+                "decoder": [False, True, True],
+            },
+        )
+        self.assertEqual(
+            configurations["gcc-enck"]["architecture"]["arch_kwargs"]["cc"],
+            {
+                "encoder": [False, True, True, True],
+                "encoder_num_experts": 4,
+            },
+        )
+        self.assertEqual(
+            configurations["gcc-deck"]["architecture"]["arch_kwargs"]["cc"],
+            {
+                "decoder": [False, True, True],
+                "decoder_num_experts": 4,
+            },
+        )
+        self.assertEqual(
+            configurations["gcc-enck-deck"]["architecture"]["arch_kwargs"]["cc"],
+            {
+                "encoder": [False, True, True, True],
+                "encoder_num_experts": 4,
+                "decoder": [False, True, True],
+                "decoder_num_experts": 4,
+            },
+        )
+
+    def test_phase_two_child_configuration_resolves_as_trainable(self):
+        planner = self._minimal_planner(PhaseTwoPlanner)
+        phase_two_configurations = planner._additional_configurations()
+        plans = {
+            "configurations": {
+                "base": {
+                    "normalization_schemes": ["ZScoreNormalization"],
+                    "use_mask_for_norm": [False],
+                    "resampling_fn_data": "resample_data_or_seg_to_shape",
+                    "resampling_fn_seg": "resample_data_or_seg_to_shape",
+                    "resampling_fn_data_kwargs": {"is_seg": False},
+                    "resampling_fn_seg_kwargs": {"is_seg": True},
+                    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+                    "resampling_fn_probabilities_kwargs": {"is_seg": False},
+                },
+                "4x": planner._plan_for_preset("4x", [0, 1, 2]),
+                "4x-l": phase_two_configurations["4x-l"],
+                "gse-enck-deck": phase_two_configurations["gse-enck-deck"],
+                "gcc-enck-deck": phase_two_configurations["gcc-enck-deck"],
+            },
+        }
+
+        se_config = PlansManager(plans).get_configuration("gse-enck-deck")
+        cc_config = PlansManager(plans).get_configuration("gcc-enck-deck")
+
+        for config, configuration_name in (
+            (se_config, "gse-enck-deck"),
+            (cc_config, "gcc-enck-deck"),
+        ):
+            self.assertEqual(config.patch_size, [192, 192, 192])
+            self.assertEqual(config.patch_size_multiplier, 6)
+            self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [128, 256, 512, 1024])
+            self.assertEqual(config.network_arch_init_kwargs["encoder_n_blocks_per_stage"], [3, 3, 9, 3])
+            self.assertEqual(config.network_arch_init_kwargs["decoder_n_blocks_per_stage"], [1, 1, 1])
+            config.validate_required_for_training(configuration_name)
+
+        self.assertEqual(
+            se_config.network_arch_init_kwargs["se"],
+            {
+                "encoder": [False, True, True, True],
+                "decoder": [False, True, True],
+            },
+        )
+        self.assertEqual(
+            cc_config.network_arch_init_kwargs["cc"],
+            {
+                "encoder": [False, True, True, True],
+                "encoder_num_experts": 4,
+                "decoder": [False, True, True],
+                "decoder_num_experts": 4,
+            },
+        )
 
 
 class TestPlansManagerCondUNetConfig(unittest.TestCase):
