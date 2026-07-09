@@ -102,6 +102,12 @@ Expected CondUNet planning workflow:
 - Defaults are tailored for this fork: `--plan nnUNetCondUNetPlans` and `--trainer nnUNetTrainerAdamW`.
 - `--disable-tta` disables validation test-time augmentation for all scheduled jobs; TTA remains enabled by default when the flag is omitted.
 
+## Results Cleanup Utility
+
+- Results cleanup script: `nnunetv2/run/cleanup_results.py`; console entrypoint: `nnUNetv2_cleanup_results`.
+- It compacts recognized results to dataset/config/fold directories, retaining only `checkpoint_last.pth`, `progress.png`, `training_log_*.txt`, and validation `summary.json`.
+- Without `-o`/`--output-dir`, cleanup modifies `nnUNet_results` in place. With an output directory, it copies cleaned results and preserves the source; destination collisions fail safely.
+
 ## Trainer Lookup
 
 - `nnunetv2/utilities/find_objects.py` and `nnunetv2/utilities/find_class_by_name.py` include local behavior around external trainer lookup via `nnUNet_extTrainer`.
