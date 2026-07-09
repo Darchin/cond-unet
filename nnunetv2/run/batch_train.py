@@ -52,6 +52,9 @@ class FinishedJob:
 JobPair = tuple[str, int]
 PROJECT_ROOT = abspath(join(dirname(__file__), "..", ".."))
 JOBS_DIR = join(PROJECT_ROOT, "jobs")
+STARTED_COLOR = "deep_sky_blue1"
+FINISHED_COLOR = "chartreuse3"
+FAILED_COLOR = "red3"
 
 
 def format_duration(seconds: float) -> str:
@@ -60,42 +63,52 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
-def format_verbose_duration(seconds: float) -> str:
+def format_bold_value(value: object, color: str | None = None) -> str:
+    if color is None:
+        return f"[bold]{value}[/bold]"
+    return f"[bold {color}]{value}[/bold {color}]"
+
+
+def format_verbose_duration(seconds: float, color: str | None = None) -> str:
     minutes = max(0, int(seconds // 60))
     hours, minutes = divmod(minutes, 60)
     hour_label = "hour" if hours == 1 else "hours"
     minute_label = "minute" if minutes == 1 else "minutes"
-    return f"[bold]{hours}[/bold] {hour_label} and [bold]{minutes}[/bold] {minute_label}"
+    if color is None:
+        return f"{format_bold_value(hours)} {hour_label} and {format_bold_value(minutes)} {minute_label}"
+    duration = f"{hours} {hour_label} and {minutes} {minute_label}"
+    return format_bold_value(duration, color)
 
 
-def format_log_timestamp(timestamp: datetime) -> str:
-    return timestamp.strftime("%Y-%m-%d at %H:%M")
+def format_log_timestamp(timestamp: datetime, color: str | None = None) -> str:
+    return format_bold_value(timestamp.strftime("%Y-%m-%d at %H:%M"), color)
 
 
-def format_job_progress(job: TrainingJob, gpu: str) -> str:
-    return f"job [bold]{job.index + 1}/{job.total}[/bold] on GPU [bold]{gpu}[/bold]"
+def format_job_progress(job: TrainingJob, gpu: str, color: str | None = None) -> str:
+    return f"job {format_bold_value(f'{job.index + 1}/{job.total}', color)} on GPU {format_bold_value(gpu, color)}"
 
 
-def format_job_configuration(job: TrainingJob) -> str:
-    return f"fold [bold]{job.fold}[/bold] of config [bold]{job.configuration}[/bold]"
+def format_job_configuration(job: TrainingJob, color: str | None = None) -> str:
+    return f"fold {format_bold_value(job.fold, color)} of config {format_bold_value(job.configuration, color)}"
 
 
 def format_start_message(job: TrainingJob, gpu: str, started_at: datetime) -> str:
     return (
-        f"[bold cyan]STARTED[/bold cyan] {format_job_progress(job, gpu)} — "
-        f"{format_job_configuration(job)} — "
-        f"started on [bold]{format_log_timestamp(started_at)}[/bold]."
+        f"{format_bold_value('STARTED', STARTED_COLOR)} {format_job_progress(job, gpu, STARTED_COLOR)} — "
+        f"{format_job_configuration(job, STARTED_COLOR)} — "
+        f"started on {format_log_timestamp(started_at, STARTED_COLOR)}."
     )
 
 
 def format_finish_message(result: FinishedJob) -> str:
-    status = "[bold green]FINISHED[/bold green]" if result.returncode == 0 else "[bold red]FAILED[/bold red]"
+    color = FINISHED_COLOR if result.returncode == 0 else FAILED_COLOR
+    status = "FINISHED" if result.returncode == 0 else "FAILED"
     return (
-        f"{status} {format_job_progress(result.job, result.gpu)} — "
-        f"{format_job_configuration(result.job)} — "
-        f"started on [bold]{format_log_timestamp(result.started_at)}[/bold], "
-        f"finished on [bold]{format_log_timestamp(result.finished_at)}[/bold], "
-        f"took {format_verbose_duration(result.elapsed_seconds)} in total."
+        f"{format_bold_value(status, color)} {format_job_progress(result.job, result.gpu, color)} — "
+        f"{format_job_configuration(result.job, color)} — "
+        f"started on {format_log_timestamp(result.started_at, color)}, "
+        f"finished on {format_log_timestamp(result.finished_at, color)}, "
+        f"took {format_verbose_duration(result.elapsed_seconds, color)} in total."
     )
 
 

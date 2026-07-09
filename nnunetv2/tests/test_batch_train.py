@@ -274,9 +274,12 @@ class TestBatchTrain(unittest.TestCase):
 
         self.assertEqual(
             format_start_message(job, "2", datetime(2026, 7, 8, 16, 33)),
-            "[bold cyan]STARTED[/bold cyan] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
-            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
-            "started on [bold]2026-07-08 at 16:33[/bold].",
+            "[bold deep_sky_blue1]STARTED[/bold deep_sky_blue1] "
+            "job [bold deep_sky_blue1]1/1[/bold deep_sky_blue1] on GPU "
+            "[bold deep_sky_blue1]2[/bold deep_sky_blue1] — "
+            "fold [bold deep_sky_blue1]3[/bold deep_sky_blue1] of config "
+            "[bold deep_sky_blue1]3x-m[/bold deep_sky_blue1] — "
+            "started on [bold deep_sky_blue1]2026-07-08 at 16:33[/bold deep_sky_blue1].",
         )
 
     def test_format_finish_message_uses_finished_times_and_duration(self):
@@ -292,11 +295,14 @@ class TestBatchTrain(unittest.TestCase):
 
         self.assertEqual(
             format_finish_message(result),
-            "[bold green]FINISHED[/bold green] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
-            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
-            "started on [bold]2026-07-08 at 16:33[/bold], "
-            "finished on [bold]2026-07-08 at 19:47[/bold], "
-            "took [bold]3[/bold] hours and [bold]14[/bold] minutes in total.",
+            "[bold chartreuse3]FINISHED[/bold chartreuse3] "
+            "job [bold chartreuse3]1/1[/bold chartreuse3] on GPU "
+            "[bold chartreuse3]2[/bold chartreuse3] — "
+            "fold [bold chartreuse3]3[/bold chartreuse3] of config "
+            "[bold chartreuse3]3x-m[/bold chartreuse3] — "
+            "started on [bold chartreuse3]2026-07-08 at 16:33[/bold chartreuse3], "
+            "finished on [bold chartreuse3]2026-07-08 at 19:47[/bold chartreuse3], "
+            "took [bold chartreuse3]3 hours and 14 minutes[/bold chartreuse3] in total.",
         )
 
     def test_format_finish_message_uses_failed_status(self):
@@ -312,11 +318,14 @@ class TestBatchTrain(unittest.TestCase):
 
         self.assertEqual(
             format_finish_message(result),
-            "[bold red]FAILED[/bold red] job [bold]1/1[/bold] on GPU [bold]2[/bold] — "
-            "fold [bold]3[/bold] of config [bold]3x-m[/bold] — "
-            "started on [bold]2026-07-08 at 16:33[/bold], "
-            "finished on [bold]2026-07-08 at 16:34[/bold], "
-            "took [bold]0[/bold] hours and [bold]1[/bold] minute in total.",
+            "[bold red3]FAILED[/bold red3] "
+            "job [bold red3]1/1[/bold red3] on GPU "
+            "[bold red3]2[/bold red3] — "
+            "fold [bold red3]3[/bold red3] of config "
+            "[bold red3]3x-m[/bold red3] — "
+            "started on [bold red3]2026-07-08 at 16:33[/bold red3], "
+            "finished on [bold red3]2026-07-08 at 16:34[/bold red3], "
+            "took [bold red3]0 hours and 1 minute[/bold red3] in total.",
         )
 
     def test_visible_gpu_tokens_respects_existing_cuda_visible_devices(self):
