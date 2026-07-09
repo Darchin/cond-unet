@@ -226,53 +226,53 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         self.assertEqual(
             list(configurations),
             [
-                "4x-l",
-                "gse-enck",
-                "gse-deck",
-                "gse-enck-deck",
-                "gcc-enck",
-                "gcc-deck",
-                "gcc-enck-deck",
+                "4x-m",
+                "4x-m-gse-enck",
+                "4x-m-gse-deck",
+                "4x-m-gse-enck-deck",
+                "4x-m-gcc-enck",
+                "4x-m-gcc-deck",
+                "4x-m-gcc-enck-deck",
             ],
         )
-        self.assertEqual(configurations["4x-l"]["inherits_from"], "4x")
-        self.assertEqual(configurations["4x-l"]["patch_size_multiplier"], 6)
+        self.assertEqual(configurations["4x-m"]["inherits_from"], "4x")
+        self.assertEqual(configurations["4x-m"]["patch_size_multiplier"], 6)
         self.assertEqual(
-            configurations["4x-l"]["architecture"]["arch_kwargs"]["features_per_stage"],
-            [128, 256, 512, 1024],
+            configurations["4x-m"]["architecture"]["arch_kwargs"]["features_per_stage"],
+            [96, 192, 384, 768],
         )
-        self.assertEqual(configurations["gse-enck"]["inherits_from"], "4x-l")
+        self.assertEqual(configurations["4x-m-gse-enck"]["inherits_from"], "4x-l")
         self.assertEqual(
-            configurations["gse-enck"]["architecture"]["arch_kwargs"]["se"],
+            configurations["4x-m-gse-enck"]["architecture"]["arch_kwargs"]["se"],
             {"encoder": [False, True, True, True]},
         )
         self.assertEqual(
-            configurations["gse-deck"]["architecture"]["arch_kwargs"]["se"],
+            configurations["4x-m-gse-deck"]["architecture"]["arch_kwargs"]["se"],
             {"decoder": [False, True, True]},
         )
         self.assertEqual(
-            configurations["gse-enck-deck"]["architecture"]["arch_kwargs"]["se"],
+            configurations["4x-m-gse-enck-deck"]["architecture"]["arch_kwargs"]["se"],
             {
                 "encoder": [False, True, True, True],
                 "decoder": [False, True, True],
             },
         )
         self.assertEqual(
-            configurations["gcc-enck"]["architecture"]["arch_kwargs"]["cc"],
+            configurations["4x-m-gcc-enck"]["architecture"]["arch_kwargs"]["cc"],
             {
                 "encoder": [False, True, True, True],
                 "encoder_num_experts": 4,
             },
         )
         self.assertEqual(
-            configurations["gcc-deck"]["architecture"]["arch_kwargs"]["cc"],
+            configurations["4x-m-gcc-deck"]["architecture"]["arch_kwargs"]["cc"],
             {
                 "decoder": [False, True, True],
                 "decoder_num_experts": 4,
             },
         )
         self.assertEqual(
-            configurations["gcc-enck-deck"]["architecture"]["arch_kwargs"]["cc"],
+            configurations["4x-m-gcc-enck-deck"]["architecture"]["arch_kwargs"]["cc"],
             {
                 "encoder": [False, True, True, True],
                 "encoder_num_experts": 4,
@@ -297,22 +297,22 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
                     "resampling_fn_probabilities_kwargs": {"is_seg": False},
                 },
                 "4x": planner._plan_for_preset("4x", [0, 1, 2]),
-                "4x-l": phase_two_configurations["4x-l"],
-                "gse-enck-deck": phase_two_configurations["gse-enck-deck"],
-                "gcc-enck-deck": phase_two_configurations["gcc-enck-deck"],
+                "4x-m": phase_two_configurations["4x-m"],
+                "4x-m-gse-enck-deck": phase_two_configurations["4x-m-gse-enck-deck"],
+                "4x-m-gcc-enck-deck": phase_two_configurations["4x-m-gcc-enck-deck"],
             },
         }
 
-        se_config = PlansManager(plans).get_configuration("gse-enck-deck")
-        cc_config = PlansManager(plans).get_configuration("gcc-enck-deck")
+        se_config = PlansManager(plans).get_configuration("4x-m-gse-enck-deck")
+        cc_config = PlansManager(plans).get_configuration("4x-m-gcc-enck-deck")
 
         for config, configuration_name in (
-            (se_config, "gse-enck-deck"),
-            (cc_config, "gcc-enck-deck"),
+            (se_config, "4x-m-gse-enck-deck"),
+            (cc_config, "4x-m-gcc-enck-deck"),
         ):
             self.assertEqual(config.patch_size, [192, 192, 192])
             self.assertEqual(config.patch_size_multiplier, 6)
-            self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [128, 256, 512, 1024])
+            self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [96, 192, 384, 768])
             self.assertEqual(config.network_arch_init_kwargs["encoder_n_blocks_per_stage"], [3, 3, 9, 3])
             self.assertEqual(config.network_arch_init_kwargs["decoder_n_blocks_per_stage"], [1, 1, 1])
             config.validate_required_for_training(configuration_name)
