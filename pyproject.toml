@@ -67,6 +67,7 @@ nnUNetv2_extract_fingerprint = "nnunetv2.experiment_planning.plan_and_preprocess
 nnUNetv2_plan_experiment = "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints:plan_experiment_entry"
 nnUNetv2_preprocess = "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints:preprocess_entry"
 nnUNetv2_benchmark = "nnunetv2.run.benchmark:benchmark_entry"
+nnUNetv2_cleanup_results = "nnunetv2.run.cleanup_results:main"
 nnUNetv2_train = "nnunetv2.run.run_training:run_training_entry"
 nnUNetv2_batch_train = "nnunetv2.run.batch_train:main"
 nnUNetv2_predict_from_modelfolder = "nnunetv2.inference.predict_from_raw_data:predict_entry_point_modelfolder"
