@@ -37,12 +37,14 @@ class SEConfig:
             globally; a list of bools applies per-stage; a nested list applies
             per-block within each stage.
         decoder: Same as ``encoder`` but for the decoder.
-        tile_size: Spatial tile size for tiled SE. None means global (standard) SE.
+        max_grid_size: Maximum number of grid cells along the longest bottleneck
+            axis. The actual grid follows the bottleneck aspect ratio. None means
+            global (standard) SE.
     """
     reduction: float = 0.125
     encoder: BoolConfig = False
     decoder: BoolConfig = False
-    tile_size: Union[None, List[int], Tuple[int, ...]] = None
+    max_grid_size: Optional[int] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "SEConfig":
@@ -64,7 +66,9 @@ class CCConfig:
         decoder_num_experts: Number of experts per decoder stage.
         encoder_num_groups: Channel-wise routing granularity per encoder stage.
         decoder_num_groups: Channel-wise routing granularity per decoder stage.
-        tile_size: Spatial tile size for tiled routing. None means global routing.
+        max_grid_size: Maximum number of grid cells along the longest bottleneck
+            axis. The actual grid follows the bottleneck aspect ratio. None means
+            global routing.
     """
     reduction: float = 0.125
     encoder: BoolConfig = False
@@ -73,7 +77,7 @@ class CCConfig:
     decoder_num_experts: IntConfig = 0
     encoder_num_groups: IntConfig = 1
     decoder_num_groups: IntConfig = 1
-    tile_size: Union[None, List[int], Tuple[int, ...]] = None
+    max_grid_size: Optional[int] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -146,27 +150,34 @@ def _normalize_spatial_param(
     return [int(item) for item in values]
 
 
-def _scale_tile_size(
-    tile_size: Union[None, Sequence[int]], scale: Sequence[int], *, down: bool
-) -> Optional[Tuple[int, ...]]:
-    if tile_size is None:
+def _normalize_max_grid_size(value: Optional[int], name: str) -> Optional[int]:
+    if value is None:
         return None
-    if down:
-        return tuple(max(1, tile // factor) for tile, factor in zip(tile_size, scale))
-    return tuple(tile * factor for tile, factor in zip(tile_size, scale))
+    if not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer or None")
+    return int(value)
 
 
-def _tile_grid(spatial_shape: Sequence[int], tile_size: Sequence[int]) -> Tuple[int, ...]:
-    grid_shape = tuple(
-        max(1, spatial_size // requested_tile_size)
-        for spatial_size, requested_tile_size in zip(spatial_shape, tile_size)
+def _largest_divisor_at_most(value: int, limit: int) -> int:
+    return next(candidate for candidate in range(min(value, limit), 0, -1) if value % candidate == 0)
+
+
+def _derive_grid_shape(
+    bottleneck_shape: Sequence[int], max_grid_size: int
+) -> Tuple[int, ...]:
+    """Derive an aspect-aware grid whose axes divide the bottleneck exactly."""
+    if not bottleneck_shape or any(size <= 0 for size in bottleneck_shape):
+        raise ValueError(f"bottleneck shape values must be positive, got {tuple(bottleneck_shape)}")
+    max_grid_size = _normalize_max_grid_size(max_grid_size, "max_grid_size")
+    longest_axis = max(bottleneck_shape)
+    ideal_grid = [
+        max(1, min(size, max_grid_size * size // longest_axis))
+        for size in bottleneck_shape
+    ]
+    return tuple(
+        _largest_divisor_at_most(int(size), target)
+        for size, target in zip(bottleneck_shape, ideal_grid)
     )
-    if any(spatial_size % grid_size for spatial_size, grid_size in zip(spatial_shape, grid_shape)):
-        raise ValueError(
-            f"input spatial shape {tuple(spatial_shape)} cannot be partitioned into equal routing/attention "
-            f"tiles for tile_size={tuple(tile_size)} (derived grid={grid_shape})"
-        )
-    return grid_shape
 
 
 def _transpose_output_padding(
@@ -256,9 +267,9 @@ def _conv_output_shape(
 class TiledPoolMLP(nn.Module):
     """Pool-then-MLP module with optional spatial tiling.
 
-    When ``tile_size`` is None, performs global average pooling (standard behavior).
-    When provided, the input is partitioned into a grid of tiles and each tile is
-    pooled and processed independently, enabling spatially-varying attention/routing.
+    When ``max_grid_size`` is None, performs global average pooling (standard
+    behavior). Otherwise, ``grid_shape`` is supplied at runtime from the shared
+    bottleneck-relative grid.
     """
 
     def __init__(
@@ -269,14 +280,12 @@ class TiledPoolMLP(nn.Module):
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
         final_activation: Union[None, Type[nn.Module]] = nn.Sigmoid,
-        tile_size: Union[None, Sequence[int]] = None,
+        max_grid_size: Optional[int] = None,
     ):
         super().__init__()
         if reduction <= 0:
             raise ValueError("reduction must be greater than 0")
-        if tile_size is not None and any(tile <= 0 for tile in tile_size):
-            raise ValueError("tile_size values must be greater than 0")
-        self.tile_size = None if tile_size is None else tuple(tile_size)
+        self.max_grid_size = _normalize_max_grid_size(max_grid_size, "max_grid_size")
         hidden_channels = max(1, round(input_channels * reduction))
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
         activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
@@ -289,25 +298,38 @@ class TiledPoolMLP(nn.Module):
             layers.append(final_activation())
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
+    ) -> torch.Tensor:
         """Returns pooled MLP output.
 
         - Global mode: shape ``[B, output_channels]``
         - Tiled mode: shape ``[B, *grid_shape, output_channels]``
         """
         spatial_dims = x.ndim - 2
-        if self.tile_size is None:
+        if self.max_grid_size is None:
             return self.mlp(x.mean(dim=tuple(range(2, x.ndim))))
 
-        if len(self.tile_size) != spatial_dims:
+        if grid_shape is None:
+            raise ValueError("grid_shape must be supplied when max_grid_size is configured")
+        if len(grid_shape) != spatial_dims:
             raise ValueError(
-                f"tile_size has {len(self.tile_size)} dimensions, expected {spatial_dims}"
+                f"grid_shape has {len(grid_shape)} dimensions, expected {spatial_dims}"
             )
-        output_grid = _tile_grid(x.shape[2:], self.tile_size)
+        grid_shape = tuple(int(grid) for grid in grid_shape)
+        if any(grid <= 0 or grid > self.max_grid_size for grid in grid_shape):
+            raise ValueError(
+                f"grid_shape values must be between 1 and max_grid_size={self.max_grid_size}, "
+                f"got {grid_shape}"
+            )
+        if any(size % grid for size, grid in zip(x.shape[2:], grid_shape)):
+            raise ValueError(
+                f"input spatial shape {tuple(x.shape[2:])} must be divisible by grid_shape {grid_shape}"
+            )
         adaptive_avg_pool = (
             F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d
         )[spatial_dims - 1]
-        return self.mlp(adaptive_avg_pool(x, output_grid).movedim(1, -1))
+        return self.mlp(adaptive_avg_pool(x, grid_shape).movedim(1, -1))
 
 
 class SqueezeAndExcitationBlock(nn.Module):
@@ -319,17 +341,19 @@ class SqueezeAndExcitationBlock(nn.Module):
         reduction: float,
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
-        tile_size: Union[None, Sequence[int]] = None,
+        max_grid_size: Optional[int] = None,
     ):
         super().__init__()
         self.pool_mlp = TiledPoolMLP(
             channels, channels, reduction, nonlin, nonlin_kwargs,
-            final_activation=nn.Sigmoid, tile_size=tile_size,
+            final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scale = self.pool_mlp(x)
-        if self.pool_mlp.tile_size is None:
+    def forward(
+        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
+    ) -> torch.Tensor:
+        scale = self.pool_mlp(x, grid_shape)
+        if self.pool_mlp.max_grid_size is None:
             spatial_dims = x.ndim - 2
             return x * scale.reshape(x.shape[0], x.shape[1], *([1] * spatial_dims))
         scale = scale.movedim(-1, 1)
@@ -347,17 +371,19 @@ class Router(nn.Module):
         reduction: float,
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
-        tile_size: Union[None, Sequence[int]] = None,
+        max_grid_size: Optional[int] = None,
     ):
         super().__init__()
         self.pool_mlp = TiledPoolMLP(
             input_channels, num_experts, reduction, nonlin, nonlin_kwargs,
-            final_activation=nn.Sigmoid, tile_size=tile_size,
+            final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
         )
-        self.tile_size = self.pool_mlp.tile_size
+        self.max_grid_size = self.pool_mlp.max_grid_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pool_mlp(x)
+    def forward(
+        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
+    ) -> torch.Tensor:
+        return self.pool_mlp(x, grid_shape)
 
 
 class CondPWConv(nn.Module):
@@ -797,8 +823,8 @@ class InvertedBottleneckBlock(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc_reduction: float = 0.125,
-        se_tile_size: Union[None, Sequence[int]] = None,
-        cc_tile_size: Union[None, Sequence[int]] = None,
+        se_max_grid_size: Optional[int] = None,
+        cc_max_grid_size: Optional[int] = None,
         se_reduction: float = 0.125,
         se: bool = False,
         cc: bool = False,
@@ -811,16 +837,8 @@ class InvertedBottleneckBlock(nn.Module):
         kernel_size = _normalize_spatial_param(
             conv_op, kernel_size, "kernel_size", require_odd=True
         )
-        se_tile_size = (
-            None
-            if se_tile_size is None
-            else _normalize_spatial_param(conv_op, se_tile_size, "se_tile_size")
-        )
-        cc_tile_size = (
-            None
-            if cc_tile_size is None
-            else _normalize_spatial_param(conv_op, cc_tile_size, "cc_tile_size")
-        )
+        se_max_grid_size = _normalize_max_grid_size(se_max_grid_size, "se_max_grid_size")
+        cc_max_grid_size = _normalize_max_grid_size(cc_max_grid_size, "cc_max_grid_size")
         norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
 
@@ -863,7 +881,8 @@ class InvertedBottleneckBlock(nn.Module):
                 )
 
             self.router = Router(
-                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs, cc_tile_size
+                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs,
+                cc_max_grid_size,
             )
             _expertify_pointwise(
                 self.expand, num_experts, cc_reduction, nonlin, nonlin_kwargs,
@@ -876,19 +895,23 @@ class InvertedBottleneckBlock(nn.Module):
         else:
             self.router = None
 
-        se_tile_size_scaled = _scale_tile_size(se_tile_size, self.stride, down=True)
         self.se_block = (
             SqueezeAndExcitationBlock(
-                output_channels, se_reduction, nonlin, nonlin_kwargs, se_tile_size_scaled
+                output_channels, se_reduction, nonlin, nonlin_kwargs, se_max_grid_size
             )
             if se
             else nn.Identity()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        se_grid_shape: Optional[Sequence[int]] = None,
+        cc_grid_shape: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
         residual = x
         if self.router is not None:
-            scores = self.router(x)
+            scores = self.router(x, cc_grid_shape)
             x = _forward_routed_conv_block(self.expand, x, scores)
             x = self.depthwise(x)
             x = _forward_routed_conv_block(self.project, x, scores)
@@ -897,7 +920,10 @@ class InvertedBottleneckBlock(nn.Module):
             x = self.depthwise(x)
             x = self.project(x)
 
-        x = self.se_block(x)
+        if isinstance(self.se_block, SqueezeAndExcitationBlock):
+            x = self.se_block(x, se_grid_shape)
+        else:
+            x = self.se_block(x)
         if self.add_identity:
             x = x + residual
         return x
@@ -912,7 +938,6 @@ class InvertedBottleneckBlock(nn.Module):
         output += np.prod([self.expanded_channels, *size_after_stride], dtype=np.int64)
         output += np.prod([self.output_channels, *size_after_stride], dtype=np.int64)
         return output
-
 
 class StackedCondInvertedBottleneckBlocks(nn.Module):
     def __init__(
@@ -930,8 +955,8 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc_reduction: float = 0.125,
-        se_tile_size: Union[None, Sequence[int]] = None,
-        cc_tile_size: Union[None, Sequence[int]] = None,
+        se_max_grid_size: Optional[int] = None,
+        cc_max_grid_size: Optional[int] = None,
         se_reduction: float = 0.125,
         se_config: List[bool] = None,
         cc_config: List[bool] = None,
@@ -953,7 +978,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         if len(cc_config) != n_blocks:
             raise ValueError(f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})")
 
-        def make_block(in_channels: int, stride, block_se_tile_size, block_cc_tile_size, block_se: bool, block_cc: bool):
+        def make_block(in_channels: int, stride, block_se: bool, block_cc: bool):
             return InvertedBottleneckBlock(
                 conv_op=conv_op,
                 input_channels=in_channels,
@@ -967,28 +992,33 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
                 cc_reduction=cc_reduction,
-                se_tile_size=block_se_tile_size,
-                cc_tile_size=block_cc_tile_size,
+                se_max_grid_size=se_max_grid_size,
+                cc_max_grid_size=cc_max_grid_size,
                 se_reduction=se_reduction,
                 se=block_se,
                 cc=block_cc,
                 num_groups=num_groups,
             )
 
-        self.blocks = nn.Sequential(
+        self.blocks = nn.ModuleList((
             make_block(
                 input_channels,
                 initial_stride,
-                _scale_tile_size(se_tile_size, self.initial_stride, down=False),
-                _scale_tile_size(cc_tile_size, self.initial_stride, down=False),
                 se_config[0],
                 cc_config[0],
             ),
-            *[make_block(output_channels, 1, se_tile_size, cc_tile_size, se_config[i], cc_config[i]) for i in range(1, n_blocks)],
-        )
+            *[make_block(output_channels, 1, se_config[i], cc_config[i]) for i in range(1, n_blocks)],
+        ))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.blocks(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        se_grid_shape: Optional[Sequence[int]] = None,
+        cc_grid_shape: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x, se_grid_shape, cc_grid_shape)
+        return x
 
     def compute_conv_feature_map_size(self, input_size):
         output = self.blocks[0].compute_conv_feature_map_size(input_size)
@@ -1024,8 +1054,8 @@ class CondUNetEncoder(nn.Module):
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
         cc_reduction: float = 0.125,
-        se_tile_size: Union[None, Sequence[int]] = None,
-        cc_tile_size: Union[None, Sequence[int]] = None,
+        se_max_grid_size: Optional[int] = None,
+        cc_max_grid_size: Optional[int] = None,
         se_reduction: float = 0.125,
         se: BoolConfig = False,
         cc: BoolConfig = False,
@@ -1094,18 +1124,15 @@ class CondUNetEncoder(nn.Module):
         )
         self.stem_stride = _normalize_spatial_param(conv_op, stem_stride, "stem.stride")
 
-        normalized_se_tile_size = (
-            None
-            if se_tile_size is None
-            else _normalize_spatial_param(conv_op, se_tile_size, "se.tile_size")
-        )
-        normalized_cc_tile_size = (
-            None
-            if cc_tile_size is None
-            else _normalize_spatial_param(conv_op, cc_tile_size, "cc.tile_size")
-        )
-        current_se_tile_size = _scale_tile_size(normalized_se_tile_size, self.stem_stride, down=True)
-        current_cc_tile_size = _scale_tile_size(normalized_cc_tile_size, self.stem_stride, down=True)
+        self.se_max_grid_size = _normalize_max_grid_size(se_max_grid_size, "se.max_grid_size")
+        self.cc_max_grid_size = _normalize_max_grid_size(cc_max_grid_size, "cc.max_grid_size")
+        if (self.se_max_grid_size is not None or self.cc_max_grid_size is not None) and any(
+            len(set(stage_stride)) != 1 for stage_stride in strides
+        ):
+            raise ValueError(
+                "max_grid_size requires isotropic encoder stage strides so the bottleneck "
+                "aspect ratio remains valid at every stage"
+            )
 
         # Stem applies no non-linearity (only Conv + Norm)
         self.stem = StackedConvBlocks(
@@ -1125,18 +1152,8 @@ class CondUNetEncoder(nn.Module):
         )
 
         stages = []
-        stage_se_tile_sizes = []
-        stage_cc_tile_sizes = []
         stage_input_channels = stem_channels
         for stage_idx, settings in enumerate(stage_settings):
-            stage_stride = strides[stage_idx]
-            current_se_tile_size = _scale_tile_size(current_se_tile_size, stage_stride, down=True)
-            current_cc_tile_size = _scale_tile_size(current_cc_tile_size, stage_stride, down=True)
-            if current_se_tile_size is not None:
-                stage_se_tile_sizes.append(current_se_tile_size)
-            if current_cc_tile_size is not None:
-                stage_cc_tile_sizes.append(current_cc_tile_size)
-
             stages.append(
                 StackedCondInvertedBottleneckBlocks(
                     n_blocks=settings.n_blocks,
@@ -1152,8 +1169,8 @@ class CondUNetEncoder(nn.Module):
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
                     cc_reduction=cc_reduction,
-                    se_tile_size=current_se_tile_size,
-                    cc_tile_size=current_cc_tile_size,
+                    se_max_grid_size=self.se_max_grid_size,
+                    cc_max_grid_size=self.cc_max_grid_size,
                     se_reduction=se_reduction,
                     se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
@@ -1163,8 +1180,6 @@ class CondUNetEncoder(nn.Module):
             stage_input_channels = features_per_stage[stage_idx]
 
         self.stages = nn.ModuleList(stages)
-        self.stage_se_tile_sizes = None if se_tile_size is None else stage_se_tile_sizes
-        self.stage_cc_tile_sizes = None if cc_tile_size is None else stage_cc_tile_sizes
         self.output_channels = features_per_stage
         self.strides = strides
         self.return_skips = return_skips
@@ -1178,11 +1193,16 @@ class CondUNetEncoder(nn.Module):
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        se_grid_shape: Optional[Sequence[int]] = None,
+        cc_grid_shape: Optional[Sequence[int]] = None,
+    ):
         x = self.stem(x)
         skips = []
         for stage in self.stages:
-            x = stage(x)
+            x = stage(x, se_grid_shape, cc_grid_shape)
             skips.append(x)
         return skips if self.return_skips else skips[-1]
 
@@ -1195,6 +1215,14 @@ class CondUNetEncoder(nn.Module):
                 input_size, self.kernel_sizes[stage_idx], self.strides[stage_idx]
             )
         return output
+
+    def compute_bottleneck_shape(self, input_size: Sequence[int]) -> Tuple[int, ...]:
+        spatial_shape = _conv_output_shape(
+            input_size, self.stem_kernel_size, self.stem_stride
+        )
+        for kernel_size, stride in zip(self.kernel_sizes, self.strides):
+            spatial_shape = _conv_output_shape(spatial_shape, kernel_size, stride)
+        return tuple(int(size) for size in spatial_shape)
 
 
 class CondUNetDecoder(nn.Module):
@@ -1289,12 +1317,8 @@ class CondUNetDecoder(nn.Module):
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
                     cc_reduction=cc_reduction,
-                    se_tile_size=None
-                    if encoder.stage_se_tile_sizes is None
-                    else encoder.stage_se_tile_sizes[target_stage_idx],
-                    cc_tile_size=None
-                    if encoder.stage_cc_tile_sizes is None
-                    else encoder.stage_cc_tile_sizes[target_stage_idx],
+                    se_max_grid_size=encoder.se_max_grid_size,
+                    cc_max_grid_size=encoder.cc_max_grid_size,
                     se_reduction=se_reduction,
                     se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
@@ -1319,7 +1343,12 @@ class CondUNetDecoder(nn.Module):
             bias=True,
         )
 
-    def forward(self, skips):
+    def forward(
+        self,
+        skips,
+        se_grid_shape: Optional[Sequence[int]] = None,
+        cc_grid_shape: Optional[Sequence[int]] = None,
+    ):
         if self.deep_supervision:
             raise RuntimeError("CondUNet does not support deep supervision")
         x = skips[-1]
@@ -1331,7 +1360,7 @@ class CondUNetDecoder(nn.Module):
                 )
             else:
                 x = self.upsamplers[stage_idx](x)
-            x = stage(torch.cat((x, skip), dim=1))
+            x = stage(torch.cat((x, skip), dim=1), se_grid_shape, cc_grid_shape)
         seg_output = self.seg_layer(x)
         return seg_output
 
@@ -1426,8 +1455,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_stride=stem.stride,
             num_experts=cc.encoder_num_experts,
             cc_reduction=cc.reduction,
-            se_tile_size=se.tile_size,
-            cc_tile_size=cc.tile_size,
+            se_max_grid_size=se.max_grid_size,
+            cc_max_grid_size=cc.max_grid_size,
             se_reduction=se.reduction,
             se=se.encoder,
             cc=cc.encoder,
@@ -1450,7 +1479,19 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
 
     def forward(self, x: torch.Tensor):
         input_spatial_shape = x.shape[2:]
-        output = self.decoder(self.encoder(x))
+        bottleneck_shape = self.encoder.compute_bottleneck_shape(input_spatial_shape)
+        se_grid_shape = (
+            None
+            if self.encoder.se_max_grid_size is None
+            else _derive_grid_shape(bottleneck_shape, self.encoder.se_max_grid_size)
+        )
+        cc_grid_shape = (
+            None
+            if self.encoder.cc_max_grid_size is None
+            else _derive_grid_shape(bottleneck_shape, self.encoder.cc_max_grid_size)
+        )
+        skips = self.encoder(x, se_grid_shape, cc_grid_shape)
+        output = self.decoder(skips, se_grid_shape, cc_grid_shape)
         if output.shape[2:] != input_spatial_shape:
             raise ValueError(
                 f"CondUNet output spatial shape {tuple(output.shape[2:])} does not match input "

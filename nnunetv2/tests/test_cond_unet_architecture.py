@@ -2,7 +2,12 @@ import pytest
 import torch
 from torch import nn
 
-from nnunetv2.training.network_architecture.cond_unet import CondPWConv, CondUNet, TiledPoolMLP
+from nnunetv2.training.network_architecture.cond_unet import (
+    CondPWConv,
+    CondUNet,
+    TiledPoolMLP,
+    _derive_grid_shape,
+)
 
 
 def _small_model(**overrides) -> CondUNet:
@@ -117,9 +122,45 @@ def test_grouped_expert_blending_matches_explicit_channel_group_mixture(group_on
 
 
 def test_tiled_pool_rejects_geometry_that_cannot_form_equal_tiles():
-    pool = TiledPoolMLP(4, 2, 0.5, nn.ReLU, tile_size=(3, 3))
-    with pytest.raises(ValueError, match="cannot be partitioned into equal"):
-        pool(torch.randn(1, 4, 10, 10))
+    pool = TiledPoolMLP(4, 2, 0.5, nn.ReLU, max_grid_size=3)
+    with pytest.raises(ValueError, match="must be divisible by grid_shape"):
+        pool(torch.randn(1, 4, 10, 10), grid_shape=(3, 3))
+
+
+def test_grid_shape_tracks_bottleneck_aspect_ratio_and_uses_valid_divisors():
+    assert _derive_grid_shape((6, 12, 12), max_grid_size=4) == (2, 4, 4)
+    assert _derive_grid_shape((10, 12, 12), max_grid_size=4) == (2, 4, 4)
+
+
+def test_tiled_addons_use_one_bottleneck_relative_grid_across_network():
+    model = _small_model(
+        se={
+            "encoder": [False, True, True],
+            "decoder": True,
+            "max_grid_size": 4,
+        },
+        cc={
+            "encoder": [False, True, True],
+            "encoder_num_experts": 2,
+            "max_grid_size": 4,
+        }
+    )
+    pooled_output_shapes = []
+    hooks = [
+        module.register_forward_hook(
+            lambda _module, _inputs, output: pooled_output_shapes.append(output.shape)
+        )
+        for module in model.modules()
+        if isinstance(module, TiledPoolMLP) and module.max_grid_size is not None
+    ]
+
+    output = model(torch.randn(1, 1, 32, 64))
+    for hook in hooks:
+        hook.remove()
+
+    assert output.shape == (1, 2, 32, 64)
+    assert pooled_output_shapes
+    assert all(tuple(shape[1:-1]) == (2, 4) for shape in pooled_output_shapes)
 
 
 @pytest.mark.parametrize(
@@ -128,6 +169,14 @@ def test_tiled_pool_rejects_geometry_that_cannot_form_equal_tiles():
         ({"deep_supervision": True}, "does not support deep supervision"),
         ({"upsample_mode": "typo"}, "upsample_mode must be"),
         ({"kernel_sizes": 2}, "kernel_sizes values must be odd"),
+        ({"se": {"max_grid_size": 0}}, "must be a positive integer or None"),
+        (
+            {
+                "strides": [[1, 1], [1, 2], [2, 2]],
+                "se": {"max_grid_size": 2},
+            },
+            "requires isotropic encoder stage strides",
+        ),
     ],
 )
 def test_invalid_public_architecture_options_fail_early(overrides, message):

@@ -508,22 +508,33 @@ class PhaseThreePlanner(CondUNetPlanner):
                 "features_per_stage": [96, 192, 384, 768],
             },
         },
-        "4x-m-t4se-enck": {
-            "inherits_from": "4x-m",
-            "arch_kwargs": {
-                "se": {
-                    "encoder": [False, True, True, True],
-                    "tile_size": [16, 48, 48],
-                },
-            },
-        },
-        "4x-m-t4cc-enck": {
+        "4x-m-tcc2-enck": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "encoder": [False, True, True, True],
                     "encoder_num_experts": 4,
-                    "tile_size": [16, 48, 48],
+                    "max_grid_size": 2,
+                },
+            },
+        },
+        "4x-m-tcc4-enck": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "max_grid_size": 4,
+                },
+            },
+        },
+        "4x-m-tcc8-enck": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "max_grid_size": 8,
                 },
             },
         },
