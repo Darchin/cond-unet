@@ -1412,7 +1412,7 @@ class nnUNetTrainer(object):
             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
                                    also_print_to_console=True)
 
-        self.set_deep_supervision_enabled(True)
+        self.set_deep_supervision_enabled(self.enable_deep_supervision)
         compute_gaussian.cache_clear()
 
     def run_training(self):
