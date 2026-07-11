@@ -357,7 +357,7 @@ class SqueezeAndExcitationBlock(nn.Module):
             spatial_dims = x.ndim - 2
             return x * scale.reshape(x.shape[0], x.shape[1], *([1] * spatial_dims))
         scale = scale.movedim(-1, 1)
-        scale = F.interpolate(scale, size=x.shape[2:], mode="nearest")
+        scale = F.interpolate(scale, size=x.shape[2:], mode="trilinear")
         return x * scale
 
 
