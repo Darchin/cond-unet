@@ -127,6 +127,28 @@ def test_tiled_pool_rejects_geometry_that_cannot_form_equal_tiles():
         pool(torch.randn(1, 4, 10, 10), grid_shape=(3, 3))
 
 
+def test_tiled_pool_concatenates_global_context_without_expanding_hidden_width():
+    pool = TiledPoolMLP(
+        2, 3, 0.5, nn.ReLU, max_grid_size=2, concat_global_context=True
+    )
+    captured = []
+    hook = pool.mlp[0].register_forward_pre_hook(
+        lambda _module, inputs: captured.append(inputs[0].detach().clone())
+    )
+    x = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
+    pool(x, grid_shape=(1, 2))
+    hook.remove()
+
+    tile_descriptors = nn.functional.adaptive_avg_pool2d(x, (1, 2)).movedim(1, -1)
+    global_descriptor = tile_descriptors.mean(dim=(1, 2), keepdim=True)
+    expected = torch.cat(
+        (tile_descriptors, global_descriptor.expand_as(tile_descriptors)), dim=-1
+    )
+    torch.testing.assert_close(captured[0], expected)
+    assert pool.mlp[0].in_features == 4
+    assert pool.mlp[0].out_features == 1
+
+
 def test_grid_shape_tracks_bottleneck_aspect_ratio_and_uses_valid_divisors():
     assert _derive_grid_shape((6, 12, 12), max_grid_size=4) == (2, 4, 4)
     assert _derive_grid_shape((10, 12, 12), max_grid_size=4) == (2, 4, 4)
@@ -198,3 +220,78 @@ def test_per_stage_and_per_block_addon_configuration_builds_and_runs():
     )
     output = model(torch.randn(1, 1, 32, 32))
     assert output.shape == (1, 2, 32, 32)
+
+
+def test_se_runs_between_projection_convolution_and_normalization():
+    model = _small_model(se={"encoder": [[True], [False, False], [False]]})
+    block = model.encoder.stages[0].blocks[0]
+    events = []
+    hooks = [
+        block.project.conv.register_forward_hook(lambda *_args: events.append("projection")),
+        block.se_block.register_forward_hook(lambda *_args: events.append("se")),
+        block.project.norm.register_forward_hook(lambda *_args: events.append("norm")),
+    ]
+    model(torch.randn(1, 1, 32, 32))
+    for hook in hooks:
+        hook.remove()
+    assert events[:3] == ["projection", "se", "norm"]
+
+
+def test_router_assignment_shares_mlp_but_evaluates_it_for_each_block():
+    model = _small_model(
+        encoder_n_blocks_per_stage=[2, 2, 1],
+        cc={
+            "encoder": [[True, True], [False, False], [False]],
+            "encoder_num_experts": [2, 0, 0],
+            "encoder_router_assignment": [[0, 0], None, None],
+        },
+    )
+    first, second = model.encoder.stages[0].blocks
+    assert first.router is second.router
+    calls = []
+    hook = first.router.register_forward_hook(lambda *_args: calls.append(None))
+    model(torch.randn(1, 1, 32, 32))
+    hook.remove()
+    assert len(calls) == 2
+
+
+def test_router_assignment_rejects_incompatible_widths():
+    with pytest.raises(ValueError, match="cannot be shared by blocks with input channels"):
+        _small_model(
+            cc={
+                "encoder": [[False], [True, True], [False]],
+                "encoder_num_experts": [0, 2, 0],
+                "encoder_router_assignment": [None, [0, 0], None],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("assignment", "message"),
+    [
+        ([[None], [0, 1], None], "must be None when CC is disabled"),
+        ([[None], [-1, None], None], "must be a nonnegative integer"),
+    ],
+)
+def test_router_assignment_validation(assignment, message):
+    cc_blocks = [[False], [True, False], [False]]
+    with pytest.raises(ValueError, match=message):
+        _small_model(
+            cc={
+                "encoder": cc_blocks,
+                "encoder_num_experts": [0, 2, 0],
+                "encoder_router_assignment": assignment,
+            }
+        )
+
+
+def test_router_assignment_rejects_noncontiguous_ids():
+    with pytest.raises(ValueError, match="must form one contiguous run"):
+        _small_model(
+            encoder_n_blocks_per_stage=[1, 3, 1],
+            cc={
+                "encoder": [[False], [True, True, True], [False]],
+                "encoder_num_experts": [0, 2, 0],
+                "encoder_router_assignment": [None, [0, 1, 0], None],
+            },
+        )

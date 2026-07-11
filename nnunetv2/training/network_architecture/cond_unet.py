@@ -25,6 +25,7 @@ from torch.nn.modules.dropout import _DropoutNd
 BoolConfig = Union[bool, List[bool], List[List[bool]]]
 IntConfig = Union[int, List[int], Tuple[int, ...]]
 KernelConfig = Union[int, List[int], Tuple[int, ...]]
+RouterAssignment = Optional[Sequence[Optional[Sequence[Optional[int]]]]]
 
 
 @dataclass
@@ -40,11 +41,16 @@ class SEConfig:
         max_grid_size: Maximum number of grid cells along the longest bottleneck
             axis. The actual grid follows the bottleneck aspect ratio. None means
             global (standard) SE.
+        encoder_concat_global_context: Per-block enablement for concatenating a
+            global descriptor to each tiled encoder descriptor.
+        decoder_concat_global_context: Decoder equivalent.
     """
     reduction: float = 0.125
     encoder: BoolConfig = False
     decoder: BoolConfig = False
     max_grid_size: Optional[int] = None
+    encoder_concat_global_context: BoolConfig = False
+    decoder_concat_global_context: BoolConfig = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "SEConfig":
@@ -69,6 +75,12 @@ class CCConfig:
         max_grid_size: Maximum number of grid cells along the longest bottleneck
             axis. The actual grid follows the bottleneck aspect ratio. None means
             global routing.
+        encoder_concat_global_context: Per-block enablement for concatenating a
+            global descriptor to each tiled encoder router descriptor.
+        decoder_concat_global_context: Decoder equivalent.
+        encoder_router_assignment: Optional per-stage, per-block router IDs.
+            A None stage uses one router per enabled block.
+        decoder_router_assignment: Decoder equivalent.
     """
     reduction: float = 0.125
     encoder: BoolConfig = False
@@ -78,6 +90,10 @@ class CCConfig:
     encoder_num_groups: IntConfig = 1
     decoder_num_groups: IntConfig = 1
     max_grid_size: Optional[int] = None
+    encoder_concat_global_context: BoolConfig = False
+    decoder_concat_global_context: BoolConfig = False
+    encoder_router_assignment: RouterAssignment = None
+    decoder_router_assignment: RouterAssignment = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -281,16 +297,23 @@ class TiledPoolMLP(nn.Module):
         nonlin_kwargs: dict = None,
         final_activation: Union[None, Type[nn.Module]] = nn.Sigmoid,
         max_grid_size: Optional[int] = None,
+        concat_global_context: bool = False,
     ):
         super().__init__()
         if reduction <= 0:
             raise ValueError("reduction must be greater than 0")
         self.max_grid_size = _normalize_max_grid_size(max_grid_size, "max_grid_size")
+        if not isinstance(concat_global_context, bool):
+            raise TypeError("concat_global_context must be a bool")
+        self.concat_global_context = concat_global_context
         hidden_channels = max(1, round(input_channels * reduction))
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
         activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
         layers = [
-            nn.Linear(input_channels, hidden_channels),
+            nn.Linear(
+                input_channels * (2 if concat_global_context and self.max_grid_size is not None else 1),
+                hidden_channels,
+            ),
             activation,
             nn.Linear(hidden_channels, output_channels),
         ]
@@ -329,7 +352,13 @@ class TiledPoolMLP(nn.Module):
         adaptive_avg_pool = (
             F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d
         )[spatial_dims - 1]
-        return self.mlp(adaptive_avg_pool(x, grid_shape).movedim(1, -1))
+        descriptors = adaptive_avg_pool(x, grid_shape).movedim(1, -1)
+        if self.concat_global_context:
+            grid_axes = tuple(range(1, descriptors.ndim - 1))
+            global_descriptor = descriptors.mean(dim=grid_axes, keepdim=True)
+            global_descriptor = global_descriptor.expand_as(descriptors)
+            descriptors = torch.cat((descriptors, global_descriptor), dim=-1)
+        return self.mlp(descriptors)
 
 
 class SqueezeAndExcitationBlock(nn.Module):
@@ -342,11 +371,13 @@ class SqueezeAndExcitationBlock(nn.Module):
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
         max_grid_size: Optional[int] = None,
+        concat_global_context: bool = False,
     ):
         super().__init__()
         self.pool_mlp = TiledPoolMLP(
             channels, channels, reduction, nonlin, nonlin_kwargs,
             final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
+            concat_global_context=concat_global_context,
         )
 
     def forward(
@@ -373,11 +404,13 @@ class Router(nn.Module):
         nonlin: Union[None, Type[nn.Module]],
         nonlin_kwargs: dict = None,
         max_grid_size: Optional[int] = None,
+        concat_global_context: bool = False,
     ):
         super().__init__()
         self.pool_mlp = TiledPoolMLP(
             input_channels, num_experts, reduction, nonlin, nonlin_kwargs,
             final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
+            concat_global_context=concat_global_context,
         )
         self.max_grid_size = self.pool_mlp.max_grid_size
 
@@ -679,6 +712,53 @@ def _expand_block_config(
     return result
 
 
+def _expand_router_assignment(
+    assignment: RouterAssignment,
+    n_stages: int,
+    n_blocks_per_stage: List[int],
+    cc_blocks: List[List[bool]],
+    name: str,
+) -> List[Optional[Tuple[Optional[int], ...]]]:
+    if assignment is None:
+        return [None] * n_stages
+    if not isinstance(assignment, (list, tuple)) or len(assignment) != n_stages:
+        raise ValueError(f"{name} must contain exactly {n_stages} per-stage values")
+
+    result = []
+    for stage_idx, stage_assignment in enumerate(assignment):
+        if stage_assignment is None:
+            result.append(None)
+            continue
+        if not isinstance(stage_assignment, (list, tuple)):
+            raise ValueError(f"{name}[{stage_idx}] must be None or a sequence")
+        values = list(stage_assignment)
+        if len(values) != n_blocks_per_stage[stage_idx]:
+            raise ValueError(
+                f"{name}[{stage_idx}] must contain exactly {n_blocks_per_stage[stage_idx]} values"
+            )
+        seen_runs = set()
+        previous = None
+        for block_idx, (value, enabled) in enumerate(zip(values, cc_blocks[stage_idx])):
+            if enabled:
+                if not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value < 0:
+                    raise ValueError(
+                        f"{name}[{stage_idx}][{block_idx}] must be a nonnegative integer when CC is enabled"
+                    )
+                value = int(value)
+                values[block_idx] = value
+                if value != previous:
+                    if value in seen_runs:
+                        raise ValueError(f"router ID {value} in {name}[{stage_idx}] must form one contiguous run")
+                    seen_runs.add(value)
+            elif value is not None:
+                raise ValueError(
+                    f"{name}[{stage_idx}][{block_idx}] must be None when CC is disabled"
+                )
+            previous = value
+        result.append(tuple(values))
+    return result
+
+
 @dataclass(frozen=True)
 class _StageSettings:
     n_blocks: int
@@ -687,6 +767,9 @@ class _StageSettings:
     num_groups: int
     se_blocks: Tuple[bool, ...]
     cc_blocks: Tuple[bool, ...]
+    se_concat_global_context: Tuple[bool, ...]
+    cc_concat_global_context: Tuple[bool, ...]
+    router_assignment: Optional[Tuple[Optional[int], ...]]
 
 
 def _normalize_stage_settings(
@@ -697,6 +780,9 @@ def _normalize_stage_settings(
     num_groups: Union[int, Sequence[int]],
     se: BoolConfig,
     cc: BoolConfig,
+    se_concat_global_context: BoolConfig,
+    cc_concat_global_context: BoolConfig,
+    router_assignment: RouterAssignment,
     context: str,
 ) -> List[_StageSettings]:
     block_counts = _expand_int_param(
@@ -713,6 +799,15 @@ def _normalize_stage_settings(
     )
     se_blocks = _expand_block_config(se, n_stages, block_counts, f"{context} se")
     cc_blocks = _expand_block_config(cc, n_stages, block_counts, f"{context} cc")
+    se_context = _expand_block_config(
+        se_concat_global_context, n_stages, block_counts, f"{context} se concat_global_context"
+    )
+    cc_context = _expand_block_config(
+        cc_concat_global_context, n_stages, block_counts, f"{context} cc concat_global_context"
+    )
+    assignments = _expand_router_assignment(
+        router_assignment, n_stages, block_counts, cc_blocks, f"{context} router_assignment"
+    )
 
     settings = []
     for stage_idx in range(n_stages):
@@ -729,6 +824,9 @@ def _normalize_stage_settings(
                 num_groups=group_counts[stage_idx],
                 se_blocks=tuple(se_blocks[stage_idx]),
                 cc_blocks=tuple(cc_blocks[stage_idx]),
+                se_concat_global_context=tuple(se_context[stage_idx]),
+                cc_concat_global_context=tuple(cc_context[stage_idx]),
+                router_assignment=assignments[stage_idx],
             )
         )
     return settings
@@ -806,7 +904,7 @@ class DepthwiseConvBlock(nn.Module):
 class InvertedBottleneckBlock(nn.Module):
     """Inverted bottleneck with optional pointwise routing and squeeze-and-excitation.
 
-    The basic underlying block format is: PW -> Norm/Act -> DW -> Norm/Act -> PW -> Norm.
+    The basic underlying block format is: PW -> Norm/Act -> DW -> Norm/Act -> PW -> SE -> Norm.
     Bias is set to False for all these convolutions as they have a proceeding normalization layer.
     """
 
@@ -830,6 +928,9 @@ class InvertedBottleneckBlock(nn.Module):
         se: bool = False,
         cc: bool = False,
         num_groups: int = 1,
+        se_concat_global_context: bool = False,
+        cc_concat_global_context: bool = False,
+        shared_router: Optional[Router] = None,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -881,9 +982,13 @@ class InvertedBottleneckBlock(nn.Module):
                     f"Expanded channels ({self.expanded_channels}) must be divisible by num_groups ({num_groups})"
                 )
 
-            self.router = Router(
-                input_channels, num_experts * num_groups, cc_reduction, nonlin, nonlin_kwargs,
-                cc_max_grid_size,
+            self.router = (
+                shared_router
+                if shared_router is not None
+                else Router(
+                    input_channels, num_experts * num_groups, cc_reduction, nonlin,
+                    nonlin_kwargs, cc_max_grid_size, cc_concat_global_context,
+                )
             )
             _expertify_pointwise(
                 self.expand, num_experts, cc_reduction, nonlin, nonlin_kwargs,
@@ -898,7 +1003,8 @@ class InvertedBottleneckBlock(nn.Module):
 
         self.se_block = (
             SqueezeAndExcitationBlock(
-                output_channels, se_reduction, nonlin, nonlin_kwargs, se_max_grid_size
+                output_channels, se_reduction, nonlin, nonlin_kwargs, se_max_grid_size,
+                se_concat_global_context,
             )
             if se
             else nn.Identity()
@@ -915,16 +1021,18 @@ class InvertedBottleneckBlock(nn.Module):
             scores = self.router(x, cc_grid_shape)
             x = _forward_routed_conv_block(self.expand, x, scores)
             x = self.depthwise(x)
-            x = _forward_routed_conv_block(self.project, x, scores)
+            x = self.project.conv(x, scores)
         else:
             x = self.expand(x)
             x = self.depthwise(x)
-            x = self.project(x)
+            x = self.project.conv(x)
 
         if isinstance(self.se_block, SqueezeAndExcitationBlock):
             x = self.se_block(x, se_grid_shape)
         else:
             x = self.se_block(x)
+        if hasattr(self.project, "norm"):
+            x = self.project.norm(x)
         if self.add_identity:
             x = x + residual
         return x
@@ -962,6 +1070,9 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         se_config: List[bool] = None,
         cc_config: List[bool] = None,
         num_groups: int = 1,
+        se_concat_global_context: List[bool] = None,
+        cc_concat_global_context: List[bool] = None,
+        router_assignment: Optional[Sequence[Optional[int]]] = None,
     ):
         super().__init__()
         if not isinstance(n_blocks, (int, np.integer)) or isinstance(n_blocks, bool) or n_blocks <= 0:
@@ -973,13 +1084,46 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
             se_config = [False] * n_blocks
         if cc_config is None:
             cc_config = [False] * n_blocks
+        if se_concat_global_context is None:
+            se_concat_global_context = [False] * n_blocks
+        if cc_concat_global_context is None:
+            cc_concat_global_context = [False] * n_blocks
 
         if len(se_config) != n_blocks:
             raise ValueError(f"se_config length ({len(se_config)}) must match n_blocks ({n_blocks})")
         if len(cc_config) != n_blocks:
             raise ValueError(f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})")
 
-        def make_block(in_channels: int, stride, block_se: bool, block_cc: bool):
+        block_input_channels = [input_channels] + [output_channels] * (n_blocks - 1)
+        shared_routers = {}
+        if router_assignment is not None:
+            for block_idx, router_id in enumerate(router_assignment):
+                if router_id is None:
+                    continue
+                if router_id in shared_routers:
+                    router, expected_channels, expected_context = shared_routers[router_id]
+                    if block_input_channels[block_idx] != expected_channels:
+                        raise ValueError(
+                            f"router ID {router_id} cannot be shared by blocks with input channels "
+                            f"{expected_channels} and {block_input_channels[block_idx]}"
+                        )
+                    if cc_concat_global_context[block_idx] != expected_context:
+                        raise ValueError(
+                            f"router ID {router_id} cannot be shared by blocks with different "
+                            "concat_global_context settings"
+                        )
+                else:
+                    router = Router(
+                        block_input_channels[block_idx], num_experts * num_groups, cc_reduction,
+                        nonlin, nonlin_kwargs, cc_max_grid_size,
+                        cc_concat_global_context[block_idx],
+                    )
+                    shared_routers[router_id] = (
+                        router, block_input_channels[block_idx], cc_concat_global_context[block_idx]
+                    )
+
+        def make_block(block_idx: int, in_channels: int, stride, block_se: bool, block_cc: bool):
+            router_id = None if router_assignment is None else router_assignment[block_idx]
             return InvertedBottleneckBlock(
                 conv_op=conv_op,
                 input_channels=in_channels,
@@ -999,16 +1143,23 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 se=block_se,
                 cc=block_cc,
                 num_groups=num_groups,
+                se_concat_global_context=se_concat_global_context[block_idx],
+                cc_concat_global_context=cc_concat_global_context[block_idx],
+                shared_router=None if router_id is None else shared_routers[router_id][0],
             )
 
         self.blocks = nn.ModuleList((
             make_block(
+                0,
                 input_channels,
                 initial_stride,
                 se_config[0],
                 cc_config[0],
             ),
-            *[make_block(output_channels, 1, se_config[i], cc_config[i]) for i in range(1, n_blocks)],
+            *[
+                make_block(i, output_channels, 1, se_config[i], cc_config[i])
+                for i in range(1, n_blocks)
+            ],
         ))
 
     def forward(
@@ -1061,6 +1212,9 @@ class CondUNetEncoder(nn.Module):
         se: BoolConfig = False,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
+        se_concat_global_context: BoolConfig = False,
+        cc_concat_global_context: BoolConfig = False,
+        router_assignment: RouterAssignment = None,
     ):
         super().__init__()
         if not isinstance(n_stages, (int, np.integer)) or isinstance(n_stages, bool) or n_stages <= 0:
@@ -1104,6 +1258,9 @@ class CondUNetEncoder(nn.Module):
             num_groups,
             se,
             cc,
+            se_concat_global_context,
+            cc_concat_global_context,
+            router_assignment,
             "encoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
@@ -1176,6 +1333,9 @@ class CondUNetEncoder(nn.Module):
                     se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
+                    se_concat_global_context=list(settings.se_concat_global_context),
+                    cc_concat_global_context=list(settings.cc_concat_global_context),
+                    router_assignment=settings.router_assignment,
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -1241,6 +1401,9 @@ class CondUNetDecoder(nn.Module):
         se: BoolConfig = False,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
+        se_concat_global_context: BoolConfig = False,
+        cc_concat_global_context: BoolConfig = False,
+        router_assignment: RouterAssignment = None,
     ):
         super().__init__()
         if (
@@ -1271,6 +1434,9 @@ class CondUNetDecoder(nn.Module):
             num_groups,
             se,
             cc,
+            se_concat_global_context,
+            cc_concat_global_context,
+            router_assignment,
             "decoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
@@ -1324,6 +1490,9 @@ class CondUNetDecoder(nn.Module):
                     se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
+                    se_concat_global_context=list(settings.se_concat_global_context),
+                    cc_concat_global_context=list(settings.cc_concat_global_context),
+                    router_assignment=settings.router_assignment,
                 )
             )
 
@@ -1462,6 +1631,9 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se=se.encoder,
             cc=cc.encoder,
             num_groups=cc.encoder_num_groups,
+            se_concat_global_context=se.encoder_concat_global_context,
+            cc_concat_global_context=cc.encoder_concat_global_context,
+            router_assignment=cc.encoder_router_assignment,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1476,6 +1648,9 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se=se.decoder,
             cc=cc.decoder,
             num_groups=cc.decoder_num_groups,
+            se_concat_global_context=se.decoder_concat_global_context,
+            cc_concat_global_context=cc.decoder_concat_global_context,
+            router_assignment=cc.decoder_router_assignment,
         )
 
     def forward(self, x: torch.Tensor):
