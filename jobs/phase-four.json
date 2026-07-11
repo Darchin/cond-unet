@@ -1,0 +1,17 @@
+[
+    {
+        "configs": [
+            "4x-m-tse4-enck",
+            "4x-m-tcc4-enck",
+            "4x-m-tcc4-enck-shared",
+            "4x-m-tcc4+tse4-enck"
+        ],
+        "folds": [
+            0,
+            1,
+            2,
+            3,
+            4
+        ]
+    }
+]
