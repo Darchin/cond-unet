@@ -1,10 +1,15 @@
 [
     {
         "configs": [
-            "4x-m-tcc4+tse4-enck"
+            "4x-m-tcc4+tse4-enck",
+            "4x-m-tcc4+tse4-0.33-enck"
         ],
         "folds": [
-            0, 1, 2, 3, 4
+            0,
+            1,
+            2,
+            3,
+            4
         ]
     }
 ]
