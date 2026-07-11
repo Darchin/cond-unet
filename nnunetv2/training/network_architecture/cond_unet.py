@@ -79,7 +79,8 @@ class CCConfig:
             global descriptor to each tiled encoder router descriptor.
         decoder_concat_global_context: Decoder equivalent.
         encoder_router_assignment: Optional per-stage, per-block router IDs.
-            A None stage uses one router per enabled block.
+            Blocks in a contiguous ID group reuse scores computed from the
+            group's first block. A None stage routes every enabled block independently.
         decoder_router_assignment: Decoder equivalent.
     """
     reduction: float = 0.125
@@ -1015,10 +1016,15 @@ class InvertedBottleneckBlock(nn.Module):
         x: torch.Tensor,
         se_grid_shape: Optional[Sequence[int]] = None,
         cc_grid_shape: Optional[Sequence[int]] = None,
+        router_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = x
         if self.router is not None:
-            scores = self.router(x, cc_grid_shape)
+            scores = (
+                self.router(x, cc_grid_shape)
+                if router_scores is None
+                else router_scores
+            )
             x = _forward_routed_conv_block(self.expand, x, scores)
             x = self.depthwise(x)
             x = self.project.conv(x, scores)
@@ -1079,6 +1085,9 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
             raise ValueError("n_blocks must be greater than 0")
         self.initial_stride = _normalize_spatial_param(conv_op, initial_stride, "initial_stride")
         self.output_channels = output_channels
+        self.router_assignment = (
+            None if router_assignment is None else tuple(router_assignment)
+        )
 
         if se_config is None:
             se_config = [False] * n_blocks
@@ -1101,12 +1110,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 if router_id is None:
                     continue
                 if router_id in shared_routers:
-                    router, expected_channels, expected_context = shared_routers[router_id]
-                    if block_input_channels[block_idx] != expected_channels:
-                        raise ValueError(
-                            f"router ID {router_id} cannot be shared by blocks with input channels "
-                            f"{expected_channels} and {block_input_channels[block_idx]}"
-                        )
+                    router, expected_context = shared_routers[router_id]
                     if cc_concat_global_context[block_idx] != expected_context:
                         raise ValueError(
                             f"router ID {router_id} cannot be shared by blocks with different "
@@ -1118,9 +1122,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                         nonlin, nonlin_kwargs, cc_max_grid_size,
                         cc_concat_global_context[block_idx],
                     )
-                    shared_routers[router_id] = (
-                        router, block_input_channels[block_idx], cc_concat_global_context[block_idx]
-                    )
+                    shared_routers[router_id] = (router, cc_concat_global_context[block_idx])
 
         def make_block(block_idx: int, in_channels: int, stride, block_se: bool, block_cc: bool):
             router_id = None if router_assignment is None else router_assignment[block_idx]
@@ -1168,8 +1170,16 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         se_grid_shape: Optional[Sequence[int]] = None,
         cc_grid_shape: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x, se_grid_shape, cc_grid_shape)
+        shared_scores = {}
+        for block_idx, block in enumerate(self.blocks):
+            router_scores = None
+            if self.router_assignment is not None:
+                router_id = self.router_assignment[block_idx]
+                if router_id is not None:
+                    if router_id not in shared_scores:
+                        shared_scores[router_id] = block.router(x, cc_grid_shape)
+                    router_scores = shared_scores[router_id]
+            x = block(x, se_grid_shape, cc_grid_shape, router_scores)
         return x
 
     def compute_conv_feature_map_size(self, input_size):

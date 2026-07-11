@@ -237,7 +237,7 @@ def test_se_runs_between_projection_convolution_and_normalization():
     assert events[:3] == ["projection", "se", "norm"]
 
 
-def test_router_assignment_shares_mlp_but_evaluates_it_for_each_block():
+def test_router_assignment_reuses_first_blocks_scores_for_each_group():
     model = _small_model(
         encoder_n_blocks_per_stage=[2, 2, 1],
         cc={
@@ -249,21 +249,35 @@ def test_router_assignment_shares_mlp_but_evaluates_it_for_each_block():
     first, second = model.encoder.stages[0].blocks
     assert first.router is second.router
     calls = []
+    routed_scores = []
     hook = first.router.register_forward_hook(lambda *_args: calls.append(None))
+    score_hooks = [
+        block.expand.conv.register_forward_pre_hook(
+            lambda _module, inputs: routed_scores.append(inputs[1])
+        )
+        for block in (first, second)
+    ]
     model(torch.randn(1, 1, 32, 32))
     hook.remove()
-    assert len(calls) == 2
+    for score_hook in score_hooks:
+        score_hook.remove()
+    assert len(calls) == 1
+    assert routed_scores[0] is routed_scores[1]
 
 
-def test_router_assignment_rejects_incompatible_widths():
-    with pytest.raises(ValueError, match="cannot be shared by blocks with input channels"):
-        _small_model(
-            cc={
-                "encoder": [[False], [True, True], [False]],
-                "encoder_num_experts": [0, 2, 0],
-                "encoder_router_assignment": [None, [0, 0], None],
-            }
-        )
+def test_router_assignment_can_span_blocks_with_different_input_widths():
+    model = _small_model(
+        cc={
+            "encoder": [[False], [True, True], [False]],
+            "encoder_num_experts": [0, 2, 0],
+            "encoder_router_assignment": [None, [0, 0], None],
+        }
+    )
+    first, second = model.encoder.stages[1].blocks
+    assert first.input_channels != second.input_channels
+    assert first.router is second.router
+    output = model(torch.randn(1, 1, 32, 32))
+    assert output.shape == (1, 2, 32, 32)
 
 
 @pytest.mark.parametrize(
