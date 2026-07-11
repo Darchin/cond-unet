@@ -717,3 +717,104 @@ class PhaseThreePlanner(CondUNetPlanner):
             name: self._phase_three_configuration(preset)
             for name, preset in self.phase_three_presets.items()
         }
+
+class PhaseFourPlanner(CondUNetPlanner):
+    phase_four_presets = {
+        "4x-m": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "arch_kwargs": {
+                "features_per_stage": [96, 192, 384, 768],
+            },
+        },
+        "4x-m-tcc4-enck": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "max_grid_size": 4,
+                    "encoder_concat_global_context": True,
+                },
+            },
+        },
+        "4x-m-tcc4-enck-shared": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "max_grid_size": 4,
+                    "encoder_concat_global_context": True,
+                    "encoder_router_assignment": [
+                        None,
+                        [0, 0, 0],
+                        [0, 0, 0, 1, 1, 1, 2, 2, 2],
+                        [0, 0, 0]
+                    ]
+                },
+            },
+        },
+        "4x-m-tse4-enck": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "se": {
+                    "encoder": [False, True, True, True],
+                    "max_grid_size": 4,
+                    "encoder_concat_global_context": True,
+                },
+            },
+        },
+        "4x-m-tcc4+tse4-enck": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "max_grid_size": 4,
+                    "encoder_concat_global_context": True,
+                },
+                "se": {
+                    "encoder": [False, True, True, True],
+                    "max_grid_size": 4,
+                    "encoder_concat_global_context": True,
+                },
+            },
+        },
+    }
+
+    def __init__(
+        self,
+        dataset_name_or_id: Union[str, int],
+        gpu_memory_target_in_gb: float = 8,
+        preprocessor_name: str = "DefaultPreprocessor",
+        plans_name: str = "nnUNetCondUNetPlans",
+        overwrite_target_spacing: Union[List[float], Tuple[float, ...]] = None,
+        suppress_transpose: bool = False,
+    ):
+        super().__init__(
+            dataset_name_or_id,
+            gpu_memory_target_in_gb,
+            preprocessor_name,
+            plans_name,
+            overwrite_target_spacing,
+            suppress_transpose,
+        )
+
+    @classmethod
+    def _phase_four_configuration(cls, preset: dict) -> dict:
+        configuration = {
+            "inherits_from": preset["inherits_from"],
+            "architecture": {
+                "arch_kwargs": deepcopy(preset["arch_kwargs"]),
+            },
+        }
+        if "patch_size_multiplier" in preset:
+            configuration["patch_size_multiplier"] = preset["patch_size_multiplier"]
+        return configuration
+
+    def _additional_configurations(self) -> dict:
+        return {
+            name: self._phase_four_configuration(preset)
+            for name, preset in self.phase_four_presets.items()
+        }
