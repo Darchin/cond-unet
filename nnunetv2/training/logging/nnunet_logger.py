@@ -74,8 +74,9 @@ class MetaLogger(object):
 
         # handle the ema_fg_dice special case! It is automatically logged when we add a new mean_fg_dice
         if key == 'mean_fg_dice':
-            new_ema_pseudo_dice = self.get_value('ema_fg_dice', step=step-1) * 0.9 + 0.1 * value \
-                if len(self.get_value('ema_fg_dice', step=None)) > 0 else value
+            previous_values = self.get_value('ema_fg_dice', step=None)
+            previous_value = next((i for i in reversed(previous_values) if i is not None), None)
+            new_ema_pseudo_dice = previous_value * 0.9 + 0.1 * value if previous_value is not None else value
             self.log('ema_fg_dice', new_ema_pseudo_dice, step)
 
     def log_summary(self, key: str, value: Any):
@@ -101,13 +102,13 @@ class MetaLogger(object):
         """
         return self.local_logger.get_value(key, step)
 
-    def plot_progress_png(self, output_folder: str):
+    def plot_progress_png(self, output_folder: str, include_validation: bool = True):
         """Write a progress plot PNG using local logger data.
 
         Args:
             output_folder: Directory where the plot image is saved.
         """
-        self.local_logger.plot_progress_png(output_folder)
+        self.local_logger.plot_progress_png(output_folder, include_validation)
 
     def get_checkpoint(self):
         """Return the local logger checkpoint data.
@@ -141,7 +142,7 @@ class LocalLogger:
     arising from out-of-sync epoch numbers and numbers of logged loss values. It also simplifies the trainer class a
     little
 
-    YOU MUST LOG EXACTLY ONE VALUE PER EPOCH FOR EACH OF THE LOGGING ITEMS! DONT FUCK IT UP
+    Metrics may contain None for epochs in which they were disabled.
     """
     def __init__(self, verbose: bool = False):
         self.my_fantastic_logging = {
@@ -168,6 +169,7 @@ class LocalLogger:
             print(f'logging {key}: {value} for epoch {epoch}')
 
         if len(self.my_fantastic_logging[key]) < (epoch + 1):
+            self.my_fantastic_logging[key].extend([None] * (epoch - len(self.my_fantastic_logging[key])))
             self.my_fantastic_logging[key].append(value)
         else:
             assert len(self.my_fantastic_logging[key]) == (epoch + 1), 'something went horribly wrong. My logging ' \
@@ -181,26 +183,28 @@ class LocalLogger:
         else:
             return self.my_fantastic_logging[key]
 
-    def plot_progress_png(self, output_folder):
-        # we infer the epoch form our internal logging
-        epoch = min([len(i) for i in self.my_fantastic_logging.values()]) - 1  # lists of epoch 0 have len 1
+    def plot_progress_png(self, output_folder, include_validation: bool = True):
+        # These values are logged for every epoch regardless of whether training validation is enabled.
+        always_logged = ('train_losses', 'lrs', 'epoch_start_timestamps', 'epoch_end_timestamps')
+        epoch = min(len(self.my_fantastic_logging[i]) for i in always_logged) - 1
         sns.set(font_scale=2.5)
         fig, ax_all = plt.subplots(3, 1, figsize=(30, 54))
         # regular progress.png as we are used to from previous nnU-Net versions
         ax = ax_all[0]
-        ax2 = ax.twinx()
         x_values = list(range(epoch + 1))
         ax.plot(x_values, self.my_fantastic_logging['train_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
-        ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice",
-                 linewidth=3)
-        ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)",
-                 linewidth=4)
+        if include_validation:
+            ax2 = ax.twinx()
+            ax.plot(x_values, self.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
+            ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice",
+                     linewidth=3)
+            ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)",
+                     linewidth=4)
+            ax2.set_ylabel("pseudo dice")
+            ax2.legend(loc=(0.2, 1))
         ax.set_xlabel("epoch")
         ax.set_ylabel("loss")
-        ax2.set_ylabel("pseudo dice")
         ax.legend(loc=(0, 1))
-        ax2.legend(loc=(0.2, 1))
 
         # epoch times to see whether the training speed is consistent (inconsistent means there are other jobs
         # clogging up the system)

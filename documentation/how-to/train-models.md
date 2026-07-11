@@ -83,11 +83,14 @@ nnUNet_results/DatasetXXX_Name/TRAINER__PLANS__CONFIGURATION/fold_X
 
 Important artifacts include:
 
-- `checkpoint_final.pth`
-- `checkpoint_best.pth`
+- `checkpoint_last.pth`
 - `progress.png`
 - `validation/summary.json`
 - `validation/*.npz` if `--npz` was enabled
+
+Use `--ckpt-interval` to change the checkpoint interval from its default of 50 epochs. Use
+`--disable_train_val` to omit the per-epoch validation loss and pseudo-Dice computation; post-training validation is
+unaffected.
 
 ## Next steps
 

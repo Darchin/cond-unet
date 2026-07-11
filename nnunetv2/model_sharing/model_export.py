@@ -9,7 +9,7 @@ def export_pretrained_model(dataset_name_or_id: Union[int, str], output_file: st
                             plans_identifier: str = 'nnUNetPlans',
                             folds: Tuple[int, ...] = (0, 1, 2, 3, 4),
                             strict: bool = True,
-                            save_checkpoints: Tuple[str, ...] = ('checkpoint_final.pth',),
+                            save_checkpoints: Tuple[str, ...] = ('checkpoint_last.pth',),
                             export_crossval_predictions: bool = False) -> None:
     dataset_name = maybe_convert_to_dataset_name(dataset_name_or_id)
     with(zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED)) as zipf:

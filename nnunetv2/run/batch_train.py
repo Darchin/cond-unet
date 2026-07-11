@@ -403,7 +403,9 @@ def run_training_worker(plans_file: str,
                         configuration: str,
                         fold: int,
                         trainer_name: str,
-                        disable_tta: bool) -> None:
+                        disable_tta: bool,
+                        checkpoint_interval: int,
+                        disable_train_val: bool) -> None:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
@@ -418,6 +420,8 @@ def run_training_worker(plans_file: str,
         dataset_json=dataset_json,
         device=torch.device("cuda"),
     )
+    trainer.checkpoint_interval = checkpoint_interval
+    trainer.disable_train_val = disable_train_val
 
     maybe_load_checkpoint(trainer, continue_training=False, validation_only=False, pretrained_weights_file=None)
 
@@ -433,7 +437,9 @@ def make_worker_command(plans_file: str,
                         configuration: str,
                         fold: int,
                         trainer_name: str,
-                        disable_tta: bool) -> list[str]:
+                        disable_tta: bool,
+                        checkpoint_interval: int,
+                        disable_train_val: bool) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -447,9 +453,13 @@ def make_worker_command(plans_file: str,
         str(fold),
         "--trainer",
         trainer_name,
+        "--ckpt-interval",
+        str(checkpoint_interval),
     ]
     if disable_tta:
         command.append("--disable-tta")
+    if disable_train_val:
+        command.append("--disable_train_val")
     return command
 
 
@@ -457,11 +467,14 @@ def launch_job(job: TrainingJob,
                gpu: str,
                plans_file: str,
                trainer_name: str,
-               disable_tta: bool) -> subprocess.Popen:
+               disable_tta: bool,
+               checkpoint_interval: int,
+               disable_train_val: bool) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     return subprocess.Popen(
-        make_worker_command(plans_file, job.configuration, job.fold, trainer_name, disable_tta),
+        make_worker_command(plans_file, job.configuration, job.fold, trainer_name, disable_tta,
+                            checkpoint_interval, disable_train_val),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -497,8 +510,10 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
                   plans_file: str,
                   trainer_name: str,
                   disable_tta: bool,
+                  checkpoint_interval: int,
+                  disable_train_val: bool,
                   console: Console,
-                  launcher: Callable[[TrainingJob, str, str, str, bool], subprocess.Popen] = launch_job,
+                  launcher: Callable[[TrainingJob, str, str, str, bool, int, bool], subprocess.Popen] = launch_job,
                   monotonic: Callable[[], float] = time.monotonic,
                   wall_clock: Callable[[], datetime] = datetime.now,
                   sleep: Callable[[float], None] = time.sleep,
@@ -512,7 +527,8 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
         while pending and free_gpus:
             gpu = free_gpus.pop(0)
             job = pending.pop(0)
-            process = launcher(job, gpu, plans_file, trainer_name, disable_tta)
+            process = launcher(job, gpu, plans_file, trainer_name, disable_tta,
+                               checkpoint_interval, disable_train_val)
             started_at = wall_clock()
             running.append(RunningJob(job, gpu, process, monotonic(), started_at))
             log_start(console, job, gpu, started_at)
@@ -592,11 +608,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Disable test-time augmentation during post-training validation.",
     )
+    parser.add_argument(
+        "--ckpt-interval",
+        type=int,
+        default=50,
+        help="Save checkpoint_last.pth after this many epochs. Default: 50.",
+    )
+    parser.add_argument(
+        "--disable_train_val",
+        action="store_true",
+        default=False,
+        help="Disable validation loops and pseudo-Dice computation during training.",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--plans-file", help=argparse.SUPPRESS)
     parser.add_argument("--configuration", help=argparse.SUPPRESS)
     parser.add_argument("--fold", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.ckpt_interval <= 0:
+        parser.error("--ckpt-interval must be greater than 0")
 
     if args.worker:
         missing = [i for i in ("plans_file", "configuration", "fold", "trainer") if getattr(args, i) is None]
@@ -613,7 +644,8 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.worker:
-        run_training_worker(args.plans_file, args.configuration, args.fold, args.trainer, args.disable_tta)
+        run_training_worker(args.plans_file, args.configuration, args.fold, args.trainer, args.disable_tta,
+                            args.ckpt_interval, args.disable_train_val)
         return 0
 
     console = Console()
@@ -633,7 +665,8 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
         f"[bold]Scheduling {len(jobs)} jobs[/bold] across [bold]{len(gpu_tokens)} GPUs[/bold] "
         f"with plans [bold]{plans_file}[/bold]"
     )
-    results = schedule_jobs(jobs, gpu_tokens, plans_file, args.trainer, args.disable_tta, console)
+    results = schedule_jobs(jobs, gpu_tokens, plans_file, args.trainer, args.disable_tta,
+                            args.ckpt_interval, args.disable_train_val, console)
     print_summary(console, results)
     return 1 if any(i.returncode != 0 for i in results) else 0
 

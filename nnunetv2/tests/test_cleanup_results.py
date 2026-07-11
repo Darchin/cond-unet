@@ -15,7 +15,16 @@ class TestCleanupResults(unittest.TestCase):
         fold = experiment / "fold_0"
         validation = fold / "validation"
         validation.mkdir(parents=True)
-        for name in ("checkpoint_last.pth", "checkpoint_best.pth", "debug.json", "progress.png", "training_log_a.txt", "training_log_b.txt"):
+        for name in (
+            "checkpoint_last.pth",
+            "checkpoint_best.pth",
+            "checkpoint_final.pth",
+            "checkpoint_latest.pth",
+            "debug.json",
+            "progress.png",
+            "training_log_a.txt",
+            "training_log_b.txt",
+        ):
             (fold / name).write_text(name)
         (validation / "summary.json").write_text("{}")
         (validation / "case_001.nii.gz").write_text("prediction")
@@ -55,11 +64,13 @@ class TestCleanupResults(unittest.TestCase):
             self.assertTrue((cleaned_fold / "training_log_b.txt").is_file())
             self.assertTrue((cleaned_fold / "summary.json").is_file())
             self.assertFalse((cleaned_fold / "checkpoint_best.pth").exists())
+            self.assertFalse((cleaned_fold / "checkpoint_final.pth").exists())
+            self.assertFalse((cleaned_fold / "checkpoint_latest.pth").exists())
             self.assertFalse((cleaned_fold / "debug.json").exists())
             self.assertFalse((cleaned_fold / "validation").exists())
             self.assertFalse((root / "KiTS2023" / "3x-s" / "dataset.json").exists())
             self.assertTrue((root / "notes.txt").is_file())
-            self.assertEqual(summary.removed_paths, 6)
+            self.assertEqual(summary.removed_paths, 8)
 
     def test_destination_collision_aborts_before_source_mutation(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -161,10 +161,9 @@ Note that 3d_lowres and 3d_cascade_fullres do not exist here because this datase
 model training output folder (each of the fold_x folder), the following files will be created:
 - debug.json: Contains a summary of blueprint and inferred parameters used for training this model as well as a
 bunch of additional stuff. Not easy to read, but very useful for debugging ;-)
-- checkpoint_best.pth: checkpoint files of the best model identified during training. Not used right now unless you
-explicitly tell nnU-Net to use it.
-- checkpoint_final.pth: checkpoint file of the final model (after training has ended). This is what is used for both
-validation and inference.
+- checkpoint_last.pth: the latest interval checkpoint while training is running and the final checkpoint after
+training has ended. This is used for both validation and inference. The save interval defaults to 50 epochs and can
+be changed with `--ckpt-interval`.
 - network_architecture.pdf (only if hiddenlayer is installed!): a pdf document with a figure of the network architecture in it.
 - progress.png: Shows losses, pseudo dice, learning rate and epoch times over the course of the training. At the top is
 a plot of the training (blue) and validation (red) loss during training. Also shows an approximation of

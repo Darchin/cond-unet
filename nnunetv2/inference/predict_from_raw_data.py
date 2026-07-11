@@ -67,7 +67,7 @@ class nnUNetPredictor(object):
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_last.pth'):
         """
         This is used when making predictions with a trained model
         """
@@ -840,8 +840,8 @@ def predict_entry_point_modelfolder():
                              'multiple configurations.')
     parser.add_argument('--continue_prediction', '--c', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
-    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
-                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_last.pth',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_last.pth')
     parser.add_argument('-npp', type=int, required=False, default=3,
                         help='Number of processes used for preprocessing. More is not always better. Beware of '
                              'out-of-RAM issues. Default: 3')
@@ -944,8 +944,8 @@ def predict_entry_point():
                              'multiple configurations.')
     parser.add_argument('--continue_prediction', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
-    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
-                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_last.pth',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_last.pth')
     parser.add_argument('-npp', type=int, required=False, default=_getDefaultValue('nnUNet_npp', int, 3),
                         help='Number of processes used for preprocessing. More is not always better. Beware of '
                              'out-of-RAM issues. Default: 3')
@@ -1076,7 +1076,7 @@ if __name__ == '__main__':
     predictor.initialize_from_trained_model_folder(
         join(nnUNet_results, 'Dataset004_Hippocampus/nnUNetTrainer_5epochs__nnUNetPlans__3d_fullres'),
         use_folds=(0,),
-        checkpoint_name='checkpoint_final.pth',
+        checkpoint_name='checkpoint_last.pth',
     )
     # predictor.predict_from_files(join(nnUNet_raw, 'Dataset003_Liver/imagesTs'),
     #                              join(nnUNet_raw, 'Dataset003_Liver/imagesTs_predlowres'),

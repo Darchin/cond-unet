@@ -16,6 +16,7 @@ from nnunetv2.run.batch_train import (
     format_start_message,
     format_verbose_duration,
     load_job_pairs_from_json,
+    make_worker_command,
     parse_args,
     requested_configurations,
     resolve_cli_job_pairs,
@@ -46,11 +47,33 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual(args.plan, "nnUNetCondUNetPlans")
         self.assertEqual(args.trainer, "nnUNetTrainerAdamW")
         self.assertFalse(args.disable_tta)
+        self.assertEqual(args.ckpt_interval, 50)
+        self.assertFalse(args.disable_train_val)
 
     def test_parse_args_disable_tta(self):
         args = parse_args(["-d", "1", "-t", "nnUNetTrainer", "-c", "2x", "-f", "0", "--disable-tta"])
 
         self.assertTrue(args.disable_tta)
+
+    def test_parse_args_training_behavior_options(self):
+        args = parse_args([
+            "-d", "1", "-c", "2x", "-f", "0",
+            "--ckpt-interval", "25", "--disable_train_val",
+        ])
+
+        self.assertEqual(args.ckpt_interval, 25)
+        self.assertTrue(args.disable_train_val)
+
+    def test_parse_args_rejects_non_positive_checkpoint_interval(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["-d", "1", "-c", "2x", "-f", "0", "--ckpt-interval", "0"])
+
+    def test_worker_command_propagates_training_behavior_options(self):
+        command = make_worker_command("plans.json", "2x", 0, "nnUNetTrainer", True, 25, True)
+
+        self.assertIn("--disable-tta", command)
+        self.assertIn("--disable_train_val", command)
+        self.assertEqual(command[command.index("--ckpt-interval") + 1], "25")
 
     def test_parse_args_include_and_exclude_job_pairs(self):
         args = parse_args([
@@ -363,8 +386,9 @@ class TestBatchTrain(unittest.TestCase):
         launches = []
         returncodes = [0, 1, 0, 0]
 
-        def launcher(job, gpu, plans_file, trainer_name, disable_tta):
-            launches.append((job.index, gpu, plans_file, trainer_name, disable_tta))
+        def launcher(job, gpu, plans_file, trainer_name, disable_tta, checkpoint_interval, disable_train_val):
+            launches.append((job.index, gpu, plans_file, trainer_name, disable_tta,
+                             checkpoint_interval, disable_train_val))
             return FakeProcess(returncodes[job.index])
 
         now = {"value": 0.0}
@@ -381,6 +405,8 @@ class TestBatchTrain(unittest.TestCase):
                 "plans.json",
                 "nnUNetTrainer",
                 True,
+                25,
+                True,
                 console,
                 launcher=launcher,
                 monotonic=monotonic,
@@ -392,6 +418,7 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual([i[0] for i in launches], [0, 1, 2, 3])
         self.assertEqual([i[1] for i in launches], ["0", "1", "0", "1"])
         self.assertTrue(all(i[4] for i in launches))
+        self.assertTrue(all(i[5:] == (25, True) for i in launches))
         self.assertEqual([i.returncode for i in results], [0, 1, 0, 0])
 
 

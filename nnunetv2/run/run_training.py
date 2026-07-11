@@ -66,18 +66,13 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
         raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
                            'be used at the beginning of the training.')
     if continue_training:
-        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
-        if not isfile(expected_checkpoint_file):
-            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_latest.pth')
-        # special case where --c is used to run a previously aborted validation
-        if not isfile(expected_checkpoint_file):
-            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_best.pth')
+        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_last.pth')
         if not isfile(expected_checkpoint_file):
             print("WARNING: Cannot continue training because there seems to be no checkpoint available to "
                                "continue from. Starting a new training...")
             expected_checkpoint_file = None
     elif validation_only:
-        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
+        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_last.pth')
         if not isfile(expected_checkpoint_file):
             raise RuntimeError("Cannot run validation because the training is not finished yet!")
     else:
@@ -101,7 +96,7 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, disable_tta, world_size):
+            pretrained_weights, npz, disable_tta, checkpoint_interval, disable_train_val, world_size):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -109,6 +104,8 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
+    nnunet_trainer.checkpoint_interval = checkpoint_interval
+    nnunet_trainer.disable_train_val = disable_train_val
 
     assert not (c and val), 'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -121,8 +118,6 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     if not val:
         nnunet_trainer.run_training()
 
-    if val_with_best:
-        nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
     nnunet_trainer.perform_actual_validation(npz, not disable_tta)
     cleanup_ddp()
 
@@ -137,9 +132,10 @@ def run_training(dataset_name_or_id: Union[str, int],
                  continue_training: bool = False,
                  only_run_validation: bool = False,
                  disable_checkpointing: bool = False,
-                 val_with_best: bool = False,
                  device: torch.device = torch.device('cuda'),
-                 disable_tta: bool = False):
+                 disable_tta: bool = False,
+                 checkpoint_interval: int = 50,
+                 disable_train_val: bool = False):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
               "INFO: You are using the old nnU-Net default plans. We have updated our recommendations. "
@@ -154,8 +150,8 @@ def run_training(dataset_name_or_id: Union[str, int],
                 print(f'Unable to convert given value for fold to int: {fold}. fold must bei either "all" or an integer!')
                 raise e
 
-    if val_with_best:
-        assert not disable_checkpointing, '--val_best is not compatible with --disable_checkpointing'
+    if checkpoint_interval <= 0:
+        raise ValueError(f'checkpoint_interval must be greater than 0, got {checkpoint_interval}')
 
     if num_gpus > 1:
         assert device.type == 'cuda', f"DDP training (triggered by num_gpus > 1) is only implemented for cuda devices. Your device: {device}"
@@ -178,8 +174,9 @@ def run_training(dataset_name_or_id: Union[str, int],
                      only_run_validation,
                      pretrained_weights,
                      export_validation_probabilities,
-                     val_with_best,
                      disable_tta,
+                     checkpoint_interval,
+                     disable_train_val,
                      num_gpus),
                  nprocs=num_gpus,
                  join=True)
@@ -189,6 +186,8 @@ def run_training(dataset_name_or_id: Union[str, int],
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
+        nnunet_trainer.checkpoint_interval = checkpoint_interval
+        nnunet_trainer.disable_train_val = disable_train_val
 
         assert not (continue_training and only_run_validation), 'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -201,8 +200,6 @@ def run_training(dataset_name_or_id: Union[str, int],
         if not only_run_validation:
             nnunet_trainer.run_training()
 
-        if val_with_best:
-            nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
         nnunet_trainer.perform_actual_validation(export_validation_probabilities, not disable_tta)
 
 
@@ -228,25 +225,28 @@ def run_training_entry():
                         help='[OPTIONAL] Save softmax predictions from final validation as npz files (in addition to predicted '
                              'segmentations). Needed for finding the best ensemble.')
     parser.add_argument('--c', action='store_true', required=False,
-                        help='[OPTIONAL] Continue training from latest checkpoint')
+                        help='[OPTIONAL] Continue training from checkpoint_last.pth')
     parser.add_argument('--val', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to only run the validation. Requires training to have finished.')
-    parser.add_argument('--val_best', action='store_true', required=False,
-                        help='[OPTIONAL] If set, the validation will be performed with the checkpoint_best instead '
-                             'of checkpoint_final. NOT COMPATIBLE with --disable_checkpointing! '
-                             'WARNING: This will use the same \'validation\' folder as the regular validation '
-                             'with no way of distinguishing the two!')
     parser.add_argument('--disable_checkpointing', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
                              'you dont want to flood your hard drive with checkpoints.')
     parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
                         help='[OPTIONAL] Set this flag to disable test time data augmentation in the form of '
                              'mirroring during the final validation. Faster, but less accurate.')
+    parser.add_argument('--ckpt-interval', type=int, default=50, required=False,
+                        help='[OPTIONAL] Save checkpoint_last.pth after this many epochs. Default: 50.')
+    parser.add_argument('--disable_train_val', action='store_true', required=False, default=False,
+                        help='[OPTIONAL] Disable the validation loop and pseudo-Dice computation during training. '
+                             'Post-training validation is unaffected.')
     parser.add_argument('-device', type=str, default='cuda', required=False,
                     help="Use this to set the device the training should run with. Available options are 'cuda' "
                          "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
                          "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
     args = parser.parse_args()
+
+    if args.ckpt_interval <= 0:
+        parser.error('--ckpt-interval must be greater than 0')
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
     if args.device == 'cpu':
@@ -262,8 +262,9 @@ def run_training_entry():
         device = torch.device('mps')
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
-                 args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device, disable_tta=args.disable_tta)
+                 args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing,
+                 device=device, disable_tta=args.disable_tta, checkpoint_interval=args.ckpt_interval,
+                 disable_train_val=args.disable_train_val)
 
 
 if __name__ == '__main__':

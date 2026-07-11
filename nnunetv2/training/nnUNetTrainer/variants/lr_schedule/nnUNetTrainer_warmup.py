@@ -96,7 +96,6 @@ class nnUNetTrainer_warmup(nnUNetTrainer):
         self.my_init_kwargs = checkpoint["init_args"]
         self.current_epoch = checkpoint["current_epoch"]
         self.logger.load_checkpoint(checkpoint["logging"])
-        self._best_ema = checkpoint["_best_ema"]
         self.inference_allowed_mirroring_axes = (
             checkpoint["inference_allowed_mirroring_axes"]
             if "inference_allowed_mirroring_axes" in checkpoint.keys()
