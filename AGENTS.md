@@ -80,10 +80,12 @@ Expected CondUNet planning workflow:
   - `enable_deep_supervision`
 - Defaults are defined in both the trainer and the CondUNet planner. Keep them in sync if changing default training behavior.
 
-## Training Validation TTA
+## Training Validation And Checkpointing
 
 - `nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py` and `nnunetv2/run/run_training.py` include local support for disabling test-time augmentation during post-training validation.
 - Preserve the training-script `--disable-tta` behavior when touching validation or training entrypoints.
+- `--disable_train_val` skips the per-epoch validation loop, validation loss, pseudo-Dice logging, and validation curves without disabling post-training or `--val` validation.
+- This fork uses only `checkpoint_last.pth`: it is overwritten at `--ckpt-interval` epoch intervals (default 50) and again when training finishes. Best/final/latest checkpoint variants and `--val_best` are not supported.
 
 ## Benchmark Utility
 
@@ -101,6 +103,7 @@ Expected CondUNet planning workflow:
 - Job order is configuration-major, then fold-minor: all requested folds for the first configuration, then all requested folds for the next configuration.
 - Defaults are tailored for this fork: `--plan nnUNetCondUNetPlans` and `--trainer nnUNetTrainerAdamW`.
 - `--disable-tta` disables validation test-time augmentation for all scheduled jobs; TTA remains enabled by default when the flag is omitted.
+- `--disable_train_val` and `--ckpt-interval` are propagated to every scheduled worker.
 
 ## Results Cleanup Utility
 
