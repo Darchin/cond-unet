@@ -35,31 +35,54 @@ def _explicit_condconv(
 ) -> torch.Tensor:
     outputs = []
     for sample, sample_scores in zip(x, scores):
-        if layer.num_groups != 1:
-            raise AssertionError("helper only supports ungrouped routing")
-        weight = torch.einsum("e,eoi->oi", sample_scores, layer.weight)
-        bias = (
-            None
-            if layer.bias is None
-            else torch.einsum("e,eo->o", sample_scores, layer.bias)
-        )
+        grouped_scores = sample_scores.reshape(layer.num_groups, layer.num_experts)
+        grouped_delta = []
+        for group_idx in range(layer.num_groups):
+            delta = sum(
+                grouped_scores[group_idx, expert_idx]
+                * layer.left_factor[expert_idx, group_idx]
+                @ layer.right_factor[expert_idx, group_idx]
+                for expert_idx in range(layer.num_experts)
+            )
+            grouped_delta.append(delta)
+        if layer.group_on_out:
+            delta = torch.cat(grouped_delta, dim=0)
+        else:
+            delta = torch.cat(grouped_delta, dim=1)
+        weight = layer.base_weight + delta
         outputs.append(
             torch.nn.functional.conv2d(
-                sample.unsqueeze(0), weight[:, :, None, None], bias
+                sample.unsqueeze(0), weight[:, :, None, None], layer.base_bias
             ).squeeze(0)
         )
     return torch.stack(outputs)
 
 
-def test_condpwconv_matches_explicit_per_sample_mixture():
-    layer = CondPWConv(nn.Conv2d(3, 4, 1, bias=True), num_experts=3)
-    x = torch.randn(2, 3, 5, 7)
-    scores = torch.sigmoid(torch.randn(2, 3))
+@pytest.mark.parametrize("group_on_out", [True, False])
+def test_condpwconv_matches_explicit_per_sample_mixture(group_on_out):
+    layer = CondPWConv(
+        nn.Conv2d(4, 6, 1, bias=True),
+        num_experts=3,
+        rank=2,
+        num_groups=2,
+        group_on_out=group_on_out,
+    )
+    with torch.no_grad():
+        layer.right_factor.normal_()
+    x = torch.randn(2, 4, 5, 7)
+    scores = torch.sigmoid(torch.randn(2, 6))
 
     actual = layer(x, scores)
     expected = _explicit_condconv(layer, x, scores)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_condpwconv_zero_delta_matches_base_convolution():
+    conv = nn.Conv2d(3, 4, 1, bias=True)
+    layer = CondPWConv(conv, num_experts=3, rank=2)
+    x = torch.randn(2, 3, 5, 7)
+    torch.testing.assert_close(layer(x, torch.randn(2, 3)), conv(x))
 
 
 def test_condpwconv_rejects_tiled_scores():
@@ -73,6 +96,7 @@ def test_grouped_expert_blending_has_expected_shape(group_on_out):
     layer = CondPWConv(
         nn.Conv2d(4, 6, 1, bias=True),
         num_experts=3,
+        rank=2,
         num_groups=2,
         group_on_out=group_on_out,
     )
@@ -146,6 +170,22 @@ def test_decoder_stages_have_no_transposed_convolutions():
     assert isinstance(model.decoder.seg_layer, nn.ConvTranspose2d)
 
 
+def test_group_norm_is_hard_coded_with_model_wide_inner_groups():
+    model = _small_model(
+        num_groups=4,
+        norm_op=nn.BatchNorm2d,
+        norm_op_kwargs={"this_is_ignored": True},
+    )
+    block = model.encoder.stages[0].blocks[0]
+    assert isinstance(model.encoder.stem.convs[0].norm, nn.GroupNorm)
+    assert model.encoder.stem.convs[0].norm.num_groups == 1
+    assert block.expand.norm.num_groups == 4
+    assert block.depthwise.norm.num_groups == 4
+    assert block.project.norm.num_groups == 1
+    assert model.decoder.seg_norm.num_groups == 1
+    model(torch.randn(1, 1, 32, 32))
+
+
 @pytest.mark.parametrize("obsolete_key", ["se", "upsample_mode"])
 def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
     with pytest.raises(TypeError, match=obsolete_key):
@@ -175,8 +215,8 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "decoder",
         "encoder_num_experts",
         "decoder_num_experts",
-        "encoder_num_groups",
-        "decoder_num_groups",
+        "encoder_rank",
+        "decoder_rank",
     }
     model_parameters = inspect.signature(CondUNet).parameters
     assert "se" not in model_parameters

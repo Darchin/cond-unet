@@ -6,6 +6,7 @@ from nnunetv2.experiment_planning.dataset_fingerprint.cond_unet_fingerprint_extr
 from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import (
     CondUNetPlanner,
     Phase1Planner,
+    Phase2Planner,
     PhaseFourPlanner,
     PhaseThreePlanner,
     PhaseTwoPlanner,
@@ -173,6 +174,7 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
             ],
         )
         self.assertEqual(configurations["2x-s"]["inherits_from"], "2x")
+
         self.assertEqual(configurations["2x-s"]["patch_size_multiplier"], 6)
         self.assertEqual(
             configurations["2x-s"]["architecture"]["arch_kwargs"]["features_per_stage"],
@@ -190,6 +192,18 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
             configurations["4x-l"]["architecture"]["arch_kwargs"]["features_per_stage"],
             [128, 256, 512, 1024],
         )
+
+    def test_phase_two_planner_uses_rank_and_global_groups(self):
+        planner = Phase2Planner.__new__(Phase2Planner)
+
+        configurations = planner._additional_configurations()
+
+        e4 = configurations["4x-m_cc-e4"]["architecture"]["arch_kwargs"]
+        self.assertEqual(e4["cc"]["encoder_rank"], 1)
+        self.assertNotIn("encoder_num_groups", e4["cc"])
+        grouped = configurations["4x-m_cc-e8-g8"]["architecture"]["arch_kwargs"]
+        self.assertEqual(grouped["num_groups"], 8)
+        self.assertEqual(grouped["cc"]["encoder_num_experts"], 8)
 
     def test_phase_one_child_configuration_resolves_as_trainable(self):
         planner = self._minimal_planner(Phase1Planner)

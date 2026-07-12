@@ -526,36 +526,26 @@ class Phase2Planner(CondUNetPlanner):
                 "features_per_stage": [96, 192, 384, 768],
             },
         },
-        "4x-m_cc-e4": {
-            "inherits_from": "4x-m",
-            "arch_kwargs": {
-                "cc": {"encoder": [False, True, True, True], "encoder_num_experts": 4},
-            },
-        },
-        "4x-m_cc-e8": {
-            "inherits_from": "4x-m",
-            "arch_kwargs": {
-                "cc": {"encoder": [False, True, True, True], "encoder_num_experts": 8},
-            },
-        },
-        "4x-m_cc-e4-g8": {
+        "4x-m_cc-e4-g16": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "encoder": [False, True, True, True],
                     "encoder_num_experts": 4,
-                    "encoder_num_groups": 8,
+                    "encoder_rank": [1, 1, 2, 4],
                 },
+                "num_groups": 16,
             },
         },
-        "4x-m_cc-e8-g8": {
+        "4x-m_cc-e16-g16": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
                     "encoder": [False, True, True, True],
-                    "encoder_num_experts": 4,
-                    "encoder_num_groups": 8,
+                    "encoder_num_experts": 16,
+                    "encoder_rank": [1, 1, 2, 4],
                 },
+                "num_groups": 16,
             },
         },
     }

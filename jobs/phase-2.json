@@ -1,10 +1,6 @@
 [
     {
-        "configs": ["4x-m_cc-e8"],
-        "folds": [0, 3]
-    },
-    {
-        "configs": ["4x-m_cc-e4-g8"],
-        "folds": [0, 3]
+        "configs": ["4x-m_cc-e4-g16", "4x-m_cc-e16-g16"],
+        "folds": [0, 1, 2, 3, 4]
     }
 ]
