@@ -1,18 +1,18 @@
 import shutil
+from copy import deepcopy
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
-from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p
+from batchgenerators.utilities.file_and_folder_operations import (
+    join, maybe_mkdir_p)
 from dynamic_network_architectures.building_blocks.helper import (
-    convert_dim_to_conv_op,
-    get_matching_instancenorm,
-)
+    convert_dim_to_conv_op, get_matching_instancenorm)
 
-from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import (
-    ExperimentPlanner,
-)
+from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import \
+    ExperimentPlanner
 from nnunetv2.paths import nnUNet_preprocessed
-from nnunetv2.preprocessing.resampling.default_resampling import compute_new_shape
+from nnunetv2.preprocessing.resampling.default_resampling import \
+    compute_new_shape
 
 
 class CondUNetPlanner(ExperimentPlanner):
@@ -430,7 +430,7 @@ class CondUNetPlanner(ExperimentPlanner):
         return plans
 
 
-class PhaseOnePlanner(CondUNetPlanner):
+class Phase1Planner(CondUNetPlanner):
     phase_one_presets = {
         "2x-s": {
             "inherits_from": "2x",
@@ -515,6 +515,62 @@ class PhaseOnePlanner(CondUNetPlanner):
             for name, preset in self.phase_one_presets.items()
         }
 
+class Phase2Planner(CondUNetPlanner):
+    phase_two_presets = {
+        "4x-m": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "arch_kwargs": {
+                "features_per_stage": [96, 192, 384, 768],
+            },
+        },
+        "4x-m_cc-g8": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "encoder_num_groups": 8
+                },
+            },
+        }
+    }
+
+    def __init__(
+        self,
+        dataset_name_or_id: Union[str, int],
+        gpu_memory_target_in_gb: float = 8,
+        preprocessor_name: str = "DefaultPreprocessor",
+        plans_name: str = "nnUNetCondUNetPlans",
+        overwrite_target_spacing: Union[List[float], Tuple[float, ...]] = None,
+        suppress_transpose: bool = False,
+    ):
+        super().__init__(
+            dataset_name_or_id,
+            gpu_memory_target_in_gb,
+            preprocessor_name,
+            plans_name,
+            overwrite_target_spacing,
+            suppress_transpose,
+        )
+
+    @classmethod
+    def _phase_2_configuration(cls, preset: dict) -> dict:
+        configuration = {
+            "inherits_from": preset["inherits_from"],
+            "architecture": {
+                "arch_kwargs": deepcopy(preset["arch_kwargs"]),
+            },
+        }
+        if "patch_size_multiplier" in preset:
+            configuration["patch_size_multiplier"] = preset["patch_size_multiplier"]
+        return configuration
+
+    def _additional_configurations(self) -> dict:
+        return {
+            name: self._phase_2_configuration(preset)
+            for name, preset in self.phase_two_presets.items()
+        }
 
 class _DeprecatedPhasePlanner(CondUNetPlanner):
     def __init__(self, *args, **kwargs):

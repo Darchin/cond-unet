@@ -5,7 +5,7 @@ from nnunetv2.experiment_planning.dataset_fingerprint.cond_unet_fingerprint_extr
 )
 from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import (
     CondUNetPlanner,
-    PhaseOnePlanner,
+    Phase1Planner,
     PhaseFourPlanner,
     PhaseThreePlanner,
     PhaseTwoPlanner,
@@ -160,7 +160,7 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         )
 
     def test_phase_one_planner_generates_expected_child_configurations(self):
-        planner = PhaseOnePlanner.__new__(PhaseOnePlanner)
+        planner = Phase1Planner.__new__(Phase1Planner)
 
         configurations = planner._additional_configurations()
 
@@ -192,7 +192,7 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         )
 
     def test_phase_one_child_configuration_resolves_as_trainable(self):
-        planner = self._minimal_planner(PhaseOnePlanner)
+        planner = self._minimal_planner(Phase1Planner)
         plans = {
             "configurations": {
                 "base": {
