@@ -516,7 +516,7 @@ class Phase1Planner(CondUNetPlanner):
         }
 
 class Phase2Planner(CondUNetPlanner):
-    phase_two_presets = {
+    phase_2_presets = {
         "4x-m": {
             "inherits_from": "4x",
             "patch_size_multiplier": 6,
@@ -524,7 +524,35 @@ class Phase2Planner(CondUNetPlanner):
                 "features_per_stage": [96, 192, 384, 768],
             },
         },
-        "4x-m_cc-g8": {
+        "4x-m_cc-e4": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4
+                },
+            },
+        },
+        "4x-m_cc-e8": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 8
+                },
+            },
+        },
+        "4x-m_cc-e4-g8": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [False, True, True, True],
+                    "encoder_num_experts": 4,
+                    "encoder_num_groups": 8
+                },
+            },
+        },
+        "4x-m_cc-e8-g8": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
                 "cc": {
@@ -569,7 +597,7 @@ class Phase2Planner(CondUNetPlanner):
     def _additional_configurations(self) -> dict:
         return {
             name: self._phase_2_configuration(preset)
-            for name, preset in self.phase_two_presets.items()
+            for name, preset in self.phase_2_presets.items()
         }
 
 class _DeprecatedPhasePlanner(CondUNetPlanner):

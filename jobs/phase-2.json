@@ -1,0 +1,10 @@
+[
+    {
+        "configs": ["4x-m_cc-e8"],
+        "folds": [0, 3]
+    },
+    {
+        "configs": ["4x-m_cc-e4-g8"],
+        "folds": [0, 3]
+    }
+]
