@@ -3,16 +3,17 @@ from copy import deepcopy
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
-from batchgenerators.utilities.file_and_folder_operations import (
-    join, maybe_mkdir_p)
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p
 from dynamic_network_architectures.building_blocks.helper import (
-    convert_dim_to_conv_op, get_matching_instancenorm)
+    convert_dim_to_conv_op,
+    get_matching_instancenorm,
+)
 
-from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import \
-    ExperimentPlanner
+from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import (
+    ExperimentPlanner,
+)
 from nnunetv2.paths import nnUNet_preprocessed
-from nnunetv2.preprocessing.resampling.default_resampling import \
-    compute_new_shape
+from nnunetv2.preprocessing.resampling.default_resampling import compute_new_shape
 
 
 class CondUNetPlanner(ExperimentPlanner):
@@ -515,6 +516,7 @@ class Phase1Planner(CondUNetPlanner):
             for name, preset in self.phase_one_presets.items()
         }
 
+
 class Phase2Planner(CondUNetPlanner):
     phase_2_presets = {
         "4x-m": {
@@ -527,19 +529,13 @@ class Phase2Planner(CondUNetPlanner):
         "4x-m_cc-e4": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
-                "cc": {
-                    "encoder": [False, True, True, True],
-                    "encoder_num_experts": 4
-                },
+                "cc": {"encoder": [False, True, True, True], "encoder_num_experts": 4},
             },
         },
         "4x-m_cc-e8": {
             "inherits_from": "4x-m",
             "arch_kwargs": {
-                "cc": {
-                    "encoder": [False, True, True, True],
-                    "encoder_num_experts": 8
-                },
+                "cc": {"encoder": [False, True, True, True], "encoder_num_experts": 8},
             },
         },
         "4x-m_cc-e4-g8": {
@@ -548,7 +544,7 @@ class Phase2Planner(CondUNetPlanner):
                 "cc": {
                     "encoder": [False, True, True, True],
                     "encoder_num_experts": 4,
-                    "encoder_num_groups": 8
+                    "encoder_num_groups": 8,
                 },
             },
         },
@@ -558,10 +554,10 @@ class Phase2Planner(CondUNetPlanner):
                 "cc": {
                     "encoder": [False, True, True, True],
                     "encoder_num_experts": 4,
-                    "encoder_num_groups": 8
+                    "encoder_num_groups": 8,
                 },
             },
-        }
+        },
     }
 
     def __init__(
@@ -599,6 +595,7 @@ class Phase2Planner(CondUNetPlanner):
             name: self._phase_2_configuration(preset)
             for name, preset in self.phase_2_presets.items()
         }
+
 
 class _DeprecatedPhasePlanner(CondUNetPlanner):
     def __init__(self, *args, **kwargs):
