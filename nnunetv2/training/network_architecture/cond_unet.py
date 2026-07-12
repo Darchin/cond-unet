@@ -6,7 +6,9 @@ from typing import List, Optional, Sequence, Tuple, Type, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from dynamic_network_architectures.architectures.abstract_arch import AbstractDynamicNetworkArchitectures
+from dynamic_network_architectures.architectures.abstract_arch import (
+    AbstractDynamicNetworkArchitectures,
+)
 from dynamic_network_architectures.building_blocks.helper import (
     convert_conv_op_to_dim,
     get_matching_convtransp,
@@ -39,6 +41,7 @@ class CCConfig:
         encoder_num_groups: Channel-wise routing granularity per encoder stage.
         decoder_num_groups: Channel-wise routing granularity per decoder stage.
     """
+
     encoder: BoolConfig = False
     decoder: BoolConfig = False
     encoder_num_experts: IntConfig = 0
@@ -64,6 +67,7 @@ class StemConfig:
         kernel_size: Convolution kernel size for the stem.
         stride: Convolution stride for the stem (controls initial downsampling).
     """
+
     channels: Optional[int] = None
     kernel_size: KernelConfig = 3
     stride: KernelConfig = 1
@@ -89,9 +93,16 @@ def _normalize_config(value, config_class):
     )
 
 
-def _same_padding(kernel_size: Union[int, List[int], Tuple[int, ...]]) -> Union[int, List[int]]:
+def _same_padding(
+    kernel_size: Union[int, List[int], Tuple[int, ...]],
+) -> Union[int, List[int]]:
     values = [kernel_size] if isinstance(kernel_size, int) else list(kernel_size)
-    if any(not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value <= 0 for value in values):
+    if any(
+        not isinstance(value, (int, np.integer))
+        or isinstance(value, bool)
+        or value <= 0
+        for value in values
+    ):
         raise ValueError("kernel size values must be positive integers")
     if any(value % 2 == 0 for value in values):
         raise ValueError("kernel size values must be odd when using same padding")
@@ -110,7 +121,10 @@ def _normalize_spatial_param(
     values = maybe_convert_scalar_to_list(conv_op, value)
     if len(values) != dim:
         raise ValueError(f"{name} must contain exactly {dim} values, got {len(values)}")
-    if any(not isinstance(item, (int, np.integer)) or isinstance(item, bool) or item <= 0 for item in values):
+    if any(
+        not isinstance(item, (int, np.integer)) or isinstance(item, bool) or item <= 0
+        for item in values
+    ):
         raise ValueError(f"{name} values must be positive integers")
     if require_odd and any(item % 2 == 0 for item in values):
         raise ValueError(f"{name} values must be odd when using same padding")
@@ -157,26 +171,49 @@ def _normalize_kernel_sizes(
 ) -> List[List[int]]:
     dim = convert_conv_op_to_dim(conv_op)
     if kernel_sizes is None:
-        normalized = [_kernel_size_for_dim(default_kernel_size, dim) for _ in range(n_stages)]
-        return [_normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True) for value in normalized]
+        normalized = [
+            _kernel_size_for_dim(default_kernel_size, dim) for _ in range(n_stages)
+        ]
+        return [
+            _normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True)
+            for value in normalized
+        ]
     if isinstance(kernel_sizes, int):
-        normalized = [maybe_convert_scalar_to_list(conv_op, kernel_sizes) for _ in range(n_stages)]
-        return [_normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True) for value in normalized]
+        normalized = [
+            maybe_convert_scalar_to_list(conv_op, kernel_sizes) for _ in range(n_stages)
+        ]
+        return [
+            _normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True)
+            for value in normalized
+        ]
 
     kernel_sizes = list(kernel_sizes)
     if len(kernel_sizes) == 0:
         raise ValueError("kernel_sizes must not be empty")
     if isinstance(kernel_sizes[0], (list, tuple)):
         if len(kernel_sizes) != n_stages:
-            raise ValueError(f"Expected one kernel size per stage ({n_stages}), got {len(kernel_sizes)}")
+            raise ValueError(
+                f"Expected one kernel size per stage ({n_stages}), got {len(kernel_sizes)}"
+            )
         normalized = [_kernel_size_for_dim(i, dim) for i in kernel_sizes]
-        return [_normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True) for value in normalized]
+        return [
+            _normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True)
+            for value in normalized
+        ]
     if len(kernel_sizes) == dim:
         normalized = [_kernel_size_for_dim(kernel_sizes, dim) for _ in range(n_stages)]
-        return [_normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True) for value in normalized]
+        return [
+            _normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True)
+            for value in normalized
+        ]
     if len(kernel_sizes) == n_stages:
-        normalized = [maybe_convert_scalar_to_list(conv_op, int(i)) for i in kernel_sizes]
-        return [_normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True) for value in normalized]
+        normalized = [
+            maybe_convert_scalar_to_list(conv_op, int(i)) for i in kernel_sizes
+        ]
+        return [
+            _normalize_spatial_param(conv_op, value, "kernel_sizes", require_odd=True)
+            for value in normalized
+        ]
     raise ValueError(
         f"Cannot interpret kernel_sizes={kernel_sizes}. Provide one {dim}D kernel or one kernel per stage."
     )
@@ -234,7 +271,9 @@ class CondPWConv(nn.Module):
             raise ValueError("num_groups must be greater than 0")
 
         if conv.groups != 1 or any(k != 1 for k in conv.kernel_size):
-            raise ValueError("CondPWConv is only compatible with dense pointwise convolutions.")
+            raise ValueError(
+                "CondPWConv is only compatible with dense pointwise convolutions."
+            )
 
         self.in_channels = conv.in_channels
         self.out_channels = conv.out_channels
@@ -305,7 +344,9 @@ class CondPWConv(nn.Module):
             weight = blended.squeeze(2).reshape(N, self.out_channels, self.in_channels)
             if self.bias is not None:
                 b_reshaped = self.bias.reshape(E, G, C_out_g).permute(1, 0, 2)
-                blended_bias = torch.matmul(scores_grouped.unsqueeze(2), b_reshaped.unsqueeze(0))
+                blended_bias = torch.matmul(
+                    scores_grouped.unsqueeze(2), b_reshaped.unsqueeze(0)
+                )
                 bias = blended_bias.squeeze(2).reshape(N, self.out_channels)
             else:
                 bias = None
@@ -340,7 +381,9 @@ class CondPWConv(nn.Module):
                 f"got {scores.shape[-1]}"
             )
         if scores.ndim != 2:
-            raise ValueError(f"router scores must be sample-level (2D), got {scores.ndim}D")
+            raise ValueError(
+                f"router scores must be sample-level (2D), got {scores.ndim}D"
+            )
 
     def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
@@ -357,8 +400,13 @@ def _expand_expansion_ratios(
 ) -> List[float]:
     values = [value] * n_stages if isinstance(value, Real) else list(value)
     if len(values) != n_stages:
-        raise ValueError(f"{name} must contain exactly {n_stages} values, got {len(values)}")
-    if any(not isinstance(item, Real) or isinstance(item, bool) or item <= 0 for item in values):
+        raise ValueError(
+            f"{name} must contain exactly {n_stages} values, got {len(values)}"
+        )
+    if any(
+        not isinstance(item, Real) or isinstance(item, bool) or item <= 0
+        for item in values
+    ):
         raise ValueError(f"{name} values must be positive numbers")
     return [float(item) for item in values]
 
@@ -369,11 +417,17 @@ def _expand_int_param(
     """Expand a scalar-or-sequence of ints to a per-stage list, validating >= min_value."""
     values = [value] * n_stages if isinstance(value, (int, np.integer)) else list(value)
     if len(values) != n_stages:
-        raise ValueError(f"{name} must contain exactly {n_stages} values, got {len(values)}")
-    if any(not isinstance(item, (int, np.integer)) or isinstance(item, bool) or item < min_value for item in values):
+        raise ValueError(
+            f"{name} must contain exactly {n_stages} values, got {len(values)}"
+        )
+    if any(
+        not isinstance(item, (int, np.integer))
+        or isinstance(item, bool)
+        or item < min_value
+        for item in values
+    ):
         raise ValueError(f"{name} values must be integers >= {min_value}")
     return [int(v) for v in values]
-
 
 
 def _expand_block_config(
@@ -524,7 +578,11 @@ class DepthwiseConvBlock(nn.Module):
         nonlin_kwargs: dict = None,
     ):
         super().__init__()
-        if not isinstance(channels, (int, np.integer)) or isinstance(channels, bool) or channels <= 0:
+        if (
+            not isinstance(channels, (int, np.integer))
+            or isinstance(channels, bool)
+            or channels <= 0
+        ):
             raise ValueError("channels must be a positive integer")
         kernel_size = _normalize_spatial_param(
             conv_op, kernel_size, "kernel_size", require_odd=True
@@ -533,11 +591,19 @@ class DepthwiseConvBlock(nn.Module):
         norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
         self.conv = conv_op(
-            channels, channels, kernel_size, stride,
+            channels,
+            channels,
+            kernel_size,
+            stride,
             padding=_same_padding(kernel_size),
-            groups=channels, bias=False,
+            groups=channels,
+            bias=False,
         )
-        self.norm = norm_op(channels, **norm_op_kwargs) if norm_op is not None else nn.Identity()
+        self.norm = (
+            norm_op(channels, **norm_op_kwargs)
+            if norm_op is not None
+            else nn.Identity()
+        )
         self.nonlin = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -579,26 +645,56 @@ class InvertedBottleneckBlock(nn.Module):
 
         self.expanded_channels = int(round(expansion_ratio * input_channels))
         if self.expanded_channels <= 0:
-            raise ValueError(f"expansion_ratio must produce at least one channel, got {expansion_ratio}")
+            raise ValueError(
+                f"expansion_ratio must produce at least one channel, got {expansion_ratio}"
+            )
 
         # PW expansion: PW -> Norm/Act
         self.expand = ConvDropoutNormReLU(
-            conv_op, input_channels, self.expanded_channels, 1, 1, False,
-            norm_op, norm_op_kwargs, None, None, nonlin, nonlin_kwargs
+            conv_op,
+            input_channels,
+            self.expanded_channels,
+            1,
+            1,
+            False,
+            norm_op,
+            norm_op_kwargs,
+            None,
+            None,
+            nonlin,
+            nonlin_kwargs,
         )
 
         # Depthwise DW: DW -> Norm/Act
         self.depthwise = DepthwiseConvBlock(
-            conv_op, self.expanded_channels, kernel_size, self.stride,
-            norm_op, norm_op_kwargs, nonlin, nonlin_kwargs,
+            conv_op,
+            self.expanded_channels,
+            kernel_size,
+            self.stride,
+            norm_op,
+            norm_op_kwargs,
+            nonlin,
+            nonlin_kwargs,
         )
 
         # PW projection: PW -> Norm
         self.project = ConvDropoutNormReLU(
-            conv_op, self.expanded_channels, output_channels, 1, 1, False,
-            norm_op, norm_op_kwargs, None, None, None, None
+            conv_op,
+            self.expanded_channels,
+            output_channels,
+            1,
+            1,
+            False,
+            norm_op,
+            norm_op_kwargs,
+            None,
+            None,
+            None,
+            None,
         )
-        self.add_identity = input_channels == output_channels and all(i == 1 for i in self.stride)
+        self.add_identity = input_channels == output_channels and all(
+            i == 1 for i in self.stride
+        )
 
         self.num_experts = num_experts if cc else 0
         self.num_groups = num_groups if cc else 1
@@ -648,11 +744,14 @@ class InvertedBottleneckBlock(nn.Module):
             "just give the image size without color/feature channels or batch channel. "
             "Do not give input_size=(b, c, x, y(, z)). Give input_size=(x, y(, z))!"
         )
-        size_after_stride = _conv_output_shape(input_size, self.depthwise.conv.kernel_size, self.stride)
+        size_after_stride = _conv_output_shape(
+            input_size, self.depthwise.conv.kernel_size, self.stride
+        )
         output = np.prod([self.expanded_channels, *input_size], dtype=np.int64)
         output += np.prod([self.expanded_channels, *size_after_stride], dtype=np.int64)
         output += np.prod([self.output_channels, *size_after_stride], dtype=np.int64)
         return output
+
 
 class StackedCondInvertedBottleneckBlocks(nn.Module):
     def __init__(
@@ -673,14 +772,22 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         num_groups: int = 1,
     ):
         super().__init__()
-        if not isinstance(n_blocks, (int, np.integer)) or isinstance(n_blocks, bool) or n_blocks <= 0:
+        if (
+            not isinstance(n_blocks, (int, np.integer))
+            or isinstance(n_blocks, bool)
+            or n_blocks <= 0
+        ):
             raise ValueError("n_blocks must be greater than 0")
-        self.initial_stride = _normalize_spatial_param(conv_op, initial_stride, "initial_stride")
+        self.initial_stride = _normalize_spatial_param(
+            conv_op, initial_stride, "initial_stride"
+        )
         self.output_channels = output_channels
         if cc_config is None:
             cc_config = [False] * n_blocks
         if len(cc_config) != n_blocks:
-            raise ValueError(f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})")
+            raise ValueError(
+                f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})"
+            )
 
         def make_block(block_idx: int, in_channels: int, stride, block_cc: bool):
             return InvertedBottleneckBlock(
@@ -699,18 +806,20 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 num_groups=num_groups,
             )
 
-        self.blocks = nn.ModuleList((
-            make_block(
-                0,
-                input_channels,
-                initial_stride,
-                cc_config[0],
-            ),
-            *[
-                make_block(i, output_channels, 1, cc_config[i])
-                for i in range(1, n_blocks)
-            ],
-        ))
+        self.blocks = nn.ModuleList(
+            (
+                make_block(
+                    0,
+                    input_channels,
+                    initial_stride,
+                    cc_config[0],
+                ),
+                *[
+                    make_block(i, output_channels, 1, cc_config[i])
+                    for i in range(1, n_blocks)
+                ],
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
@@ -754,7 +863,11 @@ class CondUNetEncoder(nn.Module):
         num_groups: Union[int, Sequence[int]] = 1,
     ):
         super().__init__()
-        if not isinstance(n_stages, (int, np.integer)) or isinstance(n_stages, bool) or n_stages <= 0:
+        if (
+            not isinstance(n_stages, (int, np.integer))
+            or isinstance(n_stages, bool)
+            or n_stages <= 0
+        ):
             raise ValueError("n_stages must be a positive integer")
         if (
             not isinstance(input_channels, (int, np.integer))
@@ -769,15 +882,21 @@ class CondUNetEncoder(nn.Module):
             )
         features_per_stage = list(features_per_stage)
         if len(features_per_stage) != n_stages:
-            raise ValueError(f"features_per_stage must contain exactly {n_stages} values")
+            raise ValueError(
+                f"features_per_stage must contain exactly {n_stages} values"
+            )
         if any(
-            not isinstance(channels, (int, np.integer)) or isinstance(channels, bool) or channels <= 0
+            not isinstance(channels, (int, np.integer))
+            or isinstance(channels, bool)
+            or channels <= 0
             for channels in features_per_stage
         ):
             raise ValueError("features_per_stage values must be positive integers")
         features_per_stage = [int(channels) for channels in features_per_stage]
 
-        raw_strides = [strides] * n_stages if isinstance(strides, int) else list(strides)
+        raw_strides = (
+            [strides] * n_stages if isinstance(strides, int) else list(strides)
+        )
         if len(raw_strides) != n_stages:
             raise ValueError(f"strides must contain exactly {n_stages} values")
         strides = [
@@ -798,10 +917,14 @@ class CondUNetEncoder(nn.Module):
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
-        self.expansion_ratios = [settings.expansion_ratio for settings in stage_settings]
+        self.expansion_ratios = [
+            settings.expansion_ratio for settings in stage_settings
+        ]
         self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
 
-        stem_channels = features_per_stage[0] if stem_channels is None else stem_channels
+        stem_channels = (
+            features_per_stage[0] if stem_channels is None else stem_channels
+        )
         if (
             not isinstance(stem_channels, (int, np.integer))
             or isinstance(stem_channels, bool)
@@ -878,7 +1001,9 @@ class CondUNetEncoder(nn.Module):
 
     def compute_conv_feature_map_size(self, input_size):
         output = self.stem.compute_conv_feature_map_size(input_size)
-        input_size = _conv_output_shape(input_size, self.stem_kernel_size, self.stem_stride)
+        input_size = _conv_output_shape(
+            input_size, self.stem_kernel_size, self.stem_stride
+        )
         for stage_idx, stage in enumerate(self.stages):
             output += stage.compute_conv_feature_map_size(input_size)
             input_size = _conv_output_shape(
@@ -916,7 +1041,9 @@ class CondUNetDecoder(nn.Module):
             raise ValueError("num_classes must be a positive integer")
         num_classes = int(num_classes)
         if deep_supervision:
-            raise ValueError("CondUNet does not support deep supervision; set deep_supervision=False")
+            raise ValueError(
+                "CondUNet does not support deep supervision; set deep_supervision=False"
+            )
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
@@ -934,7 +1061,9 @@ class CondUNetDecoder(nn.Module):
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
-        self.expansion_ratios = [settings.expansion_ratio for settings in stage_settings]
+        self.expansion_ratios = [
+            settings.expansion_ratio for settings in stage_settings
+        ]
         self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
 
         stages = []
@@ -998,7 +1127,9 @@ class CondUNetDecoder(nn.Module):
             input_size, self.encoder.stem_kernel_size, self.encoder.stem_stride
         )
         skip_sizes = []
-        for kernel_size, stride in zip(self.encoder.kernel_sizes[:-1], self.encoder.strides[:-1]):
+        for kernel_size, stride in zip(
+            self.encoder.kernel_sizes[:-1], self.encoder.strides[:-1]
+        ):
             input_size = _conv_output_shape(input_size, kernel_size, stride)
             skip_sizes.append(input_size)
 
