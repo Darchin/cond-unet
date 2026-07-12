@@ -25,39 +25,6 @@ from torch.nn.modules.dropout import _DropoutNd
 BoolConfig = Union[bool, List[bool], List[List[bool]]]
 IntConfig = Union[int, List[int], Tuple[int, ...]]
 KernelConfig = Union[int, List[int], Tuple[int, ...]]
-RouterAssignment = Optional[Sequence[Optional[Sequence[Optional[int]]]]]
-
-
-@dataclass
-class SEConfig:
-    """Squeeze-and-Excitation addon configuration.
-
-    Attributes:
-        reduction: MLP bottleneck ratio for the SE block.
-        encoder: Per-block SE enablement in the encoder. A single bool applies
-            globally; a list of bools applies per-stage; a nested list applies
-            per-block within each stage.
-        decoder: Same as ``encoder`` but for the decoder.
-        max_grid_size: Maximum number of grid cells along the longest bottleneck
-            axis. The actual grid follows the bottleneck aspect ratio. None means
-            global (standard) SE.
-        encoder_concat_global_context: Per-block enablement for concatenating a
-            global descriptor to each tiled encoder descriptor.
-        decoder_concat_global_context: Decoder equivalent.
-    """
-    reduction: float = 0.125
-    encoder: BoolConfig = False
-    decoder: BoolConfig = False
-    max_grid_size: Optional[int] = None
-    encoder_concat_global_context: BoolConfig = False
-    decoder_concat_global_context: BoolConfig = False
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "SEConfig":
-        return cls(**d)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
 
 
 @dataclass
@@ -65,36 +32,19 @@ class CCConfig:
     """CondConv (dense mixture-of-experts) addon configuration.
 
     Attributes:
-        reduction: MLP bottleneck ratio for the expert router.
-        encoder: Per-block CC enablement in the encoder (same format as SEConfig).
+        encoder: Per-block CC enablement in the encoder.
         decoder: Per-block CC enablement in the decoder.
         encoder_num_experts: Number of experts per encoder stage (int or per-stage list).
         decoder_num_experts: Number of experts per decoder stage.
         encoder_num_groups: Channel-wise routing granularity per encoder stage.
         decoder_num_groups: Channel-wise routing granularity per decoder stage.
-        max_grid_size: Maximum number of grid cells along the longest bottleneck
-            axis. The actual grid follows the bottleneck aspect ratio. None means
-            global routing.
-        encoder_concat_global_context: Per-block enablement for concatenating a
-            global descriptor to each tiled encoder router descriptor.
-        decoder_concat_global_context: Decoder equivalent.
-        encoder_router_assignment: Optional per-stage, per-block router IDs.
-            Blocks in a contiguous ID group reuse scores computed from the
-            group's first block. A None stage routes every enabled block independently.
-        decoder_router_assignment: Decoder equivalent.
     """
-    reduction: float = 0.125
     encoder: BoolConfig = False
     decoder: BoolConfig = False
     encoder_num_experts: IntConfig = 0
     decoder_num_experts: IntConfig = 0
     encoder_num_groups: IntConfig = 1
     decoder_num_groups: IntConfig = 1
-    max_grid_size: Optional[int] = None
-    encoder_concat_global_context: BoolConfig = False
-    decoder_concat_global_context: BoolConfig = False
-    encoder_router_assignment: RouterAssignment = None
-    decoder_router_assignment: RouterAssignment = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -165,36 +115,6 @@ def _normalize_spatial_param(
     if require_odd and any(item % 2 == 0 for item in values):
         raise ValueError(f"{name} values must be odd when using same padding")
     return [int(item) for item in values]
-
-
-def _normalize_max_grid_size(value: Optional[int], name: str) -> Optional[int]:
-    if value is None:
-        return None
-    if not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer or None")
-    return int(value)
-
-
-def _largest_divisor_at_most(value: int, limit: int) -> int:
-    return next(candidate for candidate in range(min(value, limit), 0, -1) if value % candidate == 0)
-
-
-def _derive_grid_shape(
-    bottleneck_shape: Sequence[int], max_grid_size: int
-) -> Tuple[int, ...]:
-    """Derive an aspect-aware grid whose axes divide the bottleneck exactly."""
-    if not bottleneck_shape or any(size <= 0 for size in bottleneck_shape):
-        raise ValueError(f"bottleneck shape values must be positive, got {tuple(bottleneck_shape)}")
-    max_grid_size = _normalize_max_grid_size(max_grid_size, "max_grid_size")
-    longest_axis = max(bottleneck_shape)
-    ideal_grid = [
-        max(1, min(size, max_grid_size * size // longest_axis))
-        for size in bottleneck_shape
-    ]
-    return tuple(
-        _largest_divisor_at_most(int(size), target)
-        for size, target in zip(bottleneck_shape, ideal_grid)
-    )
 
 
 def _transpose_output_padding(
@@ -281,144 +201,20 @@ def _conv_output_shape(
     ]
 
 
-class TiledPoolMLP(nn.Module):
-    """Pool-then-MLP module with optional spatial tiling.
-
-    When ``max_grid_size`` is None, performs global average pooling (standard
-    behavior). Otherwise, ``grid_shape`` is supplied at runtime from the shared
-    bottleneck-relative grid.
-    """
-
-    def __init__(
-        self,
-        input_channels: int,
-        output_channels: int,
-        reduction: float,
-        nonlin: Union[None, Type[nn.Module]],
-        nonlin_kwargs: dict = None,
-        final_activation: Union[None, Type[nn.Module]] = nn.Sigmoid,
-        max_grid_size: Optional[int] = None,
-        concat_global_context: bool = False,
-    ):
-        super().__init__()
-        if reduction <= 0:
-            raise ValueError("reduction must be greater than 0")
-        self.max_grid_size = _normalize_max_grid_size(max_grid_size, "max_grid_size")
-        if not isinstance(concat_global_context, bool):
-            raise TypeError("concat_global_context must be a bool")
-        self.concat_global_context = concat_global_context
-        hidden_channels = max(1, round(input_channels * reduction))
-        nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
-        activation = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
-        layers = [
-            nn.Linear(
-                input_channels * (2 if concat_global_context and self.max_grid_size is not None else 1),
-                hidden_channels,
-            ),
-            activation,
-            nn.Linear(hidden_channels, output_channels),
-        ]
-        if final_activation is not None:
-            layers.append(final_activation())
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(
-        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
-    ) -> torch.Tensor:
-        """Returns pooled MLP output.
-
-        - Global mode: shape ``[B, output_channels]``
-        - Tiled mode: shape ``[B, *grid_shape, output_channels]``
-        """
-        spatial_dims = x.ndim - 2
-        if self.max_grid_size is None:
-            return self.mlp(x.mean(dim=tuple(range(2, x.ndim))))
-
-        if grid_shape is None:
-            raise ValueError("grid_shape must be supplied when max_grid_size is configured")
-        if len(grid_shape) != spatial_dims:
-            raise ValueError(
-                f"grid_shape has {len(grid_shape)} dimensions, expected {spatial_dims}"
-            )
-        grid_shape = tuple(int(grid) for grid in grid_shape)
-        if any(grid <= 0 or grid > self.max_grid_size for grid in grid_shape):
-            raise ValueError(
-                f"grid_shape values must be between 1 and max_grid_size={self.max_grid_size}, "
-                f"got {grid_shape}"
-            )
-        if any(size % grid for size, grid in zip(x.shape[2:], grid_shape)):
-            raise ValueError(
-                f"input spatial shape {tuple(x.shape[2:])} must be divisible by grid_shape {grid_shape}"
-            )
-        adaptive_avg_pool = (
-            F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_avg_pool3d
-        )[spatial_dims - 1]
-        descriptors = adaptive_avg_pool(x, grid_shape).movedim(1, -1)
-        if self.concat_global_context:
-            grid_axes = tuple(range(1, descriptors.ndim - 1))
-            global_descriptor = descriptors.mean(dim=grid_axes, keepdim=True)
-            global_descriptor = global_descriptor.expand_as(descriptors)
-            descriptors = torch.cat((descriptors, global_descriptor), dim=-1)
-        return self.mlp(descriptors)
-
-
-class SqueezeAndExcitationBlock(nn.Module):
-    """Squeeze-and-excitation with independently recalibrated spatial tiles."""
-
-    def __init__(
-        self,
-        channels: int,
-        reduction: float,
-        nonlin: Union[None, Type[nn.Module]],
-        nonlin_kwargs: dict = None,
-        max_grid_size: Optional[int] = None,
-        concat_global_context: bool = False,
-    ):
-        super().__init__()
-        self.pool_mlp = TiledPoolMLP(
-            channels, channels, reduction, nonlin, nonlin_kwargs,
-            final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
-            concat_global_context=concat_global_context,
-        )
-
-    def forward(
-        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
-    ) -> torch.Tensor:
-        scale = self.pool_mlp(x, grid_shape)
-        if self.pool_mlp.max_grid_size is None:
-            spatial_dims = x.ndim - 2
-            return x * scale.reshape(x.shape[0], x.shape[1], *([1] * spatial_dims))
-        scale = scale.movedim(-1, 1)
-        interpolation_mode = ("linear", "bilinear", "trilinear")[x.ndim - 3]
-        scale = F.interpolate(scale, size=x.shape[2:], mode=interpolation_mode)
-        return x * scale
-
-
 class Router(nn.Module):
-    """Mean-only router that produces one expert score vector per spatial tile."""
+    """Global-average-pooling router with a direct sigmoid projection."""
 
     def __init__(
         self,
         input_channels: int,
         num_experts: int,
-        reduction: float,
-        nonlin: Union[None, Type[nn.Module]],
-        nonlin_kwargs: dict = None,
-        max_grid_size: Optional[int] = None,
-        concat_global_context: bool = False,
     ):
         super().__init__()
-        self.pool_mlp = TiledPoolMLP(
-            input_channels, num_experts, reduction, nonlin, nonlin_kwargs,
-            final_activation=nn.Sigmoid, max_grid_size=max_grid_size,
-            concat_global_context=concat_global_context,
-        )
-        self.max_grid_size = self.pool_mlp.max_grid_size
+        self.projection = nn.Linear(input_channels, num_experts)
 
-    def forward(
-        self, x: torch.Tensor, grid_shape: Optional[Sequence[int]] = None
-    ) -> torch.Tensor:
-        return self.pool_mlp(x, grid_shape)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        descriptor = x.mean(dim=tuple(range(2, x.ndim)))
+        return torch.sigmoid(self.projection(descriptor))
 
 
 class CondPWConv(nn.Module):
@@ -428,18 +224,12 @@ class CondPWConv(nn.Module):
         self,
         conv: _ConvNd,
         num_experts: int,
-        router_reduction: float,
-        nonlin: Union[None, Type[nn.Module]],
-        nonlin_kwargs: dict = None,
-        use_internal_router: bool = True,
         num_groups: int = 1,
         group_on_out: bool = True,
     ):
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts must be greater than 0")
-        if router_reduction <= 0:
-            raise ValueError("router_reduction must be greater than 0")
         if num_groups <= 0:
             raise ValueError("num_groups must be greater than 0")
 
@@ -451,7 +241,6 @@ class CondPWConv(nn.Module):
         self.kernel_size = conv.kernel_size
         self.spatial_dims = len(conv.kernel_size)
         self.num_experts = num_experts
-        self.router_reduction = router_reduction
         self.num_groups = num_groups
         self.group_on_out = group_on_out
 
@@ -474,11 +263,6 @@ class CondPWConv(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(num_experts, self.out_channels))
 
-        self.router = (
-            Router(self.in_channels, num_experts * num_groups, router_reduction, nonlin, nonlin_kwargs)
-            if use_internal_router
-            else None
-        )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -494,8 +278,7 @@ class CondPWConv(nn.Module):
         """Blend expert weights and biases using routing scores.
 
         Args:
-            flat_scores: Shape ``[N, num_experts * num_groups]`` where N is either
-                the batch size (global routing) or batch_size * num_tiles (tiled routing).
+            flat_scores: Shape ``[B, num_experts * num_groups]``.
 
         Returns:
             weight: ``[N, out_channels, in_channels]``
@@ -556,82 +339,17 @@ class CondPWConv(nn.Module):
                 f"router scores must have {expected_score_channels} values per sample/tile, "
                 f"got {scores.shape[-1]}"
             )
-        expected_ndim = self.spatial_dims + 2
-        if scores.ndim not in (2, expected_ndim):
-            raise ValueError(
-                f"router scores must be sample-level (2D) or tiled ({expected_ndim}D), got {scores.ndim}D"
-            )
+        if scores.ndim != 2:
+            raise ValueError(f"router scores must be sample-level (2D), got {scores.ndim}D")
 
-    def _flatten_tiles(
-        self, x: torch.Tensor, grid_shape: Sequence[int]
-    ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-        spatial_shape = x.shape[2:]
-        if any(grid <= 0 for grid in grid_shape):
-            raise ValueError(f"routing grid values must be positive, got {tuple(grid_shape)}")
-        if any(size % grid for size, grid in zip(spatial_shape, grid_shape)):
-            raise ValueError(
-                f"input spatial shape {tuple(spatial_shape)} must be divisible by routing grid {tuple(grid_shape)}"
-            )
-
-        tile_shape = tuple(size // grid for size, grid in zip(spatial_shape, grid_shape))
-        split_shape = [x.shape[0], self.in_channels]
-        for grid, tile in zip(grid_shape, tile_shape):
-            split_shape.extend((grid, tile))
-        grid_axes = list(range(2, 2 + 2 * self.spatial_dims, 2))
-        tile_axes = list(range(3, 2 + 2 * self.spatial_dims, 2))
-        tiled_input = (
-            x.reshape(split_shape)
-            .permute(0, *grid_axes, 1, *tile_axes)
-            .reshape(-1, self.in_channels, math.prod(tile_shape))
-        )
-        return tiled_input, tile_shape
-
-    def _restore_tiles(
-        self,
-        output: torch.Tensor,
-        batch_size: int,
-        grid_shape: Sequence[int],
-        tile_shape: Sequence[int],
-    ) -> torch.Tensor:
-        tiled_shape = [batch_size, *grid_shape, self.out_channels, *tile_shape]
-        channel_axis = 1 + self.spatial_dims
-        spatial_axes = []
-        for dim in range(self.spatial_dims):
-            spatial_axes.extend((1 + dim, channel_axis + 1 + dim))
-        spatial_shape = tuple(grid * tile for grid, tile in zip(grid_shape, tile_shape))
-        return output.reshape(tiled_shape).permute(0, channel_axis, *spatial_axes).reshape(
-            batch_size, self.out_channels, *spatial_shape
-        )
-
-    def forward(self, x: torch.Tensor, scores: torch.Tensor = None) -> torch.Tensor:
-        if scores is None:
-            if self.router is None:
-                raise ValueError("shared router scores must be supplied to this CondPWConv")
-            scores = self.router(x)
-
+    def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
         self._validate_scores(x, scores)
-
-        # Sample-level routing: scores is [batch_size, num_groups * num_experts]
-        if scores.ndim == 2:
-            weight, bias = self._blend_experts(scores)
-            output = torch.bmm(weight, x.flatten(2))
-            if bias is not None:
-                output = output + bias.unsqueeze(-1)
-            return output.reshape(batch_size, self.out_channels, *x.shape[2:])
-
-        # Region/Patch-level routing: scores is [batch_size, *grid_shape, num_groups * num_experts]
-        grid_shape = scores.shape[1:-1]
-        tiled_input, tile_shape = self._flatten_tiles(x, grid_shape)
-
-        flat_scores = scores.reshape(-1, self.num_experts * self.num_groups)
-        weight, bias = self._blend_experts(flat_scores)
-
-        output = torch.bmm(weight, tiled_input)
+        weight, bias = self._blend_experts(scores)
+        output = torch.bmm(weight, x.flatten(2))
         if bias is not None:
-            output.add_(bias.unsqueeze(-1))
-
-        return self._restore_tiles(output, batch_size, grid_shape, tile_shape)
+            output = output + bias.unsqueeze(-1)
+        return output.reshape(batch_size, self.out_channels, *x.shape[2:])
 
 
 def _expand_expansion_ratios(
@@ -713,64 +431,13 @@ def _expand_block_config(
     return result
 
 
-def _expand_router_assignment(
-    assignment: RouterAssignment,
-    n_stages: int,
-    n_blocks_per_stage: List[int],
-    cc_blocks: List[List[bool]],
-    name: str,
-) -> List[Optional[Tuple[Optional[int], ...]]]:
-    if assignment is None:
-        return [None] * n_stages
-    if not isinstance(assignment, (list, tuple)) or len(assignment) != n_stages:
-        raise ValueError(f"{name} must contain exactly {n_stages} per-stage values")
-
-    result = []
-    for stage_idx, stage_assignment in enumerate(assignment):
-        if stage_assignment is None:
-            result.append(None)
-            continue
-        if not isinstance(stage_assignment, (list, tuple)):
-            raise ValueError(f"{name}[{stage_idx}] must be None or a sequence")
-        values = list(stage_assignment)
-        if len(values) != n_blocks_per_stage[stage_idx]:
-            raise ValueError(
-                f"{name}[{stage_idx}] must contain exactly {n_blocks_per_stage[stage_idx]} values"
-            )
-        seen_runs = set()
-        previous = None
-        for block_idx, (value, enabled) in enumerate(zip(values, cc_blocks[stage_idx])):
-            if enabled:
-                if not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value < 0:
-                    raise ValueError(
-                        f"{name}[{stage_idx}][{block_idx}] must be a nonnegative integer when CC is enabled"
-                    )
-                value = int(value)
-                values[block_idx] = value
-                if value != previous:
-                    if value in seen_runs:
-                        raise ValueError(f"router ID {value} in {name}[{stage_idx}] must form one contiguous run")
-                    seen_runs.add(value)
-            elif value is not None:
-                raise ValueError(
-                    f"{name}[{stage_idx}][{block_idx}] must be None when CC is disabled"
-                )
-            previous = value
-        result.append(tuple(values))
-    return result
-
-
 @dataclass(frozen=True)
 class _StageSettings:
     n_blocks: int
     expansion_ratio: float
     num_experts: int
     num_groups: int
-    se_blocks: Tuple[bool, ...]
     cc_blocks: Tuple[bool, ...]
-    se_concat_global_context: Tuple[bool, ...]
-    cc_concat_global_context: Tuple[bool, ...]
-    router_assignment: Optional[Tuple[Optional[int], ...]]
 
 
 def _normalize_stage_settings(
@@ -779,11 +446,7 @@ def _normalize_stage_settings(
     expansion_ratio: Union[float, Sequence[float]],
     num_experts: Union[int, Sequence[int]],
     num_groups: Union[int, Sequence[int]],
-    se: BoolConfig,
     cc: BoolConfig,
-    se_concat_global_context: BoolConfig,
-    cc_concat_global_context: BoolConfig,
-    router_assignment: RouterAssignment,
     context: str,
 ) -> List[_StageSettings]:
     block_counts = _expand_int_param(
@@ -798,17 +461,7 @@ def _normalize_stage_settings(
     group_counts = _expand_int_param(
         num_groups, n_stages, f"{context} num_groups", min_value=1
     )
-    se_blocks = _expand_block_config(se, n_stages, block_counts, f"{context} se")
     cc_blocks = _expand_block_config(cc, n_stages, block_counts, f"{context} cc")
-    se_context = _expand_block_config(
-        se_concat_global_context, n_stages, block_counts, f"{context} se concat_global_context"
-    )
-    cc_context = _expand_block_config(
-        cc_concat_global_context, n_stages, block_counts, f"{context} cc concat_global_context"
-    )
-    assignments = _expand_router_assignment(
-        router_assignment, n_stages, block_counts, cc_blocks, f"{context} router_assignment"
-    )
 
     settings = []
     for stage_idx in range(n_stages):
@@ -823,11 +476,7 @@ def _normalize_stage_settings(
                 expansion_ratio=expansion_ratios[stage_idx],
                 num_experts=expert_counts[stage_idx],
                 num_groups=group_counts[stage_idx],
-                se_blocks=tuple(se_blocks[stage_idx]),
                 cc_blocks=tuple(cc_blocks[stage_idx]),
-                se_concat_global_context=tuple(se_context[stage_idx]),
-                cc_concat_global_context=tuple(cc_context[stage_idx]),
-                router_assignment=assignments[stage_idx],
             )
         )
     return settings
@@ -844,9 +493,6 @@ def _forward_routed_conv_block(
 def _expertify_pointwise(
     conv_block: ConvDropoutNormReLU,
     num_experts: int,
-    router_reduction: float,
-    nonlin: Union[None, Type[nn.Module]],
-    nonlin_kwargs: dict,
     num_groups: int = 1,
     group_on_out: bool = True,
 ) -> None:
@@ -856,10 +502,6 @@ def _expertify_pointwise(
     conditional_conv = CondPWConv(
         conv,
         num_experts,
-        router_reduction,
-        nonlin,
-        nonlin_kwargs,
-        use_internal_router=False,
         num_groups=num_groups,
         group_on_out=group_on_out,
     )
@@ -903,9 +545,9 @@ class DepthwiseConvBlock(nn.Module):
 
 
 class InvertedBottleneckBlock(nn.Module):
-    """Inverted bottleneck with optional pointwise routing and squeeze-and-excitation.
+    """Inverted bottleneck with optional pointwise expert routing.
 
-    The basic underlying block format is: PW -> Norm/Act -> DW -> Norm/Act -> PW -> SE -> Norm.
+    The basic block format is: PW -> Norm/Act -> DW -> Norm/Act -> PW -> Norm.
     Bias is set to False for all these convolutions as they have a proceeding normalization layer.
     """
 
@@ -922,16 +564,8 @@ class InvertedBottleneckBlock(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        cc_reduction: float = 0.125,
-        se_max_grid_size: Optional[int] = None,
-        cc_max_grid_size: Optional[int] = None,
-        se_reduction: float = 0.125,
-        se: bool = False,
         cc: bool = False,
         num_groups: int = 1,
-        se_concat_global_context: bool = False,
-        cc_concat_global_context: bool = False,
-        shared_router: Optional[Router] = None,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -940,8 +574,6 @@ class InvertedBottleneckBlock(nn.Module):
         kernel_size = _normalize_spatial_param(
             conv_op, kernel_size, "kernel_size", require_odd=True
         )
-        se_max_grid_size = _normalize_max_grid_size(se_max_grid_size, "se_max_grid_size")
-        cc_max_grid_size = _normalize_max_grid_size(cc_max_grid_size, "cc_max_grid_size")
         norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
 
@@ -983,48 +615,20 @@ class InvertedBottleneckBlock(nn.Module):
                     f"Expanded channels ({self.expanded_channels}) must be divisible by num_groups ({num_groups})"
                 )
 
-            self.router = (
-                shared_router
-                if shared_router is not None
-                else Router(
-                    input_channels, num_experts * num_groups, cc_reduction, nonlin,
-                    nonlin_kwargs, cc_max_grid_size, cc_concat_global_context,
-                )
+            self.router = Router(input_channels, num_experts * num_groups)
+            _expertify_pointwise(
+                self.expand, num_experts, num_groups=num_groups, group_on_out=True
             )
             _expertify_pointwise(
-                self.expand, num_experts, cc_reduction, nonlin, nonlin_kwargs,
-                num_groups=num_groups, group_on_out=True
-            )
-            _expertify_pointwise(
-                self.project, num_experts, cc_reduction, nonlin, nonlin_kwargs,
-                num_groups=num_groups, group_on_out=False
+                self.project, num_experts, num_groups=num_groups, group_on_out=False
             )
         else:
             self.router = None
 
-        self.se_block = (
-            SqueezeAndExcitationBlock(
-                output_channels, se_reduction, nonlin, nonlin_kwargs, se_max_grid_size,
-                se_concat_global_context,
-            )
-            if se
-            else nn.Identity()
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        se_grid_shape: Optional[Sequence[int]] = None,
-        cc_grid_shape: Optional[Sequence[int]] = None,
-        router_scores: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         if self.router is not None:
-            scores = (
-                self.router(x, cc_grid_shape)
-                if router_scores is None
-                else router_scores
-            )
+            scores = self.router(x)
             x = _forward_routed_conv_block(self.expand, x, scores)
             x = self.depthwise(x)
             x = self.project.conv(x, scores)
@@ -1033,10 +637,6 @@ class InvertedBottleneckBlock(nn.Module):
             x = self.depthwise(x)
             x = self.project.conv(x)
 
-        if isinstance(self.se_block, SqueezeAndExcitationBlock):
-            x = self.se_block(x, se_grid_shape)
-        else:
-            x = self.se_block(x)
         if hasattr(self.project, "norm"):
             x = self.project.norm(x)
         if self.add_identity:
@@ -1069,63 +669,20 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        cc_reduction: float = 0.125,
-        se_max_grid_size: Optional[int] = None,
-        cc_max_grid_size: Optional[int] = None,
-        se_reduction: float = 0.125,
-        se_config: List[bool] = None,
         cc_config: List[bool] = None,
         num_groups: int = 1,
-        se_concat_global_context: List[bool] = None,
-        cc_concat_global_context: List[bool] = None,
-        router_assignment: Optional[Sequence[Optional[int]]] = None,
     ):
         super().__init__()
         if not isinstance(n_blocks, (int, np.integer)) or isinstance(n_blocks, bool) or n_blocks <= 0:
             raise ValueError("n_blocks must be greater than 0")
         self.initial_stride = _normalize_spatial_param(conv_op, initial_stride, "initial_stride")
         self.output_channels = output_channels
-        self.router_assignment = (
-            None if router_assignment is None else tuple(router_assignment)
-        )
-
-        if se_config is None:
-            se_config = [False] * n_blocks
         if cc_config is None:
             cc_config = [False] * n_blocks
-        if se_concat_global_context is None:
-            se_concat_global_context = [False] * n_blocks
-        if cc_concat_global_context is None:
-            cc_concat_global_context = [False] * n_blocks
-
-        if len(se_config) != n_blocks:
-            raise ValueError(f"se_config length ({len(se_config)}) must match n_blocks ({n_blocks})")
         if len(cc_config) != n_blocks:
             raise ValueError(f"cc_config length ({len(cc_config)}) must match n_blocks ({n_blocks})")
 
-        block_input_channels = [input_channels] + [output_channels] * (n_blocks - 1)
-        shared_routers = {}
-        if router_assignment is not None:
-            for block_idx, router_id in enumerate(router_assignment):
-                if router_id is None:
-                    continue
-                if router_id in shared_routers:
-                    router, expected_context = shared_routers[router_id]
-                    if cc_concat_global_context[block_idx] != expected_context:
-                        raise ValueError(
-                            f"router ID {router_id} cannot be shared by blocks with different "
-                            "concat_global_context settings"
-                        )
-                else:
-                    router = Router(
-                        block_input_channels[block_idx], num_experts * num_groups, cc_reduction,
-                        nonlin, nonlin_kwargs, cc_max_grid_size,
-                        cc_concat_global_context[block_idx],
-                    )
-                    shared_routers[router_id] = (router, cc_concat_global_context[block_idx])
-
-        def make_block(block_idx: int, in_channels: int, stride, block_se: bool, block_cc: bool):
-            router_id = None if router_assignment is None else router_assignment[block_idx]
+        def make_block(block_idx: int, in_channels: int, stride, block_cc: bool):
             return InvertedBottleneckBlock(
                 conv_op=conv_op,
                 input_channels=in_channels,
@@ -1138,16 +695,8 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 nonlin_kwargs=nonlin_kwargs,
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
-                cc_reduction=cc_reduction,
-                se_max_grid_size=se_max_grid_size,
-                cc_max_grid_size=cc_max_grid_size,
-                se_reduction=se_reduction,
-                se=block_se,
                 cc=block_cc,
                 num_groups=num_groups,
-                se_concat_global_context=se_concat_global_context[block_idx],
-                cc_concat_global_context=cc_concat_global_context[block_idx],
-                shared_router=None if router_id is None else shared_routers[router_id][0],
             )
 
         self.blocks = nn.ModuleList((
@@ -1155,31 +704,17 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 0,
                 input_channels,
                 initial_stride,
-                se_config[0],
                 cc_config[0],
             ),
             *[
-                make_block(i, output_channels, 1, se_config[i], cc_config[i])
+                make_block(i, output_channels, 1, cc_config[i])
                 for i in range(1, n_blocks)
             ],
         ))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        se_grid_shape: Optional[Sequence[int]] = None,
-        cc_grid_shape: Optional[Sequence[int]] = None,
-    ) -> torch.Tensor:
-        shared_scores = {}
-        for block_idx, block in enumerate(self.blocks):
-            router_scores = None
-            if self.router_assignment is not None:
-                router_id = self.router_assignment[block_idx]
-                if router_id is not None:
-                    if router_id not in shared_scores:
-                        shared_scores[router_id] = block.router(x, cc_grid_shape)
-                    router_scores = shared_scores[router_id]
-            x = block(x, se_grid_shape, cc_grid_shape, router_scores)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
         return x
 
     def compute_conv_feature_map_size(self, input_size):
@@ -1215,16 +750,8 @@ class CondUNetEncoder(nn.Module):
         stem_kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
-        cc_reduction: float = 0.125,
-        se_max_grid_size: Optional[int] = None,
-        cc_max_grid_size: Optional[int] = None,
-        se_reduction: float = 0.125,
-        se: BoolConfig = False,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
-        se_concat_global_context: BoolConfig = False,
-        cc_concat_global_context: BoolConfig = False,
-        router_assignment: RouterAssignment = None,
     ):
         super().__init__()
         if not isinstance(n_stages, (int, np.integer)) or isinstance(n_stages, bool) or n_stages <= 0:
@@ -1266,17 +793,12 @@ class CondUNetEncoder(nn.Module):
             expansion_ratio,
             num_experts,
             num_groups,
-            se,
             cc,
-            se_concat_global_context,
-            cc_concat_global_context,
-            router_assignment,
             "encoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
         self.expansion_ratios = [settings.expansion_ratio for settings in stage_settings]
-        self.se_config = [list(settings.se_blocks) for settings in stage_settings]
         self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
 
         stem_channels = features_per_stage[0] if stem_channels is None else stem_channels
@@ -1291,16 +813,6 @@ class CondUNetEncoder(nn.Module):
             conv_op, stem_kernel_size, "stem.kernel_size", require_odd=True
         )
         self.stem_stride = _normalize_spatial_param(conv_op, stem_stride, "stem.stride")
-
-        self.se_max_grid_size = _normalize_max_grid_size(se_max_grid_size, "se.max_grid_size")
-        self.cc_max_grid_size = _normalize_max_grid_size(cc_max_grid_size, "cc.max_grid_size")
-        if (self.se_max_grid_size is not None or self.cc_max_grid_size is not None) and any(
-            len(set(stage_stride)) != 1 for stage_stride in strides
-        ):
-            raise ValueError(
-                "max_grid_size requires isotropic encoder stage strides so the bottleneck "
-                "aspect ratio remains valid at every stage"
-            )
 
         # Stem applies no non-linearity (only Conv + Norm)
         self.stem = StackedConvBlocks(
@@ -1336,16 +848,8 @@ class CondUNetEncoder(nn.Module):
                     nonlin_kwargs=nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
-                    cc_reduction=cc_reduction,
-                    se_max_grid_size=self.se_max_grid_size,
-                    cc_max_grid_size=self.cc_max_grid_size,
-                    se_reduction=se_reduction,
-                    se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
-                    se_concat_global_context=list(settings.se_concat_global_context),
-                    cc_concat_global_context=list(settings.cc_concat_global_context),
-                    router_assignment=settings.router_assignment,
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -1364,16 +868,11 @@ class CondUNetEncoder(nn.Module):
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        se_grid_shape: Optional[Sequence[int]] = None,
-        cc_grid_shape: Optional[Sequence[int]] = None,
-    ):
+    def forward(self, x: torch.Tensor):
         x = self.stem(x)
         skips = []
         for stage in self.stages:
-            x = stage(x, se_grid_shape, cc_grid_shape)
+            x = stage(x)
             skips.append(x)
         return skips if self.return_skips else skips[-1]
 
@@ -1405,15 +904,8 @@ class CondUNetDecoder(nn.Module):
         deep_supervision: bool,
         expansion_ratio: Union[float, Sequence[float]] = 3.0,
         num_experts: Union[int, Sequence[int]] = 0,
-        cc_reduction: float = 0.125,
-        upsample_mode: str = "linear",
-        se_reduction: float = 0.125,
-        se: BoolConfig = False,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
-        se_concat_global_context: BoolConfig = False,
-        cc_concat_global_context: BoolConfig = False,
-        router_assignment: RouterAssignment = None,
     ):
         super().__init__()
         if (
@@ -1425,14 +917,9 @@ class CondUNetDecoder(nn.Module):
         num_classes = int(num_classes)
         if deep_supervision:
             raise ValueError("CondUNet does not support deep supervision; set deep_supervision=False")
-        if upsample_mode not in {"linear", "transposed"}:
-            raise ValueError(
-                f"upsample_mode must be 'linear' or 'transposed', got {upsample_mode!r}"
-            )
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
-        self.upsample_mode = upsample_mode
         self.interp_mode = _interpolation_mode(encoder.conv_op)
         n_stages_encoder = len(encoder.output_channels)
         _validate_native_resolution_decoder(encoder.strides)
@@ -1442,42 +929,20 @@ class CondUNetDecoder(nn.Module):
             expansion_ratio,
             num_experts,
             num_groups,
-            se,
             cc,
-            se_concat_global_context,
-            cc_concat_global_context,
-            router_assignment,
             "decoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
         self.expansion_ratios = [settings.expansion_ratio for settings in stage_settings]
-        self.se_config = [list(settings.se_blocks) for settings in stage_settings]
         self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
 
         stages = []
-        upsamplers = []
-        transpconv_op = get_matching_convtransp(conv_op=encoder.conv_op)
-        use_linear = upsample_mode == "linear"
         for s in range(1, n_stages_encoder):
             settings = stage_settings[s - 1]
             input_features_below = encoder.output_channels[-s]
             input_features_skip = encoder.output_channels[-(s + 1)]
-            if use_linear:
-                upsamplers.append(nn.Identity())
-                stage_input_channels = input_features_below + input_features_skip
-            else:
-                stride = encoder.strides[-s]
-                upsamplers.append(
-                    transpconv_op(
-                        input_features_below,
-                        input_features_skip,
-                        stride,
-                        stride,
-                        bias=encoder.conv_bias,
-                    )
-                )
-                stage_input_channels = 2 * input_features_skip
+            stage_input_channels = input_features_below + input_features_skip
             target_stage_idx = n_stages_encoder - s - 1
             stages.append(
                 StackedCondInvertedBottleneckBlocks(
@@ -1493,21 +958,12 @@ class CondUNetDecoder(nn.Module):
                     nonlin_kwargs=encoder.nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
-                    cc_reduction=cc_reduction,
-                    se_max_grid_size=encoder.se_max_grid_size,
-                    cc_max_grid_size=encoder.cc_max_grid_size,
-                    se_reduction=se_reduction,
-                    se_config=list(settings.se_blocks),
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
-                    se_concat_global_context=list(settings.se_concat_global_context),
-                    cc_concat_global_context=list(settings.cc_concat_global_context),
-                    router_assignment=settings.router_assignment,
                 )
             )
 
         self.stages = nn.ModuleList(stages)
-        self.upsamplers = nn.ModuleList(upsamplers)
         head_op = get_matching_convtransp(conv_op=encoder.conv_op)
         head_padding = _same_padding(encoder.stem_kernel_size)
         head_output_padding = _transpose_output_padding(
@@ -1523,24 +979,16 @@ class CondUNetDecoder(nn.Module):
             bias=True,
         )
 
-    def forward(
-        self,
-        skips,
-        se_grid_shape: Optional[Sequence[int]] = None,
-        cc_grid_shape: Optional[Sequence[int]] = None,
-    ):
+    def forward(self, skips):
         if self.deep_supervision:
             raise RuntimeError("CondUNet does not support deep supervision")
         x = skips[-1]
         for stage_idx, stage in enumerate(self.stages):
             skip = skips[-(stage_idx + 2)]
-            if self.upsample_mode == "linear":
-                x = F.interpolate(
-                    x, size=skip.shape[2:], mode=self.interp_mode, align_corners=False
-                )
-            else:
-                x = self.upsamplers[stage_idx](x)
-            x = stage(torch.cat((x, skip), dim=1), se_grid_shape, cc_grid_shape)
+            x = F.interpolate(
+                x, size=skip.shape[2:], mode=self.interp_mode, align_corners=False
+            )
+            x = stage(torch.cat((x, skip), dim=1))
         seg_output = self.seg_layer(x)
         return seg_output
 
@@ -1558,11 +1006,6 @@ class CondUNetDecoder(nn.Module):
         for stage_idx, stage in enumerate(self.stages):
             skip_size = skip_sizes[-(stage_idx + 1)]
             output += stage.compute_conv_feature_map_size(skip_size)
-            if self.upsample_mode != "linear":
-                output += np.prod(
-                    [self.encoder.output_channels[-(stage_idx + 2)], *skip_size],
-                    dtype=np.int64,
-                )
         output += np.prod([self.num_classes, *native_input_size], dtype=np.int64)
         return output
 
@@ -1589,9 +1032,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         deep_supervision: bool = False,
         encoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
         decoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
-        upsample_mode: str = "linear",
         stem: Union[StemConfig, dict, None] = None,
-        se: Union[SEConfig, dict, None] = None,
         cc: Union[CCConfig, dict, None] = None,
     ):
         super().__init__()
@@ -1610,7 +1051,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
 
         # Normalize config dataclasses (supports dict from JSON plans)
         stem = _normalize_config(stem, StemConfig)
-        se = _normalize_config(se, SEConfig)
         cc = _normalize_config(cc, CCConfig)
 
         self.encoder = CondUNetEncoder(
@@ -1634,16 +1074,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_kernel_size=stem.kernel_size,
             stem_stride=stem.stride,
             num_experts=cc.encoder_num_experts,
-            cc_reduction=cc.reduction,
-            se_max_grid_size=se.max_grid_size,
-            cc_max_grid_size=cc.max_grid_size,
-            se_reduction=se.reduction,
-            se=se.encoder,
             cc=cc.encoder,
             num_groups=cc.encoder_num_groups,
-            se_concat_global_context=se.encoder_concat_global_context,
-            cc_concat_global_context=cc.encoder_concat_global_context,
-            router_assignment=cc.encoder_router_assignment,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1652,32 +1084,14 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             deep_supervision=deep_supervision,
             expansion_ratio=decoder_expansion_ratio,
             num_experts=cc.decoder_num_experts,
-            cc_reduction=cc.reduction,
-            upsample_mode=upsample_mode,
-            se_reduction=se.reduction,
-            se=se.decoder,
             cc=cc.decoder,
             num_groups=cc.decoder_num_groups,
-            se_concat_global_context=se.decoder_concat_global_context,
-            cc_concat_global_context=cc.decoder_concat_global_context,
-            router_assignment=cc.decoder_router_assignment,
         )
 
     def forward(self, x: torch.Tensor):
         input_spatial_shape = x.shape[2:]
-        bottleneck_shape = self.encoder.compute_bottleneck_shape(input_spatial_shape)
-        se_grid_shape = (
-            None
-            if self.encoder.se_max_grid_size is None
-            else _derive_grid_shape(bottleneck_shape, self.encoder.se_max_grid_size)
-        )
-        cc_grid_shape = (
-            None
-            if self.encoder.cc_max_grid_size is None
-            else _derive_grid_shape(bottleneck_shape, self.encoder.cc_max_grid_size)
-        )
-        skips = self.encoder(x, se_grid_shape, cc_grid_shape)
-        output = self.decoder(skips, se_grid_shape, cc_grid_shape)
+        skips = self.encoder(x)
+        output = self.decoder(skips)
         if output.shape[2:] != input_spatial_shape:
             raise ValueError(
                 f"CondUNet output spatial shape {tuple(output.shape[2:])} does not match input "

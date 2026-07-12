@@ -6,6 +6,7 @@ from nnunetv2.experiment_planning.dataset_fingerprint.cond_unet_fingerprint_extr
 from nnunetv2.experiment_planning.experiment_planners.cond_unet_planner import (
     CondUNetPlanner,
     PhaseOnePlanner,
+    PhaseFourPlanner,
     PhaseThreePlanner,
     PhaseTwoPlanner,
 )
@@ -137,6 +138,7 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
 
         self.assertEqual(architecture["arch_kwargs"]["nonlin"], "torch.nn.ReLU")
         self.assertEqual(architecture["arch_kwargs"]["nonlin_kwargs"], {"inplace": True})
+        self.assertNotIn("upsample_mode", architecture["arch_kwargs"])
         self.assertEqual(architecture["arch_kwargs"]["n_stages"], 5)
         self.assertEqual(len(architecture["arch_kwargs"]["strides"]), 5)
 
@@ -219,187 +221,13 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
         self.assertEqual(config.network_arch_init_kwargs["decoder_expansion_ratio"], 1.0)
         config.validate_required_for_training("2x-m")
 
-    def test_phase_two_planner_generates_expected_child_configurations(self):
-        planner = PhaseTwoPlanner.__new__(PhaseTwoPlanner)
-
-        configurations = planner._additional_configurations()
-
-        self.assertEqual(
-            list(configurations),
-            [
-                "4x-m",
-                "4x-m-gse-enck",
-                "4x-m-gse-deck",
-                "4x-m-gse-enck-deck",
-                "4x-m-gcc-enck",
-                "4x-m-gcc-deck",
-                "4x-m-gcc-enck-deck",
-            ],
-        )
-        self.assertEqual(configurations["4x-m"]["inherits_from"], "4x")
-        self.assertEqual(configurations["4x-m"]["patch_size_multiplier"], 6)
-        self.assertEqual(
-            configurations["4x-m"]["architecture"]["arch_kwargs"]["features_per_stage"],
-            [96, 192, 384, 768],
-        )
-        self.assertEqual(configurations["4x-m-gse-enck"]["inherits_from"], "4x-m")
-        self.assertEqual(
-            configurations["4x-m-gse-enck"]["architecture"]["arch_kwargs"]["se"],
-            {"encoder": [False, True, True, True]},
-        )
-        self.assertEqual(
-            configurations["4x-m-gse-deck"]["architecture"]["arch_kwargs"]["se"],
-            {"decoder": [False, True, True]},
-        )
-        self.assertEqual(
-            configurations["4x-m-gse-enck-deck"]["architecture"]["arch_kwargs"]["se"],
-            {
-                "encoder": [False, True, True, True],
-                "decoder": [False, True, True],
-            },
-        )
-        self.assertEqual(
-            configurations["4x-m-gcc-enck"]["architecture"]["arch_kwargs"]["cc"],
-            {
-                "encoder": [False, True, True, True],
-                "encoder_num_experts": 4,
-            },
-        )
-        self.assertEqual(
-            configurations["4x-m-gcc-deck"]["architecture"]["arch_kwargs"]["cc"],
-            {
-                "decoder": [False, True, True],
-                "decoder_num_experts": 4,
-            },
-        )
-        self.assertEqual(
-            configurations["4x-m-gcc-enck-deck"]["architecture"]["arch_kwargs"]["cc"],
-            {
-                "encoder": [False, True, True, True],
-                "encoder_num_experts": 4,
-                "decoder": [False, True, True],
-                "decoder_num_experts": 4,
-            },
-        )
-
-    def test_phase_two_child_configuration_resolves_as_trainable(self):
-        planner = self._minimal_planner(PhaseTwoPlanner)
-        phase_two_configurations = planner._additional_configurations()
-        plans = {
-            "configurations": {
-                "base": {
-                    "normalization_schemes": ["ZScoreNormalization"],
-                    "use_mask_for_norm": [False],
-                    "resampling_fn_data": "resample_data_or_seg_to_shape",
-                    "resampling_fn_seg": "resample_data_or_seg_to_shape",
-                    "resampling_fn_data_kwargs": {"is_seg": False},
-                    "resampling_fn_seg_kwargs": {"is_seg": True},
-                    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
-                    "resampling_fn_probabilities_kwargs": {"is_seg": False},
-                },
-                "4x": planner._plan_for_preset("4x", [0, 1, 2]),
-                "4x-m": phase_two_configurations["4x-m"],
-                "4x-m-gse-enck-deck": phase_two_configurations["4x-m-gse-enck-deck"],
-                "4x-m-gcc-enck-deck": phase_two_configurations["4x-m-gcc-enck-deck"],
-            },
-        }
-
-        se_config = PlansManager(plans).get_configuration("4x-m-gse-enck-deck")
-        cc_config = PlansManager(plans).get_configuration("4x-m-gcc-enck-deck")
-
-        for config, configuration_name in (
-            (se_config, "4x-m-gse-enck-deck"),
-            (cc_config, "4x-m-gcc-enck-deck"),
-        ):
-            self.assertEqual(config.patch_size, [192, 192, 192])
-            self.assertEqual(config.patch_size_multiplier, 6)
-            self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [96, 192, 384, 768])
-            self.assertEqual(config.network_arch_init_kwargs["encoder_n_blocks_per_stage"], [3, 3, 9, 3])
-            self.assertEqual(config.network_arch_init_kwargs["decoder_n_blocks_per_stage"], [1, 1, 1])
-            config.validate_required_for_training(configuration_name)
-
-        self.assertEqual(
-            se_config.network_arch_init_kwargs["se"],
-            {
-                "encoder": [False, True, True, True],
-                "decoder": [False, True, True],
-            },
-        )
-        self.assertEqual(
-            cc_config.network_arch_init_kwargs["cc"],
-            {
-                "encoder": [False, True, True, True],
-                "encoder_num_experts": 4,
-                "decoder": [False, True, True],
-                "decoder_num_experts": 4,
-            },
-        )
-
-    def test_phase_three_planner_generates_expected_child_configurations(self):
-        planner = PhaseThreePlanner.__new__(PhaseThreePlanner)
-
-        configurations = planner._additional_configurations()
-
-        self.assertEqual(
-            list(configurations),
-            ["4x-m", "4x-m-tcc2-enck", "4x-m-tcc4-enck", "4x-m-tcc8-enck"],
-        )
-        self.assertEqual(configurations["4x-m"]["inherits_from"], "4x")
-        self.assertEqual(configurations["4x-m"]["patch_size_multiplier"], 6)
-        self.assertEqual(
-            configurations["4x-m"]["architecture"]["arch_kwargs"]["features_per_stage"],
-            [96, 192, 384, 768],
-        )
-        for max_grid_size in (2, 4, 8):
-            configuration_name = f"4x-m-tcc{max_grid_size}-enck"
-            self.assertEqual(configurations[configuration_name]["inherits_from"], "4x-m")
-            self.assertEqual(
-                configurations[configuration_name]["architecture"]["arch_kwargs"]["cc"],
-                {
-                    "encoder": [False, True, True, True],
-                    "encoder_num_experts": 4,
-                    "max_grid_size": max_grid_size,
-                },
-            )
-
-    def test_phase_three_child_configurations_resolve_as_trainable(self):
-        planner = self._minimal_planner(PhaseThreePlanner)
-        phase_three_configurations = planner._additional_configurations()
-        plans = {
-            "configurations": {
-                "base": {
-                    "normalization_schemes": ["ZScoreNormalization"],
-                    "use_mask_for_norm": [False],
-                    "resampling_fn_data": "resample_data_or_seg_to_shape",
-                    "resampling_fn_seg": "resample_data_or_seg_to_shape",
-                    "resampling_fn_data_kwargs": {"is_seg": False},
-                    "resampling_fn_seg_kwargs": {"is_seg": True},
-                    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
-                    "resampling_fn_probabilities_kwargs": {"is_seg": False},
-                },
-                "4x": planner._plan_for_preset("4x", [0, 1, 2]),
-                "4x-m": phase_three_configurations["4x-m"],
-                **phase_three_configurations,
-            },
-        }
-
-        for max_grid_size in (2, 4, 8):
-            configuration_name = f"4x-m-tcc{max_grid_size}-enck"
-            config = PlansManager(plans).get_configuration(configuration_name)
-            self.assertEqual(config.patch_size, [192, 192, 192])
-            self.assertEqual(config.patch_size_multiplier, 6)
-            self.assertEqual(config.network_arch_init_kwargs["features_per_stage"], [96, 192, 384, 768])
-            self.assertEqual(config.network_arch_init_kwargs["encoder_n_blocks_per_stage"], [3, 3, 9, 3])
-            self.assertEqual(config.network_arch_init_kwargs["decoder_n_blocks_per_stage"], [1, 1, 1])
-            config.validate_required_for_training(configuration_name)
-            self.assertEqual(
-                config.network_arch_init_kwargs["cc"],
-                {
-                    "encoder": [False, True, True, True],
-                    "encoder_num_experts": 4,
-                    "max_grid_size": max_grid_size,
-                },
-            )
+    def test_obsolete_phase_planners_raise_on_construction(self):
+        for planner_class in (PhaseTwoPlanner, PhaseThreePlanner, PhaseFourPlanner):
+            with self.subTest(planner=planner_class.__name__):
+                with self.assertRaisesRegex(
+                    RuntimeError, rf"{planner_class.__name__} is deprecated"
+                ):
+                    planner_class("Dataset001_Test")
 
 
 class TestPlansManagerCondUNetConfig(unittest.TestCase):

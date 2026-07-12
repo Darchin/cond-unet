@@ -1,12 +1,14 @@
+import inspect
+
 import pytest
 import torch
 from torch import nn
 
 from nnunetv2.training.network_architecture.cond_unet import (
+    CCConfig,
     CondPWConv,
     CondUNet,
-    TiledPoolMLP,
-    _derive_grid_shape,
+    Router,
 )
 
 
@@ -28,284 +30,159 @@ def _small_model(**overrides) -> CondUNet:
     return CondUNet(**kwargs)
 
 
-def _explicit_ungrouped_condconv(
+def _explicit_condconv(
     layer: CondPWConv, x: torch.Tensor, scores: torch.Tensor
 ) -> torch.Tensor:
-    output = torch.empty(x.shape[0], layer.out_channels, *x.shape[2:])
-    grid_shape = scores.shape[1:-1] if scores.ndim > 2 else (1,) * layer.spatial_dims
-    tile_shape = tuple(size // grid for size, grid in zip(x.shape[2:], grid_shape))
-    score_grid = scores.reshape(x.shape[0], *grid_shape, layer.num_experts)
-
-    for batch_idx in range(x.shape[0]):
-        for tile_idx in torch.cartesian_prod(*(torch.arange(size) for size in grid_shape)):
-            tile_idx = tuple(int(index) for index in tile_idx.reshape(-1))
-            tile_slices = tuple(
-                slice(index * tile, (index + 1) * tile)
-                for index, tile in zip(tile_idx, tile_shape)
-            )
-            tile_scores = score_grid[(batch_idx, *tile_idx)]
-            weight = torch.einsum("e,eoi->oi", tile_scores, layer.weight)
-            bias = None if layer.bias is None else torch.einsum("e,eo->o", tile_scores, layer.bias)
-            tile_input = x[(batch_idx, slice(None), *tile_slices)].reshape(layer.in_channels, -1)
-            tile_output = weight @ tile_input
-            if bias is not None:
-                tile_output += bias[:, None]
-            output[(batch_idx, slice(None), *tile_slices)] = tile_output.reshape(
-                layer.out_channels, *tile_shape
-            )
-    return output
+    outputs = []
+    for sample, sample_scores in zip(x, scores):
+        if layer.num_groups != 1:
+            raise AssertionError("helper only supports ungrouped routing")
+        weight = torch.einsum("e,eoi->oi", sample_scores, layer.weight)
+        bias = (
+            None
+            if layer.bias is None
+            else torch.einsum("e,eo->o", sample_scores, layer.bias)
+        )
+        outputs.append(
+            torch.nn.functional.conv2d(
+                sample.unsqueeze(0), weight[:, :, None, None], bias
+            ).squeeze(0)
+        )
+    return torch.stack(outputs)
 
 
-def test_condpwconv_bmm_matches_explicit_global_and_tiled_mixtures():
-    torch.manual_seed(0)
-    layer = CondPWConv(
-        nn.Conv2d(3, 4, 1, bias=True),
-        num_experts=3,
-        router_reduction=0.5,
-        nonlin=nn.ReLU,
-        use_internal_router=False,
-    )
-    x = torch.randn(2, 3, 8, 6)
+def test_condpwconv_matches_explicit_per_sample_mixture():
+    layer = CondPWConv(nn.Conv2d(3, 4, 1, bias=True), num_experts=3)
+    x = torch.randn(2, 3, 5, 7)
+    scores = torch.sigmoid(torch.randn(2, 3))
 
-    for scores in (torch.rand(2, 3), torch.rand(2, 2, 3, 3)):
-        actual = layer(x, scores)
-        expected = _explicit_ungrouped_condconv(layer, x, scores)
-        torch.testing.assert_close(actual, expected)
+    actual = layer(x, scores)
+    expected = _explicit_condconv(layer, x, scores)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_condpwconv_rejects_tiled_scores():
+    layer = CondPWConv(nn.Conv2d(3, 4, 1), num_experts=2)
+    with pytest.raises(ValueError, match="sample-level"):
+        layer(torch.randn(1, 3, 4, 4), torch.randn(1, 2, 2, 2))
 
 
 @pytest.mark.parametrize("group_on_out", [True, False])
-def test_grouped_expert_blending_matches_explicit_channel_group_mixture(group_on_out):
+def test_grouped_expert_blending_has_expected_shape(group_on_out):
     layer = CondPWConv(
         nn.Conv2d(4, 6, 1, bias=True),
-        num_experts=2,
-        router_reduction=0.5,
-        nonlin=nn.ReLU,
-        use_internal_router=False,
+        num_experts=3,
         num_groups=2,
         group_on_out=group_on_out,
     )
-    scores = torch.rand(3, 2, 2)
-    actual_weight, actual_bias = layer._blend_experts(scores.flatten(1))
-
-    expected_weight = torch.empty_like(actual_weight)
-    if group_on_out:
-        output_channels_per_group = layer.out_channels // layer.num_groups
-        for group_idx in range(layer.num_groups):
-            channel_slice = slice(
-                group_idx * output_channels_per_group, (group_idx + 1) * output_channels_per_group
-            )
-            expected_weight[:, channel_slice] = torch.einsum(
-                "be,eoi->boi", scores[:, group_idx], layer.weight[:, channel_slice]
-            )
-        expected_bias = torch.cat(
-            [
-                torch.einsum("be,eo->bo", scores[:, group_idx], bias_group)
-                for group_idx, bias_group in enumerate(
-                    layer.bias.split(output_channels_per_group, dim=1)
-                )
-            ],
-            dim=1,
-        )
-    else:
-        input_channels_per_group = layer.in_channels // layer.num_groups
-        for group_idx in range(layer.num_groups):
-            channel_slice = slice(
-                group_idx * input_channels_per_group, (group_idx + 1) * input_channels_per_group
-            )
-            expected_weight[:, :, channel_slice] = torch.einsum(
-                "be,eoi->boi", scores[:, group_idx], layer.weight[:, :, channel_slice]
-            )
-        expected_bias = torch.einsum("be,eo->bo", scores.mean(dim=1), layer.bias)
-
-    torch.testing.assert_close(actual_weight, expected_weight)
-    torch.testing.assert_close(actual_bias, expected_bias)
+    output = layer(torch.randn(2, 4, 5, 5), torch.randn(2, 6))
+    assert output.shape == (2, 6, 5, 5)
 
 
-def test_tiled_pool_rejects_geometry_that_cannot_form_equal_tiles():
-    pool = TiledPoolMLP(4, 2, 0.5, nn.ReLU, max_grid_size=3)
-    with pytest.raises(ValueError, match="must be divisible by grid_shape"):
-        pool(torch.randn(1, 4, 10, 10), grid_shape=(3, 3))
+def test_router_is_direct_global_projection_with_sigmoid():
+    router = Router(3, 4)
+    assert list(router.children()) == [router.projection]
+    assert isinstance(router.projection, nn.Linear)
+    with torch.no_grad():
+        router.projection.weight.fill_(0.25)
+        router.projection.bias.zero_()
+    x = torch.arange(2 * 3 * 4 * 5, dtype=torch.float32).reshape(2, 3, 4, 5)
+    expected = torch.sigmoid(router.projection(x.mean(dim=(2, 3))))
+    torch.testing.assert_close(router(x), expected)
 
 
-def test_tiled_pool_concatenates_global_context_without_expanding_hidden_width():
-    pool = TiledPoolMLP(
-        2, 3, 0.5, nn.ReLU, max_grid_size=2, concat_global_context=True
-    )
-    captured = []
-    hook = pool.mlp[0].register_forward_pre_hook(
-        lambda _module, inputs: captured.append(inputs[0].detach().clone())
-    )
-    x = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
-    pool(x, grid_shape=(1, 2))
-    hook.remove()
-
-    tile_descriptors = nn.functional.adaptive_avg_pool2d(x, (1, 2)).movedim(1, -1)
-    global_descriptor = tile_descriptors.mean(dim=(1, 2), keepdim=True)
-    expected = torch.cat(
-        (tile_descriptors, global_descriptor.expand_as(tile_descriptors)), dim=-1
-    )
-    torch.testing.assert_close(captured[0], expected)
-    assert pool.mlp[0].in_features == 4
-    assert pool.mlp[0].out_features == 1
-
-
-def test_grid_shape_tracks_bottleneck_aspect_ratio_and_uses_valid_divisors():
-    assert _derive_grid_shape((6, 12, 12), max_grid_size=4) == (2, 4, 4)
-    assert _derive_grid_shape((10, 12, 12), max_grid_size=4) == (2, 4, 4)
-
-
-def test_tiled_addons_use_one_bottleneck_relative_grid_across_network():
-    model = _small_model(
-        se={
-            "encoder": [False, True, True],
-            "decoder": True,
-            "max_grid_size": 4,
-        },
-        cc={
-            "encoder": [False, True, True],
-            "encoder_num_experts": 2,
-            "max_grid_size": 4,
-        }
-    )
-    pooled_output_shapes = []
-    hooks = [
-        module.register_forward_hook(
-            lambda _module, _inputs, output: pooled_output_shapes.append(output.shape)
-        )
-        for module in model.modules()
-        if isinstance(module, TiledPoolMLP) and module.max_grid_size is not None
-    ]
-
-    output = model(torch.randn(1, 1, 32, 64))
-    for hook in hooks:
-        hook.remove()
-
-    assert output.shape == (1, 2, 32, 64)
-    assert pooled_output_shapes
-    assert all(tuple(shape[1:-1]) == (2, 4) for shape in pooled_output_shapes)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"deep_supervision": True}, "does not support deep supervision"),
-        ({"upsample_mode": "typo"}, "upsample_mode must be"),
-        ({"kernel_sizes": 2}, "kernel_sizes values must be odd"),
-        ({"se": {"max_grid_size": 0}}, "must be a positive integer or None"),
-        (
-            {
-                "strides": [[1, 1], [1, 2], [2, 2]],
-                "se": {"max_grid_size": 2},
-            },
-            "requires isotropic encoder stage strides",
-        ),
-    ],
-)
-def test_invalid_public_architecture_options_fail_early(overrides, message):
-    with pytest.raises(ValueError, match=message):
-        _small_model(**overrides)
-
-
-def test_per_stage_and_per_block_addon_configuration_builds_and_runs():
-    model = _small_model(
-        encoder_expansion_ratio=[1.0, 1.5, 2.0],
-        decoder_expansion_ratio=[1.5, 1.0],
-        se={"encoder": [[False], [True, False], [True]], "decoder": [[True], [False, True]]},
-        cc={
-            "encoder": [[False], [False, True], [False]],
-            "decoder": [[True], [False, False]],
-            "encoder_num_experts": [0, 2, 0],
-            "decoder_num_experts": [2, 0],
-        },
-    )
-    output = model(torch.randn(1, 1, 32, 32))
-    assert output.shape == (1, 2, 32, 32)
-
-
-def test_se_runs_between_projection_convolution_and_normalization():
-    model = _small_model(se={"encoder": [[True], [False, False], [False]]})
-    block = model.encoder.stages[0].blocks[0]
-    events = []
-    hooks = [
-        block.project.conv.register_forward_hook(lambda *_args: events.append("projection")),
-        block.se_block.register_forward_hook(lambda *_args: events.append("se")),
-        block.project.norm.register_forward_hook(lambda *_args: events.append("norm")),
-    ]
-    model(torch.randn(1, 1, 32, 32))
-    for hook in hooks:
-        hook.remove()
-    assert events[:3] == ["projection", "se", "norm"]
-
-
-def test_router_assignment_reuses_first_blocks_scores_for_each_group():
-    model = _small_model(
-        encoder_n_blocks_per_stage=[2, 2, 1],
-        cc={
-            "encoder": [[True, True], [False, False], [False]],
-            "encoder_num_experts": [2, 0, 0],
-            "encoder_router_assignment": [[0, 0], None, None],
-        },
-    )
-    first, second = model.encoder.stages[0].blocks
-    assert first.router is second.router
-    calls = []
-    routed_scores = []
-    hook = first.router.register_forward_hook(lambda *_args: calls.append(None))
-    score_hooks = [
-        block.expand.conv.register_forward_pre_hook(
-            lambda _module, inputs: routed_scores.append(inputs[1])
-        )
-        for block in (first, second)
-    ]
-    model(torch.randn(1, 1, 32, 32))
-    hook.remove()
-    for score_hook in score_hooks:
-        score_hook.remove()
-    assert len(calls) == 1
-    assert routed_scores[0] is routed_scores[1]
-
-
-def test_router_assignment_can_span_blocks_with_different_input_widths():
+def test_each_cc_block_has_an_independent_router():
     model = _small_model(
         cc={
             "encoder": [[False], [True, True], [False]],
             "encoder_num_experts": [0, 2, 0],
-            "encoder_router_assignment": [None, [0, 0], None],
         }
     )
-    first, second = model.encoder.stages[1].blocks
-    assert first.input_channels != second.input_channels
-    assert first.router is second.router
-    output = model(torch.randn(1, 1, 32, 32))
-    assert output.shape == (1, 2, 32, 32)
+    blocks = model.encoder.stages[1].blocks
+    assert isinstance(blocks[0].router, Router)
+    assert isinstance(blocks[1].router, Router)
+    assert blocks[0].router is not blocks[1].router
+
+
+def test_one_block_reuses_its_router_scores_for_both_pointwise_convolutions():
+    model = _small_model(
+        cc={
+            "encoder": [[True], [False, False], [False]],
+            "encoder_num_experts": [2, 0, 0],
+        }
+    )
+    block = model.encoder.stages[0].blocks[0]
+    routed_scores = []
+    handles = [
+        module.register_forward_pre_hook(
+            lambda _module, inputs: routed_scores.append(inputs[1])
+        )
+        for module in (block.expand.conv, block.project.conv)
+    ]
+    try:
+        model(torch.randn(2, 1, 32, 32))
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(routed_scores) == 2
+    assert routed_scores[0] is routed_scores[1]
+
+
+def test_model_forward_and_feature_map_accounting():
+    model = _small_model()
+    output = model(torch.randn(2, 1, 32, 48))
+    assert output.shape == (2, 2, 32, 48)
+    assert model.compute_conv_feature_map_size((32, 48)) > 0
+
+
+def test_decoder_stages_have_no_transposed_convolutions():
+    model = _small_model(stem={"stride": 2, "kernel_size": 3})
+    assert not any(
+        isinstance(module, nn.ConvTranspose2d)
+        for stage in model.decoder.stages
+        for module in stage.modules()
+    )
+    assert isinstance(model.decoder.seg_layer, nn.ConvTranspose2d)
+
+
+@pytest.mark.parametrize("obsolete_key", ["se", "upsample_mode"])
+def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
+    with pytest.raises(TypeError, match=obsolete_key):
+        _small_model(**{obsolete_key: None})
 
 
 @pytest.mark.parametrize(
-    ("assignment", "message"),
+    "obsolete_key",
     [
-        ([[None], [0, 1], None], "must be None when CC is disabled"),
-        ([[None], [-1, None], None], "must be a nonnegative integer"),
+        "reduction",
+        "max_grid_size",
+        "encoder_concat_global_context",
+        "decoder_concat_global_context",
+        "encoder_router_assignment",
+        "decoder_router_assignment",
     ],
 )
-def test_router_assignment_validation(assignment, message):
-    cc_blocks = [[False], [True, False], [False]]
-    with pytest.raises(ValueError, match=message):
-        _small_model(
-            cc={
-                "encoder": cc_blocks,
-                "encoder_num_experts": [0, 2, 0],
-                "encoder_router_assignment": assignment,
-            }
-        )
+def test_removed_cc_keys_are_rejected(obsolete_key):
+    with pytest.raises(TypeError, match=obsolete_key):
+        _small_model(cc={obsolete_key: None})
 
 
-def test_router_assignment_rejects_noncontiguous_ids():
-    with pytest.raises(ValueError, match="must form one contiguous run"):
-        _small_model(
-            encoder_n_blocks_per_stage=[1, 3, 1],
-            cc={
-                "encoder": [[False], [True, True, True], [False]],
-                "encoder_num_experts": [0, 2, 0],
-                "encoder_router_assignment": [None, [0, 1, 0], None],
-            },
-        )
+def test_public_config_and_model_signatures_exclude_removed_parameters():
+    cc_fields = set(CCConfig.__dataclass_fields__)
+    assert cc_fields == {
+        "encoder",
+        "decoder",
+        "encoder_num_experts",
+        "decoder_num_experts",
+        "encoder_num_groups",
+        "decoder_num_groups",
+    }
+    model_parameters = inspect.signature(CondUNet).parameters
+    assert "se" not in model_parameters
+    assert "upsample_mode" not in model_parameters
+
+
+def test_cc_requires_experts_when_enabled():
+    with pytest.raises(ValueError, match="num_experts is 0"):
+        _small_model(cc={"encoder": True})
