@@ -36,23 +36,21 @@ def _explicit_condconv(
     outputs = []
     for sample, sample_scores in zip(x, scores):
         grouped_scores = sample_scores.reshape(layer.num_groups, layer.num_experts)
-        grouped_delta = []
+        grouped_weight = []
         for group_idx in range(layer.num_groups):
-            delta = sum(
+            weight = sum(
                 grouped_scores[group_idx, expert_idx]
-                * layer.left_factor[expert_idx, group_idx]
-                @ layer.right_factor[expert_idx, group_idx]
+                * layer.expert_weights[expert_idx, group_idx]
                 for expert_idx in range(layer.num_experts)
             )
-            grouped_delta.append(delta)
+            grouped_weight.append(weight)
         if layer.group_on_out:
-            delta = torch.cat(grouped_delta, dim=0)
+            weight = torch.cat(grouped_weight, dim=0)
         else:
-            delta = torch.cat(grouped_delta, dim=1)
-        weight = layer.base_weight + delta
+            weight = torch.cat(grouped_weight, dim=1)
         outputs.append(
             torch.nn.functional.conv2d(
-                sample.unsqueeze(0), weight[:, :, None, None], layer.base_bias
+                sample.unsqueeze(0), weight[:, :, None, None]
             ).squeeze(0)
         )
     return torch.stack(outputs)
@@ -61,16 +59,13 @@ def _explicit_condconv(
 @pytest.mark.parametrize("group_on_out", [True, False])
 def test_condpwconv_matches_explicit_per_sample_mixture(group_on_out):
     layer = CondPWConv(
-        nn.Conv2d(4, 6, 1, bias=True),
+        nn.Conv2d(4, 6, 1, bias=False),
         num_experts=3,
-        rank=2,
         num_groups=2,
         group_on_out=group_on_out,
     )
-    with torch.no_grad():
-        layer.right_factor.normal_()
     x = torch.randn(2, 4, 5, 7)
-    scores = torch.sigmoid(torch.randn(2, 6))
+    scores = torch.softmax(torch.randn(2, 2, 3), dim=-1).flatten(1)
 
     actual = layer(x, scores)
     expected = _explicit_condconv(layer, x, scores)
@@ -78,26 +73,33 @@ def test_condpwconv_matches_explicit_per_sample_mixture(group_on_out):
     torch.testing.assert_close(actual, expected)
 
 
-def test_condpwconv_zero_initialized_factor_matches_base_convolution():
-    conv = nn.Conv2d(3, 4, 1, bias=True)
-    layer = CondPWConv(conv, num_experts=3, rank=2)
-    x = torch.randn(2, 3, 5, 7)
-    torch.testing.assert_close(layer(x, torch.randn(2, 3)), conv(x))
-
-
-def test_condpwconv_zero_initializes_one_low_rank_factor():
+@pytest.mark.parametrize(
+    ("group_on_out", "expected_shape"),
+    [(True, (3, 2, 3, 4)), (False, (3, 2, 6, 2))],
+)
+def test_condpwconv_stores_full_rank_grouped_expert_weights(
+    group_on_out, expected_shape
+):
     layer = CondPWConv(
-        nn.Conv2d(4, 6, 1),
+        nn.Conv2d(4, 6, 1, bias=False),
         num_experts=3,
-        rank=2,
         num_groups=2,
+        group_on_out=group_on_out,
     )
-    assert torch.count_nonzero(layer.left_factor) > 0
-    torch.testing.assert_close(layer.right_factor, torch.zeros_like(layer.right_factor))
+    assert layer.expert_weights.shape == expected_shape
+    assert torch.count_nonzero(layer.expert_weights) > 0
+    assert not hasattr(layer, "base_weight")
+    assert not hasattr(layer, "left_factor")
+    assert not hasattr(layer, "right_factor")
+
+
+def test_condpwconv_rejects_bias():
+    with pytest.raises(ValueError, match="bias-free"):
+        CondPWConv(nn.Conv2d(3, 4, 1, bias=True), num_experts=2)
 
 
 def test_condpwconv_rejects_tiled_scores():
-    layer = CondPWConv(nn.Conv2d(3, 4, 1), num_experts=2)
+    layer = CondPWConv(nn.Conv2d(3, 4, 1, bias=False), num_experts=2)
     with pytest.raises(ValueError, match="sample-level"):
         layer(torch.randn(1, 3, 4, 4), torch.randn(1, 2, 2, 2))
 
@@ -105,9 +107,8 @@ def test_condpwconv_rejects_tiled_scores():
 @pytest.mark.parametrize("group_on_out", [True, False])
 def test_grouped_expert_blending_has_expected_shape(group_on_out):
     layer = CondPWConv(
-        nn.Conv2d(4, 6, 1, bias=True),
+        nn.Conv2d(4, 6, 1, bias=False),
         num_experts=3,
-        rank=2,
         num_groups=2,
         group_on_out=group_on_out,
     )
@@ -130,35 +131,33 @@ def test_router_is_bottlenecked_and_uniformly_initialized():
     assert isinstance(router.nonlin, nn.LeakyReLU)
     assert router.nonlin.negative_slope == pytest.approx(0.2)
     assert router.nonlin.inplace
-    assert router.output_projection.out_features == 15
+    assert router.output_projection.out_features == 12
     torch.testing.assert_close(
         router.output_projection.weight,
         torch.zeros_like(router.output_projection.weight),
     )
 
-    grouped_bias = router.output_projection.bias.reshape(3, 5)
+    grouped_bias = router.output_projection.bias.reshape(3, 4)
     torch.testing.assert_close(
-        torch.nn.functional.softplus(grouped_bias[:, :4]),
+        torch.nn.functional.softplus(grouped_bias),
         torch.full((3, 4), 0.25),
     )
-    torch.testing.assert_close(torch.sigmoid(grouped_bias[:, 4]), torch.full((3,), 0.5))
 
     scores = router(torch.randn(2, 17, 4, 5)).reshape(2, 3, 4)
-    torch.testing.assert_close(scores, torch.full_like(scores, 0.125))
-    torch.testing.assert_close(scores.sum(dim=-1), torch.full((2, 3), 0.5))
+    torch.testing.assert_close(scores, torch.full_like(scores, 0.25))
+    torch.testing.assert_close(scores.sum(dim=-1), torch.ones(2, 3))
 
 
-def test_router_uses_softplus_normalized_mixture_and_sigmoid_strength():
+def test_router_uses_softplus_normalized_mixture():
     router = Router(3, 3, num_groups=1, reduction=2, nonlin=nn.ReLU)
     with torch.no_grad():
         router.output_projection.weight.zero_()
-        router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0, 1.5]))
+        router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
     raw_expert_scores = torch.nn.functional.softplus(torch.tensor([-2.0, 0.0, 2.0]))
     mixture = raw_expert_scores / raw_expert_scores.sum()
-    strength = torch.sigmoid(torch.tensor(1.5))
     actual = router(torch.randn(2, 3, 4, 5))
-    torch.testing.assert_close(actual, (mixture * strength).expand(2, -1))
-    torch.testing.assert_close(actual.sum(dim=-1), strength.expand(2))
+    torch.testing.assert_close(actual, mixture.expand(2, -1))
+    torch.testing.assert_close(actual.sum(dim=-1), torch.ones(2))
 
 
 def test_each_cc_block_has_an_independent_router():
@@ -264,8 +263,8 @@ def test_cc_group_counts_are_configured_per_encoder_and_decoder_stage():
     assert model.decoder.num_groups == [8, 4]
     assert model.encoder.stages[1].blocks[0].expand.conv.num_groups == 4
     assert model.decoder.stages[0].blocks[0].expand.conv.num_groups == 8
-    assert model.encoder.stages[1].blocks[0].router.output_projection.out_features == 12
-    assert model.decoder.stages[0].blocks[0].router.output_projection.out_features == 32
+    assert model.encoder.stages[1].blocks[0].router.output_projection.out_features == 8
+    assert model.decoder.stages[0].blocks[0].router.output_projection.out_features == 24
     model(torch.randn(1, 1, 32, 32))
 
 
@@ -300,6 +299,8 @@ def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
         "encoder_router_assignment",
         "decoder_router_assignment",
         "delta_scale",
+        "encoder_rank",
+        "decoder_rank",
     ],
 )
 def test_removed_cc_keys_are_rejected(obsolete_key):
@@ -314,8 +315,6 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "decoder",
         "encoder_num_experts",
         "decoder_num_experts",
-        "encoder_rank",
-        "decoder_rank",
         "encoder_num_groups",
         "decoder_num_groups",
         "reduction",

@@ -38,8 +38,6 @@ class CCConfig:
         decoder: Per-block CC enablement in the decoder.
         encoder_num_experts: Number of experts per encoder stage (int or per-stage list).
         decoder_num_experts: Number of experts per decoder stage.
-        encoder_rank: Low-rank expert delta rank per encoder stage.
-        decoder_rank: Low-rank expert delta rank per decoder stage.
         encoder_num_groups: Channel-wise routing granularity per encoder stage.
         decoder_num_groups: Channel-wise routing granularity per decoder stage.
         reduction: Reduction factor for the router MLP hidden width.
@@ -49,8 +47,6 @@ class CCConfig:
     decoder: BoolConfig = False
     encoder_num_experts: IntConfig = 0
     decoder_num_experts: IntConfig = 0
-    encoder_rank: IntConfig = 1
-    decoder_rank: IntConfig = 1
     encoder_num_groups: IntConfig = 1
     decoder_num_groups: IntConfig = 1
     reduction: float = 8.0
@@ -255,7 +251,7 @@ def _conv_output_shape(
 
 
 class Router(nn.Module):
-    """Global-average-pooling router with grouped expert and strength outputs."""
+    """Global-average-pooling router with grouped normalized expert outputs."""
 
     def __init__(
         self,
@@ -284,7 +280,7 @@ class Router(nn.Module):
             else nn.Identity()
         )
         self.output_projection = nn.Linear(
-            self.hidden_channels, num_groups * (num_experts + 1)
+            self.hidden_channels, num_groups * num_experts
         )
         self.reset_parameters()
 
@@ -293,12 +289,11 @@ class Router(nn.Module):
         expert_bias = math.log(math.expm1(1 / self.num_experts))
         grouped_bias = torch.empty(
             self.num_groups,
-            self.num_experts + 1,
+            self.num_experts,
             device=self.output_projection.bias.device,
             dtype=self.output_projection.bias.dtype,
         )
-        grouped_bias[:, : self.num_experts].fill_(expert_bias)
-        grouped_bias[:, self.num_experts].zero_()
+        grouped_bias.fill_(expert_bias)
         with torch.no_grad():
             self.output_projection.bias.copy_(grouped_bias.flatten())
 
@@ -306,22 +301,20 @@ class Router(nn.Module):
         descriptor = x.mean(dim=tuple(range(2, x.ndim)))
         logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
         grouped_logits = logits.reshape(
-            x.shape[0], self.num_groups, self.num_experts + 1
+            x.shape[0], self.num_groups, self.num_experts
         )
-        expert_scores = F.softplus(grouped_logits[..., : self.num_experts])
+        expert_scores = F.softplus(grouped_logits)
         expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
-        adaptation_strength = torch.sigmoid(grouped_logits[..., self.num_experts :])
-        return (expert_mixture * adaptation_strength).flatten(1)
+        return expert_mixture.flatten(1)
 
 
 class CondPWConv(nn.Module):
-    """Pointwise base convolution with grouped low-rank expert deltas."""
+    """Pointwise convolution with grouped full-rank expert weights."""
 
     def __init__(
         self,
         conv: _ConvNd,
         num_experts: int,
-        rank: int = 1,
         num_groups: int = 1,
         group_on_out: bool = True,
     ):
@@ -330,20 +323,18 @@ class CondPWConv(nn.Module):
             raise ValueError("num_experts must be greater than 0")
         if num_groups <= 0:
             raise ValueError("num_groups must be greater than 0")
-        if rank <= 0:
-            raise ValueError("rank must be greater than 0")
-
         if conv.groups != 1 or any(k != 1 for k in conv.kernel_size):
             raise ValueError(
                 "CondPWConv is only compatible with dense pointwise convolutions."
             )
+        if conv.bias is not None:
+            raise ValueError("CondPWConv only supports bias-free pointwise convolutions.")
 
         self.in_channels = conv.in_channels
         self.out_channels = conv.out_channels
         self.kernel_size = conv.kernel_size
         self.spatial_dims = len(conv.kernel_size)
         self.num_experts = num_experts
-        self.rank = rank
         self.num_groups = num_groups
         self.group_on_out = group_on_out
 
@@ -360,73 +351,42 @@ class CondPWConv(nn.Module):
 
         grouped_out = self.out_channels // num_groups if group_on_out else self.out_channels
         grouped_in = self.in_channels if group_on_out else self.in_channels // num_groups
-        if rank > min(grouped_out, grouped_in):
-            raise ValueError(
-                f"rank ({rank}) cannot exceed the grouped matrix dimensions "
-                f"({grouped_out}, {grouped_in})"
-            )
-
-        self.base_weight = nn.Parameter(
-            conv.weight.detach().reshape(self.out_channels, self.in_channels).clone()
-        )
-        if conv.bias is None:
-            self.register_parameter("base_bias", None)
-        else:
-            self.base_bias = nn.Parameter(conv.bias.detach().clone())
-
-        self.left_factor = nn.Parameter(
-            torch.empty(num_experts, num_groups, grouped_out, rank)
-        )
-        self.right_factor = nn.Parameter(
-            torch.empty(num_experts, num_groups, rank, grouped_in)
+        self.expert_weights = nn.Parameter(
+            conv.weight.new_empty(num_experts, num_groups, grouped_out, grouped_in)
         )
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.left_factor, a=math.sqrt(5))
-        nn.init.zeros_(self.right_factor)
+        for expert_group_weight in self.expert_weights.flatten(0, 1):
+            nn.init.kaiming_uniform_(expert_group_weight, a=math.sqrt(5))
 
     def _blend_experts(
         self, flat_scores: torch.Tensor
-    ) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
-        """Blend expert weights and biases using routing scores.
+    ) -> torch.Tensor:
+        """Blend expert weights using routing scores.
 
         Args:
             flat_scores: Shape ``[B, num_experts * num_groups]``.
 
         Returns:
             weight: ``[N, out_channels, in_channels]``
-            bias: ``[N, out_channels]`` or None
         """
         N = flat_scores.shape[0]
 
         G = self.num_groups
         E = self.num_experts
-        R = self.rank
         scores_grouped = flat_scores.reshape(N, G, E)
-        left = self.left_factor.permute(1, 0, 2, 3)
-        scaled_left = left.unsqueeze(0) * scores_grouped[..., None, None]
-        grouped_out = left.shape[2]
-        grouped_in = self.right_factor.shape[-1]
-        scaled_left = scaled_left.permute(0, 1, 3, 2, 4).reshape(
-            N * G, grouped_out, E * R
-        )
-        right = self.right_factor.permute(1, 0, 2, 3).reshape(G, E * R, grouped_in)
-        right = right.unsqueeze(0).expand(N, -1, -1, -1).reshape(
-            N * G, E * R, grouped_in
-        )
-        delta = torch.bmm(scaled_left, right).reshape(N, G, grouped_out, grouped_in)
+        expert_weights = self.expert_weights.permute(1, 0, 2, 3)
+        grouped_weight = torch.einsum("nge,geoi->ngoi", scores_grouped, expert_weights)
 
         if self.group_on_out:
-            weight = delta.reshape(N, self.out_channels, self.in_channels)
+            weight = grouped_weight.reshape(N, self.out_channels, self.in_channels)
         else:
-            weight = delta.permute(0, 2, 1, 3).reshape(
+            weight = grouped_weight.permute(0, 2, 1, 3).reshape(
                 N, self.out_channels, self.in_channels
             )
-        weight = weight + self.base_weight.unsqueeze(0)
-        bias = None if self.base_bias is None else self.base_bias.unsqueeze(0).expand(N, -1)
-        return weight, bias
+        return weight
 
     def _validate_scores(self, x: torch.Tensor, scores: torch.Tensor) -> None:
         expected_score_channels = self.num_experts * self.num_groups
@@ -447,10 +407,8 @@ class CondPWConv(nn.Module):
     def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
         self._validate_scores(x, scores)
-        weight, bias = self._blend_experts(scores)
+        weight = self._blend_experts(scores)
         output = torch.bmm(weight, x.flatten(2))
-        if bias is not None:
-            output = output + bias.unsqueeze(-1)
         return output.reshape(batch_size, self.out_channels, *x.shape[2:])
 
 
@@ -549,7 +507,6 @@ class _StageSettings:
     n_blocks: int
     expansion_ratio: float
     num_experts: int
-    rank: int
     num_groups: int
     cc_blocks: Tuple[bool, ...]
 
@@ -559,7 +516,6 @@ def _normalize_stage_settings(
     n_blocks_per_stage: Union[int, Sequence[int]],
     expansion_ratio: Union[float, Sequence[float]],
     num_experts: Union[int, Sequence[int]],
-    rank: Union[int, Sequence[int]],
     num_groups: Union[int, Sequence[int]],
     cc: BoolConfig,
     context: str,
@@ -572,9 +528,6 @@ def _normalize_stage_settings(
     )
     expert_counts = _expand_int_param(
         num_experts, n_stages, f"{context} num_experts", min_value=0
-    )
-    ranks = _expand_int_param(
-        rank, n_stages, f"{context} rank", min_value=1
     )
     group_counts = _expand_int_param(
         num_groups, n_stages, f"{context} num_groups", min_value=1
@@ -593,7 +546,6 @@ def _normalize_stage_settings(
                 n_blocks=block_counts[stage_idx],
                 expansion_ratio=expansion_ratios[stage_idx],
                 num_experts=expert_counts[stage_idx],
-                rank=ranks[stage_idx],
                 num_groups=group_counts[stage_idx],
                 cc_blocks=tuple(cc_blocks[stage_idx]),
             )
@@ -612,7 +564,6 @@ def _forward_routed_conv_block(
 def _expertify_pointwise(
     conv_block: ConvDropoutNormReLU,
     num_experts: int,
-    rank: int = 1,
     num_groups: int = 1,
     group_on_out: bool = True,
 ) -> None:
@@ -622,7 +573,6 @@ def _expertify_pointwise(
     conditional_conv = CondPWConv(
         conv,
         num_experts,
-        rank=rank,
         num_groups=num_groups,
         group_on_out=group_on_out,
     )
@@ -697,7 +647,6 @@ class InvertedBottleneckBlock(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        rank: int = 1,
         cc: bool = False,
         num_groups: int = 1,
         reduction: float = 8.0,
@@ -767,7 +716,6 @@ class InvertedBottleneckBlock(nn.Module):
 
         self.num_experts = num_experts if cc else 0
         self.num_groups = num_groups
-        self.rank = rank
         if cc:
             if num_experts <= 0:
                 raise ValueError(
@@ -792,14 +740,12 @@ class InvertedBottleneckBlock(nn.Module):
             _expertify_pointwise(
                 self.expand,
                 num_experts,
-                rank=rank,
                 num_groups=num_groups,
                 group_on_out=True,
             )
             _expertify_pointwise(
                 self.project,
                 num_experts,
-                rank=rank,
                 num_groups=num_groups,
                 group_on_out=False,
             )
@@ -853,7 +799,6 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         nonlin_kwargs: dict = None,
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
-        rank: int = 1,
         cc_config: List[bool] = None,
         num_groups: int = 1,
         reduction: float = 8.0,
@@ -889,7 +834,6 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 nonlin_kwargs=nonlin_kwargs,
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
-                rank=rank,
                 cc=block_cc,
                 num_groups=num_groups,
                 reduction=reduction,
@@ -948,7 +892,6 @@ class CondUNetEncoder(nn.Module):
         stem_kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
-        rank: Union[int, Sequence[int]] = 1,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
         reduction: float = 8.0,
@@ -1002,14 +945,12 @@ class CondUNetEncoder(nn.Module):
             n_blocks_per_stage,
             expansion_ratio,
             num_experts,
-            rank,
             num_groups,
             cc,
             "encoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
-        self.ranks = [settings.rank for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
@@ -1064,7 +1005,6 @@ class CondUNetEncoder(nn.Module):
                     nonlin_kwargs=nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
-                    rank=settings.rank,
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
                     reduction=reduction,
@@ -1124,7 +1064,6 @@ class CondUNetDecoder(nn.Module):
         deep_supervision: bool,
         expansion_ratio: Union[float, Sequence[float]] = 3.0,
         num_experts: Union[int, Sequence[int]] = 0,
-        rank: Union[int, Sequence[int]] = 1,
         cc: BoolConfig = False,
         num_groups: Union[int, Sequence[int]] = 1,
         reduction: float = 8.0,
@@ -1152,14 +1091,12 @@ class CondUNetDecoder(nn.Module):
             n_blocks_per_stage,
             expansion_ratio,
             num_experts,
-            rank,
             num_groups,
             cc,
             "decoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.num_groups = [settings.num_groups for settings in stage_settings]
-        self.ranks = [settings.rank for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
@@ -1186,7 +1123,6 @@ class CondUNetDecoder(nn.Module):
                     nonlin_kwargs=encoder.nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
-                    rank=settings.rank,
                     cc_config=list(settings.cc_blocks),
                     num_groups=settings.num_groups,
                     reduction=reduction,
@@ -1313,7 +1249,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_kernel_size=stem.kernel_size,
             stem_stride=stem.stride,
             num_experts=cc.encoder_num_experts,
-            rank=cc.encoder_rank,
             cc=cc.encoder,
             num_groups=cc.encoder_num_groups,
             reduction=cc.reduction,
@@ -1325,7 +1260,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             deep_supervision=deep_supervision,
             expansion_ratio=decoder_expansion_ratio,
             num_experts=cc.decoder_num_experts,
-            rank=cc.decoder_rank,
             cc=cc.decoder,
             num_groups=cc.decoder_num_groups,
             reduction=cc.reduction,
@@ -1354,11 +1288,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
     @staticmethod
     def initialize(module):
         if isinstance(module, CondPWConv):
-            nn.init.kaiming_normal_(module.base_weight, a=1e-2)
-            nn.init.kaiming_normal_(module.left_factor, a=1e-2)
-            nn.init.zeros_(module.right_factor)
-            if module.base_bias is not None:
-                nn.init.constant_(module.base_bias, 0)
+            for expert_group_weight in module.expert_weights.flatten(0, 1):
+                nn.init.kaiming_normal_(expert_group_weight, a=1e-2)
         InitWeights_He(1e-2)(module)
         # Zero-init the projection norm for residual blocks so that the residual
         # path starts as identity. This is safe because CondPWConv is not a
