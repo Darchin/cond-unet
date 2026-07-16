@@ -40,6 +40,9 @@ class CCConfig:
         decoder_num_experts: Number of experts per decoder stage.
         encoder_rank: Low-rank expert delta rank per encoder stage.
         decoder_rank: Low-rank expert delta rank per decoder stage.
+        encoder_num_groups: Channel-wise routing granularity per encoder stage.
+        decoder_num_groups: Channel-wise routing granularity per decoder stage.
+        reduction: Reduction factor for the router MLP hidden width.
     """
 
     encoder: BoolConfig = False
@@ -48,6 +51,19 @@ class CCConfig:
     decoder_num_experts: IntConfig = 0
     encoder_rank: IntConfig = 1
     decoder_rank: IntConfig = 1
+    encoder_num_groups: IntConfig = 1
+    decoder_num_groups: IntConfig = 1
+    reduction: float = 8.0
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.reduction, Real)
+            or isinstance(self.reduction, bool)
+            or not math.isfinite(self.reduction)
+            or self.reduction < 1
+        ):
+            raise ValueError("cc.reduction must be a finite number greater than or equal to 1")
+        self.reduction = float(self.reduction)
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -239,19 +255,63 @@ def _conv_output_shape(
 
 
 class Router(nn.Module):
-    """Global-average-pooling router with a direct sigmoid projection."""
+    """Global-average-pooling router with grouped expert and strength outputs."""
 
     def __init__(
         self,
         input_channels: int,
         num_experts: int,
+        num_groups: int = 1,
+        reduction: float = 8.0,
+        nonlin: Union[None, Type[nn.Module]] = None,
+        nonlin_kwargs: dict = None,
     ):
         super().__init__()
-        self.projection = nn.Linear(input_channels, num_experts)
+        if num_experts <= 0:
+            raise ValueError("num_experts must be greater than 0")
+        if num_groups <= 0:
+            raise ValueError("num_groups must be greater than 0")
+        if reduction < 1:
+            raise ValueError("reduction must be greater than or equal to 1")
+
+        self.num_experts = num_experts
+        self.num_groups = num_groups
+        self.hidden_channels = max(1, int(input_channels / reduction))
+        self.input_projection = nn.Linear(input_channels, self.hidden_channels)
+        self.nonlin = (
+            nonlin(**({} if nonlin_kwargs is None else nonlin_kwargs))
+            if nonlin is not None
+            else nn.Identity()
+        )
+        self.output_projection = nn.Linear(
+            self.hidden_channels, num_groups * (num_experts + 1)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.output_projection.weight)
+        expert_bias = math.log(math.expm1(1 / self.num_experts))
+        grouped_bias = torch.empty(
+            self.num_groups,
+            self.num_experts + 1,
+            device=self.output_projection.bias.device,
+            dtype=self.output_projection.bias.dtype,
+        )
+        grouped_bias[:, : self.num_experts].fill_(expert_bias)
+        grouped_bias[:, self.num_experts].zero_()
+        with torch.no_grad():
+            self.output_projection.bias.copy_(grouped_bias.flatten())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         descriptor = x.mean(dim=tuple(range(2, x.ndim)))
-        return torch.sigmoid(self.projection(descriptor))
+        logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
+        grouped_logits = logits.reshape(
+            x.shape[0], self.num_groups, self.num_experts + 1
+        )
+        expert_scores = F.softplus(grouped_logits[..., : self.num_experts])
+        expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
+        adaptation_strength = torch.sigmoid(grouped_logits[..., self.num_experts :])
+        return (expert_mixture * adaptation_strength).flatten(1)
 
 
 class CondPWConv(nn.Module):
@@ -490,6 +550,7 @@ class _StageSettings:
     expansion_ratio: float
     num_experts: int
     rank: int
+    num_groups: int
     cc_blocks: Tuple[bool, ...]
 
 
@@ -499,6 +560,7 @@ def _normalize_stage_settings(
     expansion_ratio: Union[float, Sequence[float]],
     num_experts: Union[int, Sequence[int]],
     rank: Union[int, Sequence[int]],
+    num_groups: Union[int, Sequence[int]],
     cc: BoolConfig,
     context: str,
 ) -> List[_StageSettings]:
@@ -513,6 +575,9 @@ def _normalize_stage_settings(
     )
     ranks = _expand_int_param(
         rank, n_stages, f"{context} rank", min_value=1
+    )
+    group_counts = _expand_int_param(
+        num_groups, n_stages, f"{context} num_groups", min_value=1
     )
     cc_blocks = _expand_block_config(cc, n_stages, block_counts, f"{context} cc")
 
@@ -529,6 +594,7 @@ def _normalize_stage_settings(
                 expansion_ratio=expansion_ratios[stage_idx],
                 num_experts=expert_counts[stage_idx],
                 rank=ranks[stage_idx],
+                num_groups=group_counts[stage_idx],
                 cc_blocks=tuple(cc_blocks[stage_idx]),
             )
         )
@@ -573,7 +639,8 @@ class DepthwiseConvBlock(nn.Module):
         channels: int,
         kernel_size: Union[int, List[int], Tuple[int, ...]],
         stride: Union[int, List[int], Tuple[int, ...]],
-        num_groups: int = 1,
+        norm_op: Union[None, Type[nn.Module]] = None,
+        norm_op_kwargs: dict = None,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
     ):
@@ -588,6 +655,7 @@ class DepthwiseConvBlock(nn.Module):
             conv_op, kernel_size, "kernel_size", require_odd=True
         )
         stride = _normalize_spatial_param(conv_op, stride, "stride")
+        norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
         self.conv = conv_op(
             channels,
@@ -598,7 +666,11 @@ class DepthwiseConvBlock(nn.Module):
             groups=channels,
             bias=False,
         )
-        self.norm = nn.GroupNorm(num_groups, channels)
+        self.norm = (
+            norm_op(channels, **norm_op_kwargs)
+            if norm_op is not None
+            else nn.Identity()
+        )
         self.nonlin = nonlin(**nonlin_kwargs) if nonlin is not None else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -628,6 +700,7 @@ class InvertedBottleneckBlock(nn.Module):
         rank: int = 1,
         cc: bool = False,
         num_groups: int = 1,
+        reduction: float = 8.0,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -636,10 +709,8 @@ class InvertedBottleneckBlock(nn.Module):
         kernel_size = _normalize_spatial_param(
             conv_op, kernel_size, "kernel_size", require_odd=True
         )
+        norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
-
-        if num_groups <= 0:
-            raise ValueError("num_groups must be greater than 0")
 
         self.expanded_channels = int(round(expansion_ratio * input_channels))
         if self.expanded_channels <= 0:
@@ -655,8 +726,8 @@ class InvertedBottleneckBlock(nn.Module):
             1,
             1,
             False,
-            lambda channels, **_: nn.GroupNorm(num_groups, channels),
-            {},
+            norm_op,
+            norm_op_kwargs,
             None,
             None,
             nonlin,
@@ -669,7 +740,8 @@ class InvertedBottleneckBlock(nn.Module):
             self.expanded_channels,
             kernel_size,
             self.stride,
-            num_groups,
+            norm_op,
+            norm_op_kwargs,
             nonlin,
             nonlin_kwargs,
         )
@@ -682,8 +754,8 @@ class InvertedBottleneckBlock(nn.Module):
             1,
             1,
             False,
-            lambda channels, **_: nn.GroupNorm(1, channels),
-            {},
+            norm_op,
+            norm_op_kwargs,
             None,
             None,
             None,
@@ -702,17 +774,34 @@ class InvertedBottleneckBlock(nn.Module):
                     f"CondConv is enabled (cc=True) but num_experts is {num_experts}. "
                     "num_experts must be greater than 0 to configure a dynamic mixture of experts."
                 )
+            if num_groups <= 0:
+                raise ValueError("num_groups must be greater than 0")
             if self.expanded_channels % num_groups != 0:
                 raise ValueError(
                     f"Expanded channels ({self.expanded_channels}) must be divisible by num_groups ({num_groups})"
                 )
 
-            self.router = Router(input_channels, num_experts * num_groups)
-            _expertify_pointwise(
-                self.expand, num_experts, rank=rank, num_groups=num_groups, group_on_out=True
+            self.router = Router(
+                input_channels,
+                num_experts,
+                num_groups=num_groups,
+                reduction=reduction,
+                nonlin=nonlin,
+                nonlin_kwargs=nonlin_kwargs,
             )
             _expertify_pointwise(
-                self.project, num_experts, rank=rank, num_groups=num_groups, group_on_out=False
+                self.expand,
+                num_experts,
+                rank=rank,
+                num_groups=num_groups,
+                group_on_out=True,
+            )
+            _expertify_pointwise(
+                self.project,
+                num_experts,
+                rank=rank,
+                num_groups=num_groups,
+                group_on_out=False,
             )
         else:
             self.router = None
@@ -767,6 +856,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         rank: int = 1,
         cc_config: List[bool] = None,
         num_groups: int = 1,
+        reduction: float = 8.0,
     ):
         super().__init__()
         if (
@@ -802,6 +892,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 rank=rank,
                 cc=block_cc,
                 num_groups=num_groups,
+                reduction=reduction,
             )
 
         self.blocks = nn.ModuleList(
@@ -859,7 +950,8 @@ class CondUNetEncoder(nn.Module):
         num_experts: Union[int, Sequence[int]] = 0,
         rank: Union[int, Sequence[int]] = 1,
         cc: BoolConfig = False,
-        num_groups: int = 1,
+        num_groups: Union[int, Sequence[int]] = 1,
+        reduction: float = 8.0,
     ):
         super().__init__()
         if (
@@ -911,11 +1003,12 @@ class CondUNetEncoder(nn.Module):
             expansion_ratio,
             num_experts,
             rank,
+            num_groups,
             cc,
             "encoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
-        self.num_groups = num_groups
+        self.num_groups = [settings.num_groups for settings in stage_settings]
         self.ranks = [settings.rank for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
@@ -937,7 +1030,7 @@ class CondUNetEncoder(nn.Module):
         )
         self.stem_stride = _normalize_spatial_param(conv_op, stem_stride, "stem.stride")
 
-        # Stem applies no non-linearity (only Conv + GroupNorm).
+        # Stem applies no non-linearity (only Conv + Norm).
         self.stem = StackedConvBlocks(
             1,
             conv_op,
@@ -946,8 +1039,8 @@ class CondUNetEncoder(nn.Module):
             self.stem_kernel_size,
             self.stem_stride,
             conv_bias,
-            lambda channels, **_: nn.GroupNorm(1, channels),
-            {},
+            norm_op,
+            norm_op_kwargs,
             dropout_op,
             dropout_op_kwargs,
             None,
@@ -973,7 +1066,8 @@ class CondUNetEncoder(nn.Module):
                     num_experts=settings.num_experts,
                     rank=settings.rank,
                     cc_config=list(settings.cc_blocks),
-                    num_groups=num_groups,
+                    num_groups=settings.num_groups,
+                    reduction=reduction,
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -983,8 +1077,8 @@ class CondUNetEncoder(nn.Module):
         self.strides = strides
         self.return_skips = return_skips
         self.conv_op = conv_op
-        self.norm_op = nn.GroupNorm
-        self.norm_op_kwargs = {}
+        self.norm_op = norm_op
+        self.norm_op_kwargs = norm_op_kwargs
         self.nonlin = nonlin
         self.nonlin_kwargs = nonlin_kwargs
         self.dropout_op = dropout_op
@@ -1032,7 +1126,8 @@ class CondUNetDecoder(nn.Module):
         num_experts: Union[int, Sequence[int]] = 0,
         rank: Union[int, Sequence[int]] = 1,
         cc: BoolConfig = False,
-        num_groups: int = 1,
+        num_groups: Union[int, Sequence[int]] = 1,
+        reduction: float = 8.0,
     ):
         super().__init__()
         if (
@@ -1058,11 +1153,12 @@ class CondUNetDecoder(nn.Module):
             expansion_ratio,
             num_experts,
             rank,
+            num_groups,
             cc,
             "decoder",
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
-        self.num_groups = num_groups
+        self.num_groups = [settings.num_groups for settings in stage_settings]
         self.ranks = [settings.rank for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
@@ -1084,15 +1180,16 @@ class CondUNetDecoder(nn.Module):
                     output_channels=input_features_skip,
                     kernel_size=encoder.kernel_sizes[target_stage_idx],
                     initial_stride=1,
-                    norm_op=None,
-                    norm_op_kwargs=None,
+                    norm_op=encoder.norm_op,
+                    norm_op_kwargs=encoder.norm_op_kwargs,
                     nonlin=encoder.nonlin,
                     nonlin_kwargs=encoder.nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
                     rank=settings.rank,
                     cc_config=list(settings.cc_blocks),
-                    num_groups=num_groups,
+                    num_groups=settings.num_groups,
+                    reduction=reduction,
                 )
             )
 
@@ -1102,7 +1199,13 @@ class CondUNetDecoder(nn.Module):
         head_output_padding = _transpose_output_padding(
             encoder.stem_kernel_size, encoder.stem_stride, head_padding
         )
-        self.seg_norm = nn.GroupNorm(1, encoder.output_channels[0])
+        self.seg_norm = (
+            encoder.norm_op(
+                encoder.output_channels[0], **(encoder.norm_op_kwargs or {})
+            )
+            if encoder.norm_op is not None
+            else nn.Identity()
+        )
         self.seg_layer = head_op(
             encoder.output_channels[0],
             num_classes,
@@ -1170,7 +1273,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         decoder_expansion_ratio: Union[float, Sequence[float]] = 3.0,
         stem: Union[StemConfig, dict, None] = None,
         cc: Union[CCConfig, dict, None] = None,
-        num_groups: int = 1,
     ):
         super().__init__()
         self.key_to_encoder = "encoder.stages"
@@ -1189,13 +1291,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         # Normalize config dataclasses (supports dict from JSON plans)
         stem = _normalize_config(stem, StemConfig)
         cc = _normalize_config(cc, CCConfig)
-        if (
-            not isinstance(num_groups, (int, np.integer))
-            or isinstance(num_groups, bool)
-            or num_groups <= 0
-        ):
-            raise ValueError("num_groups must be a positive integer")
-        num_groups = int(num_groups)
 
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,
@@ -1220,7 +1315,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             num_experts=cc.encoder_num_experts,
             rank=cc.encoder_rank,
             cc=cc.encoder,
-            num_groups=num_groups,
+            num_groups=cc.encoder_num_groups,
+            reduction=cc.reduction,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1231,7 +1327,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             num_experts=cc.decoder_num_experts,
             rank=cc.decoder_rank,
             cc=cc.decoder,
-            num_groups=num_groups,
+            num_groups=cc.decoder_num_groups,
+            reduction=cc.reduction,
         )
 
     def forward(self, x: torch.Tensor):

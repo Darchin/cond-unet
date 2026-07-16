@@ -533,21 +533,10 @@ class Phase2Planner(CondUNetPlanner):
                     "encoder": [False, True, True, True],
                     "encoder_num_experts": 4,
                     "encoder_rank": [1, 1, 2, 4],
+                    "encoder_num_groups": 16,
                 },
-                "num_groups": 16,
             },
-        },
-        "4x-m_cc-e16-g16": {
-            "inherits_from": "4x-m",
-            "arch_kwargs": {
-                "cc": {
-                    "encoder": [False, True, True, True],
-                    "encoder_num_experts": 16,
-                    "encoder_rank": [1, 1, 2, 4],
-                },
-                "num_groups": 16,
-            },
-        },
+        }
     }
 
     def __init__(
@@ -584,6 +573,64 @@ class Phase2Planner(CondUNetPlanner):
         return {
             name: self._phase_2_configuration(preset)
             for name, preset in self.phase_2_presets.items()
+        }
+
+class Phase3Planner(CondUNetPlanner):
+    phase_3_presets = {
+        "4x-m": {
+            "inherits_from": "4x",
+            "patch_size_multiplier": 6,
+            "arch_kwargs": {
+                "features_per_stage": [96, 192, 384, 768],
+            },
+        },
+        "4x-m_cc-e4-g1-spnorm": {
+            "inherits_from": "4x-m",
+            "arch_kwargs": {
+                "cc": {
+                    "encoder": [True, True, True, True],
+                    "encoder_num_experts": 4,
+                    "encoder_rank": [1, 2, 4, 8],
+                    "encoder_num_groups": 1,
+                },
+            },
+        }
+    }
+
+    def __init__(
+        self,
+        dataset_name_or_id: Union[str, int],
+        gpu_memory_target_in_gb: float = 8,
+        preprocessor_name: str = "DefaultPreprocessor",
+        plans_name: str = "nnUNetCondUNetPlans",
+        overwrite_target_spacing: Union[List[float], Tuple[float, ...]] = None,
+        suppress_transpose: bool = False,
+    ):
+        super().__init__(
+            dataset_name_or_id,
+            gpu_memory_target_in_gb,
+            preprocessor_name,
+            plans_name,
+            overwrite_target_spacing,
+            suppress_transpose,
+        )
+
+    @classmethod
+    def _phase_3_configuration(cls, preset: dict) -> dict:
+        configuration = {
+            "inherits_from": preset["inherits_from"],
+            "architecture": {
+                "arch_kwargs": deepcopy(preset["arch_kwargs"]),
+            },
+        }
+        if "patch_size_multiplier" in preset:
+            configuration["patch_size_multiplier"] = preset["patch_size_multiplier"]
+        return configuration
+
+    def _additional_configurations(self) -> dict:
+        return {
+            name: self._phase_3_configuration(preset)
+            for name, preset in self.phase_3_presets.items()
         }
 
 

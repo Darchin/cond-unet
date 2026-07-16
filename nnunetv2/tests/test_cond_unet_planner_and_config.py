@@ -193,17 +193,18 @@ class TestCondUNetPlannerHelpers(unittest.TestCase):
             [128, 256, 512, 1024],
         )
 
-    def test_phase_two_planner_uses_rank_and_global_groups(self):
+    def test_phase_two_planner_uses_rank_and_cc_groups(self):
         planner = Phase2Planner.__new__(Phase2Planner)
 
         configurations = planner._additional_configurations()
 
-        e4 = configurations["4x-m_cc-e4"]["architecture"]["arch_kwargs"]
-        self.assertEqual(e4["cc"]["encoder_rank"], 1)
-        self.assertNotIn("encoder_num_groups", e4["cc"])
-        grouped = configurations["4x-m_cc-e8-g8"]["architecture"]["arch_kwargs"]
-        self.assertEqual(grouped["num_groups"], 8)
-        self.assertEqual(grouped["cc"]["encoder_num_experts"], 8)
+        e4 = configurations["4x-m_cc-e4-g16"]["architecture"]["arch_kwargs"]
+        self.assertEqual(e4["cc"]["encoder_rank"], [1, 1, 2, 4])
+        self.assertEqual(e4["cc"]["encoder_num_groups"], 16)
+        self.assertNotIn("num_groups", e4)
+        e16 = configurations["4x-m_cc-e16-g16"]["architecture"]["arch_kwargs"]
+        self.assertEqual(e16["cc"]["encoder_num_experts"], 16)
+        self.assertEqual(e16["cc"]["encoder_num_groups"], 16)
 
     def test_phase_one_child_configuration_resolves_as_trainable(self):
         planner = self._minimal_planner(Phase1Planner)
