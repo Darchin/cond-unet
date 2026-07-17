@@ -303,7 +303,7 @@ class Router(nn.Module):
         grouped_logits = logits.reshape(
             x.shape[0], self.num_groups, self.num_experts
         )
-        expert_scores = F.softplus(grouped_logits)
+        expert_scores = F.sigmoid(grouped_logits)
         expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
         return expert_mixture.flatten(1)
 
