@@ -36,6 +36,86 @@ GridConfig = Union[
 ]
 
 
+def layer_norm(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Apply channel-first layer normalization.
+
+    Statistics are computed over the channel dimension independently for every
+    batch item and spatial location. ``input`` therefore has shape
+    ``(N, C, ...)``, while optional affine parameters have shape ``(C,)``.
+    """
+    if input.ndim < 2:
+        raise ValueError(
+            f"layer_norm expects an input with at least 2 dimensions, got {input.ndim}"
+        )
+    if weight is not None and weight.shape != (input.shape[1],):
+        raise ValueError(
+            f"weight must have shape ({input.shape[1]},), got {tuple(weight.shape)}"
+        )
+    if bias is not None and bias.shape != (input.shape[1],):
+        raise ValueError(
+            f"bias must have shape ({input.shape[1]},), got {tuple(bias.shape)}"
+        )
+
+    variance, mean = torch.var_mean(input, dim=1, correction=0, keepdim=True)
+    output = (input - mean) * torch.rsqrt(variance + eps)
+    affine_shape = (1, input.shape[1], *((1,) * (input.ndim - 2)))
+    if weight is not None:
+        output = output * weight.reshape(affine_shape)
+    if bias is not None:
+        output = output + bias.reshape(affine_shape)
+    return output
+
+
+class LayerNorm(nn.Module):
+    """Layer normalization for channel-first tensors of any spatial dimension."""
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ):
+        super().__init__()
+        if (
+            not isinstance(num_features, (int, np.integer))
+            or isinstance(num_features, bool)
+            or num_features <= 0
+        ):
+            raise ValueError("num_features must be a positive integer")
+        if not isinstance(eps, Real) or isinstance(eps, bool) or eps < 0:
+            raise ValueError("eps must be a non-negative number")
+        if not isinstance(affine, bool):
+            raise TypeError("affine must be a bool")
+
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.affine = affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(self.num_features))
+            self.bias = nn.Parameter(torch.zeros(self.num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim < 2 or input.shape[1] != self.num_features:
+            actual_features = input.shape[1] if input.ndim >= 2 else None
+            raise ValueError(
+                f"expected {self.num_features} channels, got {actual_features}"
+            )
+        return layer_norm(input, self.weight, self.bias, self.eps)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_features={self.num_features}, eps={self.eps}, affine={self.affine}"
+        )
+
+
 @dataclass
 class CCConfig:
     """CondConv (dense mixture-of-experts) addon configuration.
@@ -1510,6 +1590,13 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         stem = _normalize_config(stem, StemConfig)
         cc = _normalize_config(cc, CCConfig)
         se = _normalize_config(se, SEConfig)
+
+        # CondUNet intentionally uses channel-first LayerNorm throughout.
+        # Keep norm_op and norm_op_kwargs in the public signature for
+        # compatibility with nnU-Net architecture configurations, but ignore
+        # their values.
+        norm_op = LayerNorm
+        norm_op_kwargs = {}
 
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,

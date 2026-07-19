@@ -9,9 +9,11 @@ from nnunetv2.training.network_architecture.cond_unet import (
     CCConfig,
     CondPWConv,
     CondUNet,
+    LayerNorm,
     Router,
     SEConfig,
     SqueezeExcitation,
+    layer_norm,
 )
 
 
@@ -325,10 +327,43 @@ def test_decoder_stages_have_no_transposed_convolutions():
     assert isinstance(model.decoder.seg_layer, nn.ConvTranspose2d)
 
 
-def test_provided_normalization_is_used_throughout_model():
+@pytest.mark.parametrize("shape", [(2, 4, 9), (2, 4, 5, 7), (2, 4, 3, 5, 7)])
+def test_channel_first_layer_norm_matches_pytorch_reference(shape):
+    x = torch.randn(shape, dtype=torch.float64)
+    norm = LayerNorm(shape[1], eps=1e-4).double()
+
+    actual = norm(x)
+    expected = torch.nn.functional.layer_norm(
+        x.movedim(1, -1),
+        (shape[1],),
+        norm.weight,
+        norm.bias,
+        norm.eps,
+    ).movedim(-1, 1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_layer_norm_functional_and_non_affine_module_match():
+    x = torch.randn(2, 4, 5, 7)
+    norm = LayerNorm(num_features=4, affine=False)
+
+    assert norm.weight is None
+    assert norm.bias is None
+    torch.testing.assert_close(norm(x), layer_norm(x))
+
+
+@pytest.mark.parametrize(
+    ("norm_op", "norm_op_kwargs"),
+    [
+        (nn.BatchNorm2d, {"eps": 1e-3, "momentum": 0.2}),
+        (None, None),
+    ],
+)
+def test_model_ignores_normalization_arguments(norm_op, norm_op_kwargs):
     model = _small_model(
-        norm_op=nn.BatchNorm2d,
-        norm_op_kwargs={"eps": 1e-3, "momentum": 0.2},
+        norm_op=norm_op,
+        norm_op_kwargs=norm_op_kwargs,
     )
     encoder_block = model.encoder.stages[0].blocks[0]
     decoder_block = model.decoder.stages[0].blocks[0]
@@ -342,20 +377,9 @@ def test_provided_normalization_is_used_throughout_model():
         decoder_block.project.norm,
         model.decoder.seg_norm,
     ]
-    assert all(isinstance(norm, nn.BatchNorm2d) for norm in norms)
-    assert all(norm.eps == pytest.approx(1e-3) for norm in norms)
-    assert all(norm.momentum == pytest.approx(0.2) for norm in norms)
-    model(torch.randn(1, 1, 32, 32))
-
-
-def test_missing_normalization_uses_no_op_behavior():
-    model = _small_model(norm_op=None, norm_op_kwargs=None)
-    block = model.encoder.stages[0].blocks[0]
-    assert not hasattr(model.encoder.stem.convs[0], "norm")
-    assert not hasattr(block.expand, "norm")
-    assert isinstance(block.depthwise.norm, nn.Identity)
-    assert not hasattr(block.project, "norm")
-    assert isinstance(model.decoder.seg_norm, nn.Identity)
+    assert all(isinstance(norm, LayerNorm) for norm in norms)
+    assert all(norm.eps == pytest.approx(1e-5) for norm in norms)
+    assert all(norm.affine for norm in norms)
     model(torch.randn(1, 1, 32, 32))
 
 
