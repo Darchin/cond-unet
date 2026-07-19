@@ -1,4 +1,5 @@
 import inspect
+import itertools
 
 import pytest
 import torch
@@ -33,39 +34,33 @@ def _small_model(**overrides) -> CondUNet:
 def _explicit_condconv(
     layer: CondPWConv, x: torch.Tensor, scores: torch.Tensor
 ) -> torch.Tensor:
-    outputs = []
-    for sample, sample_scores in zip(x, scores):
-        grouped_scores = sample_scores.reshape(layer.num_groups, layer.num_experts)
-        grouped_weight = []
-        for group_idx in range(layer.num_groups):
-            weight = sum(
-                grouped_scores[group_idx, expert_idx]
-                * layer.expert_weights[expert_idx, group_idx]
-                for expert_idx in range(layer.num_experts)
+    output = torch.empty(x.shape[0], layer.out_channels, *x.shape[2:])
+    grid_size = scores.shape[1:-1]
+    tile_shape = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
+    for batch_idx in range(x.shape[0]):
+        for tile_idx in itertools.product(*(range(size) for size in grid_size)):
+            tile_slices = tuple(
+                slice(index * tile, (index + 1) * tile)
+                for index, tile in zip(tile_idx, tile_shape)
             )
-            grouped_weight.append(weight)
-        if layer.group_on_out:
-            weight = torch.cat(grouped_weight, dim=0)
-        else:
-            weight = torch.cat(grouped_weight, dim=1)
-        outputs.append(
-            torch.nn.functional.conv2d(
-                sample.unsqueeze(0), weight[:, :, None, None]
-            ).squeeze(0)
-        )
-    return torch.stack(outputs)
+            weight = torch.einsum(
+                "e,eoi->oi",
+                scores[(batch_idx, *tile_idx)],
+                layer.expert_weights,
+            )
+            tile_input = x[(batch_idx, slice(None), *tile_slices)].flatten(1)
+            tile_output = weight @ tile_input
+            output[(batch_idx, slice(None), *tile_slices)] = tile_output.reshape(
+                layer.out_channels, *tile_shape
+            )
+    return output
 
 
-@pytest.mark.parametrize("group_on_out", [True, False])
-def test_condpwconv_matches_explicit_per_sample_mixture(group_on_out):
-    layer = CondPWConv(
-        nn.Conv2d(4, 6, 1, bias=False),
-        num_experts=3,
-        num_groups=2,
-        group_on_out=group_on_out,
-    )
-    x = torch.randn(2, 4, 5, 7)
-    scores = torch.softmax(torch.randn(2, 2, 3), dim=-1).flatten(1)
+@pytest.mark.parametrize("grid_size", [(1, 1), (2, 3)])
+def test_condpwconv_matches_explicit_global_and_tiled_mixture(grid_size):
+    layer = CondPWConv(nn.Conv2d(4, 6, 1, bias=False), num_experts=3)
+    x = torch.randn(2, 4, 6, 9)
+    scores = torch.softmax(torch.randn(2, *grid_size, 3), dim=-1)
 
     actual = layer(x, scores)
     expected = _explicit_condconv(layer, x, scores)
@@ -73,20 +68,20 @@ def test_condpwconv_matches_explicit_per_sample_mixture(group_on_out):
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("group_on_out", "expected_shape"),
-    [(True, (3, 2, 3, 4)), (False, (3, 2, 6, 2))],
-)
-def test_condpwconv_stores_full_rank_grouped_expert_weights(
-    group_on_out, expected_shape
-):
-    layer = CondPWConv(
-        nn.Conv2d(4, 6, 1, bias=False),
-        num_experts=3,
-        num_groups=2,
-        group_on_out=group_on_out,
-    )
-    assert layer.expert_weights.shape == expected_shape
+def test_condpwconv_matches_explicit_tiled_3d_mixture():
+    layer = CondPWConv(nn.Conv3d(3, 4, 1, bias=False), num_experts=2)
+    x = torch.randn(1, 3, 4, 6, 8)
+    scores = torch.softmax(torch.randn(1, 2, 3, 2, 2), dim=-1)
+
+    actual = layer(x, scores)
+    expected = _explicit_condconv(layer, x, scores)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_condpwconv_stores_full_rank_expert_weights():
+    layer = CondPWConv(nn.Conv2d(4, 6, 1, bias=False), num_experts=3)
+    assert layer.expert_weights.shape == (3, 6, 4)
     assert torch.count_nonzero(layer.expert_weights) > 0
     assert not hasattr(layer, "base_weight")
     assert not hasattr(layer, "left_factor")
@@ -98,29 +93,23 @@ def test_condpwconv_rejects_bias():
         CondPWConv(nn.Conv2d(3, 4, 1, bias=True), num_experts=2)
 
 
-def test_condpwconv_rejects_tiled_scores():
+def test_condpwconv_rejects_non_divisible_tiles():
     layer = CondPWConv(nn.Conv2d(3, 4, 1, bias=False), num_experts=2)
-    with pytest.raises(ValueError, match="sample-level"):
-        layer(torch.randn(1, 3, 4, 4), torch.randn(1, 2, 2, 2))
+    with pytest.raises(ValueError, match="must be divisible by routing grid"):
+        layer(torch.randn(1, 3, 5, 4), torch.randn(1, 2, 2, 2))
 
 
-@pytest.mark.parametrize("group_on_out", [True, False])
-def test_grouped_expert_blending_has_expected_shape(group_on_out):
-    layer = CondPWConv(
-        nn.Conv2d(4, 6, 1, bias=False),
-        num_experts=3,
-        num_groups=2,
-        group_on_out=group_on_out,
-    )
-    output = layer(torch.randn(2, 4, 5, 5), torch.randn(2, 6))
-    assert output.shape == (2, 6, 5, 5)
+def test_tiled_expert_blending_has_expected_shape():
+    layer = CondPWConv(nn.Conv2d(4, 6, 1, bias=False), num_experts=3)
+    output = layer(torch.randn(2, 4, 6, 10), torch.randn(2, 2, 5, 3))
+    assert output.shape == (2, 6, 6, 10)
 
 
 def test_router_is_bottlenecked_and_uniformly_initialized():
     router = Router(
         17,
         4,
-        num_groups=3,
+        grid_size=(2, 3),
         reduction=8,
         nonlin=nn.LeakyReLU,
         nonlin_kwargs={"negative_slope": 0.2, "inplace": True},
@@ -131,33 +120,49 @@ def test_router_is_bottlenecked_and_uniformly_initialized():
     assert isinstance(router.nonlin, nn.LeakyReLU)
     assert router.nonlin.negative_slope == pytest.approx(0.2)
     assert router.nonlin.inplace
-    assert router.output_projection.out_features == 12
+    assert router.output_projection.out_features == 4
     torch.testing.assert_close(
         router.output_projection.weight,
         torch.zeros_like(router.output_projection.weight),
     )
 
-    grouped_bias = router.output_projection.bias.reshape(3, 4)
     torch.testing.assert_close(
-        torch.nn.functional.softplus(grouped_bias),
-        torch.full((3, 4), 0.25),
+        torch.nn.functional.softplus(router.output_projection.bias),
+        torch.full((4,), 0.25),
     )
 
-    scores = router(torch.randn(2, 17, 4, 5)).reshape(2, 3, 4)
+    scores = router(torch.randn(2, 17, 4, 6))
+    assert scores.shape == (2, 2, 3, 4)
     torch.testing.assert_close(scores, torch.full_like(scores, 0.25))
-    torch.testing.assert_close(scores.sum(dim=-1), torch.ones(2, 3))
+    torch.testing.assert_close(scores.sum(dim=-1), torch.ones(2, 2, 3))
 
 
-def test_router_uses_softplus_normalized_mixture():
-    router = Router(3, 3, num_groups=1, reduction=2, nonlin=nn.ReLU)
+def test_router_uses_sigmoid_normalized_mixture():
+    router = Router(3, 3, grid_size=1, reduction=2, nonlin=nn.ReLU)
     with torch.no_grad():
         router.output_projection.weight.zero_()
         router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
-    raw_expert_scores = torch.nn.functional.softplus(torch.tensor([-2.0, 0.0, 2.0]))
+    raw_expert_scores = torch.sigmoid(torch.tensor([-2.0, 0.0, 2.0]))
     mixture = raw_expert_scores / raw_expert_scores.sum()
     actual = router(torch.randn(2, 3, 4, 5))
-    torch.testing.assert_close(actual, mixture.expand(2, -1))
-    torch.testing.assert_close(actual.sum(dim=-1), torch.ones(2))
+    assert actual.shape == (2, 1, 1, 3)
+    torch.testing.assert_close(actual, mixture.expand(2, 1, 1, -1))
+    torch.testing.assert_close(actual.sum(dim=-1), torch.ones(2, 1, 1))
+
+
+def test_router_uses_adaptive_average_pooling_for_tile_descriptors():
+    router = Router(2, 3, grid_size=(2, 3), reduction=2, nonlin=nn.ReLU)
+    descriptors = []
+    handle = router.input_projection.register_forward_pre_hook(
+        lambda _module, inputs: descriptors.append(inputs[0].detach().clone())
+    )
+    x = torch.arange(48, dtype=torch.float32).reshape(1, 2, 4, 6)
+    try:
+        router(x)
+    finally:
+        handle.remove()
+    expected = torch.nn.functional.adaptive_avg_pool2d(x, (2, 3)).movedim(1, -1)
+    torch.testing.assert_close(descriptors[0], expected)
 
 
 def test_each_cc_block_has_an_independent_router():
@@ -248,24 +253,64 @@ def test_missing_normalization_uses_no_op_behavior():
     model(torch.randn(1, 1, 32, 32))
 
 
-def test_cc_group_counts_are_configured_per_encoder_and_decoder_stage():
+def test_cc_grid_sizes_are_configured_per_encoder_and_decoder_stage():
     model = _small_model(
         cc={
             "encoder": True,
             "decoder": True,
             "encoder_num_experts": 2,
             "decoder_num_experts": 3,
-            "encoder_num_groups": [2, 4, 8],
-            "decoder_num_groups": [8, 4],
+            "encoder_grid_size": [[1, 1], [2, 2], [1, 2]],
+            "decoder_grid_size": [[2, 2], [4, 2]],
         }
     )
-    assert model.encoder.num_groups == [2, 4, 8]
-    assert model.decoder.num_groups == [8, 4]
-    assert model.encoder.stages[1].blocks[0].expand.conv.num_groups == 4
-    assert model.decoder.stages[0].blocks[0].expand.conv.num_groups == 8
-    assert model.encoder.stages[1].blocks[0].router.output_projection.out_features == 8
-    assert model.decoder.stages[0].blocks[0].router.output_projection.out_features == 24
+    assert model.encoder.grid_sizes == [(1, 1), (2, 2), (1, 2)]
+    assert model.decoder.grid_sizes == [(2, 2), (4, 2)]
+    assert model.encoder.stages[1].blocks[0].grid_size == (2, 2)
+    assert model.decoder.stages[0].blocks[0].grid_size == (2, 2)
+    assert model.encoder.stages[1].blocks[0].router.output_projection.out_features == 2
+    assert model.decoder.stages[0].blocks[0].router.output_projection.out_features == 3
     model(torch.randn(1, 1, 32, 32))
+
+
+def test_one_grid_shape_is_broadcast_to_every_stage():
+    model = _small_model(
+        cc={
+            "encoder_grid_size": [2, 1],
+            "decoder_grid_size": 2,
+        }
+    )
+    assert model.encoder.grid_sizes == [(2, 1)] * 3
+    assert model.decoder.grid_sizes == [(2, 2)] * 2
+
+
+def test_strided_cc_block_validates_projection_feature_map_divisibility():
+    model = _small_model(
+        cc={
+            "encoder": [[False], [True, False], [False]],
+            "encoder_num_experts": [0, 2, 0],
+            "encoder_grid_size": [[1, 1], [32, 1], [1, 1]],
+        }
+    )
+    with pytest.raises(ValueError, match=r"spatial shape \(16, 16\).*routing grid"):
+        model(torch.randn(1, 1, 32, 32))
+
+
+def test_tiled_cc_model_backward_populates_router_and_expert_gradients():
+    model = _small_model(
+        cc={
+            "encoder": [[False], [True, False], [False]],
+            "encoder_num_experts": [0, 2, 0],
+            "encoder_grid_size": [[1, 1], [2, 2], [1, 1]],
+        }
+    )
+    block = model.encoder.stages[1].blocks[0]
+
+    model(torch.randn(1, 1, 32, 32)).mean().backward()
+
+    assert block.router.output_projection.weight.grad is not None
+    assert block.expand.conv.expert_weights.grad is not None
+    assert block.project.conv.expert_weights.grad is not None
 
 
 def test_cc_router_settings_are_propagated():
@@ -274,12 +319,13 @@ def test_cc_router_settings_are_propagated():
         cc={
             "encoder": [[True], [False, False], [False]],
             "encoder_num_experts": 2,
-            "encoder_num_groups": 2,
+            "encoder_grid_size": [2, 1],
             "reduction": 4.0,
         },
     )
     block = model.encoder.stages[0].blocks[0]
     assert block.router.hidden_channels == 2
+    assert block.router.grid_size == (2, 1)
     assert isinstance(block.router.nonlin, nn.ReLU)
     assert block.router.nonlin.inplace
 
@@ -301,6 +347,8 @@ def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
         "delta_scale",
         "encoder_rank",
         "decoder_rank",
+        "encoder_num_groups",
+        "decoder_num_groups",
     ],
 )
 def test_removed_cc_keys_are_rejected(obsolete_key):
@@ -315,8 +363,8 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "decoder",
         "encoder_num_experts",
         "decoder_num_experts",
-        "encoder_num_groups",
-        "decoder_num_groups",
+        "encoder_grid_size",
+        "decoder_grid_size",
         "reduction",
     }
     model_parameters = inspect.signature(CondUNet).parameters
@@ -325,10 +373,18 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
     assert "num_groups" not in model_parameters
 
 
-@pytest.mark.parametrize("groups", [0, [1, 2]])
-def test_cc_group_counts_are_validated(groups):
-    with pytest.raises((ValueError, TypeError), match="encoder num_groups"):
-        _small_model(cc={"encoder_num_groups": groups})
+@pytest.mark.parametrize(
+    ("grid_size", "error"),
+    [
+        (0, "positive"),
+        ([1, 2, 3], "grid shape"),
+        ([[1, 1], [2, 2]], "exactly 3"),
+        ([[1, 1], [2, 0], [1, 1]], "positive"),
+    ],
+)
+def test_cc_grid_sizes_are_validated(grid_size, error):
+    with pytest.raises((ValueError, TypeError), match=error):
+        _small_model(cc={"encoder_grid_size": grid_size})
 
 
 def test_cc_requires_experts_when_enabled():

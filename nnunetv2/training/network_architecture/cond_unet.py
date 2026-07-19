@@ -27,6 +27,13 @@ from torch.nn.modules.dropout import _DropoutNd
 BoolConfig = Union[bool, List[bool], List[List[bool]]]
 IntConfig = Union[int, List[int], Tuple[int, ...]]
 KernelConfig = Union[int, List[int], Tuple[int, ...]]
+GridConfig = Union[
+    int,
+    List[int],
+    Tuple[int, ...],
+    List[List[int]],
+    Tuple[Tuple[int, ...], ...],
+]
 
 
 @dataclass
@@ -38,8 +45,10 @@ class CCConfig:
         decoder: Per-block CC enablement in the decoder.
         encoder_num_experts: Number of experts per encoder stage (int or per-stage list).
         decoder_num_experts: Number of experts per decoder stage.
-        encoder_num_groups: Channel-wise routing granularity per encoder stage.
-        decoder_num_groups: Channel-wise routing granularity per decoder stage.
+        encoder_grid_size: Routing grid shape shared by all encoder stages or
+            one grid shape per encoder stage.
+        decoder_grid_size: Routing grid shape shared by all decoder stages or
+            one grid shape per decoder stage.
         reduction: Reduction factor for the router MLP hidden width.
     """
 
@@ -47,8 +56,8 @@ class CCConfig:
     decoder: BoolConfig = False
     encoder_num_experts: IntConfig = 0
     decoder_num_experts: IntConfig = 0
-    encoder_num_groups: IntConfig = 1
-    decoder_num_groups: IntConfig = 1
+    encoder_grid_size: GridConfig = 1
+    decoder_grid_size: GridConfig = 1
     reduction: float = 8.0
 
     def __post_init__(self):
@@ -251,13 +260,13 @@ def _conv_output_shape(
 
 
 class Router(nn.Module):
-    """Global-average-pooling router with grouped normalized expert outputs."""
+    """Adaptive-average-pooling router with one expert mixture per grid cell."""
 
     def __init__(
         self,
         input_channels: int,
         num_experts: int,
-        num_groups: int = 1,
+        grid_size: Union[int, Sequence[int]] = 1,
         reduction: float = 8.0,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
@@ -265,13 +274,11 @@ class Router(nn.Module):
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts must be greater than 0")
-        if num_groups <= 0:
-            raise ValueError("num_groups must be greater than 0")
         if reduction < 1:
             raise ValueError("reduction must be greater than or equal to 1")
 
         self.num_experts = num_experts
-        self.num_groups = num_groups
+        self.grid_size = grid_size
         self.hidden_channels = max(1, int(input_channels / reduction))
         self.input_projection = nn.Linear(input_channels, self.hidden_channels)
         self.nonlin = (
@@ -279,50 +286,62 @@ class Router(nn.Module):
             if nonlin is not None
             else nn.Identity()
         )
-        self.output_projection = nn.Linear(
-            self.hidden_channels, num_groups * num_experts
-        )
+        self.output_projection = nn.Linear(self.hidden_channels, num_experts)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.zeros_(self.output_projection.weight)
         expert_bias = math.log(math.expm1(1 / self.num_experts))
-        grouped_bias = torch.empty(
-            self.num_groups,
-            self.num_experts,
-            device=self.output_projection.bias.device,
-            dtype=self.output_projection.bias.dtype,
-        )
-        grouped_bias.fill_(expert_bias)
         with torch.no_grad():
-            self.output_projection.bias.copy_(grouped_bias.flatten())
+            self.output_projection.bias.fill_(expert_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        descriptor = x.mean(dim=tuple(range(2, x.ndim)))
-        logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
-        grouped_logits = logits.reshape(
-            x.shape[0], self.num_groups, self.num_experts
+        spatial_dims = x.ndim - 2
+        grid_size = (
+            (int(self.grid_size),) * spatial_dims
+            if isinstance(self.grid_size, (int, np.integer))
+            else tuple(self.grid_size)
         )
-        expert_scores = F.sigmoid(grouped_logits)
+        if len(grid_size) != spatial_dims:
+            raise ValueError(
+                f"grid_size must contain exactly {spatial_dims} values, got {len(grid_size)}"
+            )
+        if any(
+            not isinstance(grid, (int, np.integer))
+            or isinstance(grid, bool)
+            or grid <= 0
+            for grid in grid_size
+        ):
+            raise ValueError("grid_size values must be positive integers")
+        grid_size = tuple(int(grid) for grid in grid_size)
+        if any(size % grid for size, grid in zip(x.shape[2:], grid_size)):
+            raise ValueError(
+                f"input spatial shape {tuple(x.shape[2:])} must be divisible by routing grid {grid_size}"
+            )
+
+        adaptive_avg_pool = (
+            F.adaptive_avg_pool1d,
+            F.adaptive_avg_pool2d,
+            F.adaptive_avg_pool3d,
+        )[spatial_dims - 1]
+        descriptor = adaptive_avg_pool(x, grid_size).movedim(1, -1)
+        logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
+        expert_scores = F.sigmoid(logits)
         expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
-        return expert_mixture.flatten(1)
+        return expert_mixture
 
 
 class CondPWConv(nn.Module):
-    """Pointwise convolution with grouped full-rank expert weights."""
+    """Pointwise convolution with one full-rank expert mixture per spatial tile."""
 
     def __init__(
         self,
         conv: _ConvNd,
         num_experts: int,
-        num_groups: int = 1,
-        group_on_out: bool = True,
     ):
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts must be greater than 0")
-        if num_groups <= 0:
-            raise ValueError("num_groups must be greater than 0")
         if conv.groups != 1 or any(k != 1 for k in conv.kernel_size):
             raise ValueError(
                 "CondPWConv is only compatible with dense pointwise convolutions."
@@ -335,31 +354,15 @@ class CondPWConv(nn.Module):
         self.kernel_size = conv.kernel_size
         self.spatial_dims = len(conv.kernel_size)
         self.num_experts = num_experts
-        self.num_groups = num_groups
-        self.group_on_out = group_on_out
-
-        if self.group_on_out:
-            if self.out_channels % num_groups != 0:
-                raise ValueError(
-                    f"out_channels ({self.out_channels}) must be divisible by num_groups ({num_groups}) when group_on_out=True"
-                )
-        else:
-            if self.in_channels % num_groups != 0:
-                raise ValueError(
-                    f"in_channels ({self.in_channels}) must be divisible by num_groups ({num_groups}) when group_on_out=False"
-                )
-
-        grouped_out = self.out_channels // num_groups if group_on_out else self.out_channels
-        grouped_in = self.in_channels if group_on_out else self.in_channels // num_groups
         self.expert_weights = nn.Parameter(
-            conv.weight.new_empty(num_experts, num_groups, grouped_out, grouped_in)
+            conv.weight.new_empty(num_experts, self.out_channels, self.in_channels)
         )
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        for expert_group_weight in self.expert_weights.flatten(0, 1):
-            nn.init.kaiming_uniform_(expert_group_weight, a=math.sqrt(5))
+        for expert_weight in self.expert_weights:
+            nn.init.kaiming_uniform_(expert_weight, a=math.sqrt(5))
 
     def _blend_experts(
         self, flat_scores: torch.Tensor
@@ -367,49 +370,83 @@ class CondPWConv(nn.Module):
         """Blend expert weights using routing scores.
 
         Args:
-            flat_scores: Shape ``[B, num_experts * num_groups]``.
+            flat_scores: Shape ``[N, num_experts]`` where ``N`` is the batch
+                size multiplied by the number of routing tiles.
 
         Returns:
             weight: ``[N, out_channels, in_channels]``
         """
-        N = flat_scores.shape[0]
-
-        G = self.num_groups
-        E = self.num_experts
-        scores_grouped = flat_scores.reshape(N, G, E)
-        expert_weights = self.expert_weights.permute(1, 0, 2, 3)
-        grouped_weight = torch.einsum("nge,geoi->ngoi", scores_grouped, expert_weights)
-
-        if self.group_on_out:
-            weight = grouped_weight.reshape(N, self.out_channels, self.in_channels)
-        else:
-            weight = grouped_weight.permute(0, 2, 1, 3).reshape(
-                N, self.out_channels, self.in_channels
-            )
-        return weight
+        return torch.mm(flat_scores, self.expert_weights.flatten(1)).reshape(
+            flat_scores.shape[0], self.out_channels, self.in_channels
+        )
 
     def _validate_scores(self, x: torch.Tensor, scores: torch.Tensor) -> None:
-        expected_score_channels = self.num_experts * self.num_groups
         if scores.shape[0] != x.shape[0]:
             raise ValueError(
                 f"router score batch size ({scores.shape[0]}) does not match input batch size ({x.shape[0]})"
             )
-        if scores.shape[-1] != expected_score_channels:
+        if scores.shape[-1] != self.num_experts:
             raise ValueError(
-                f"router scores must have {expected_score_channels} values per sample/tile, "
+                f"router scores must have {self.num_experts} values per tile, "
                 f"got {scores.shape[-1]}"
             )
-        if scores.ndim != 2:
+        expected_ndim = self.spatial_dims + 2
+        if scores.ndim != expected_ndim:
             raise ValueError(
-                f"router scores must be sample-level (2D), got {scores.ndim}D"
+                f"router scores must have shape [batch, *grid_size, num_experts] "
+                f"({expected_ndim}D), got {scores.ndim}D"
             )
 
+    def _flatten_tiles(
+        self, x: torch.Tensor, grid_size: Sequence[int]
+    ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+        spatial_shape = x.shape[2:]
+        if any(size % grid for size, grid in zip(spatial_shape, grid_size)):
+            raise ValueError(
+                f"input spatial shape {tuple(spatial_shape)} must be divisible by routing grid {tuple(grid_size)}"
+            )
+
+        tile_shape = tuple(size // grid for size, grid in zip(spatial_shape, grid_size))
+        split_shape = [x.shape[0], self.in_channels]
+        for grid, tile in zip(grid_size, tile_shape):
+            split_shape.extend((grid, tile))
+        grid_axes = list(range(2, 2 + 2 * self.spatial_dims, 2))
+        tile_axes = list(range(3, 2 + 2 * self.spatial_dims, 2))
+        tiled_input = (
+            x.reshape(split_shape)
+            .permute(0, *grid_axes, 1, *tile_axes)
+            .reshape(-1, self.in_channels, math.prod(tile_shape))
+        )
+        return tiled_input, tile_shape
+
+    def _restore_tiles(
+        self,
+        output: torch.Tensor,
+        batch_size: int,
+        grid_size: Sequence[int],
+        tile_shape: Sequence[int],
+    ) -> torch.Tensor:
+        tiled_shape = [batch_size, *grid_size, self.out_channels, *tile_shape]
+        channel_axis = 1 + self.spatial_dims
+        spatial_axes = []
+        for dim in range(self.spatial_dims):
+            spatial_axes.extend((1 + dim, channel_axis + 1 + dim))
+        spatial_shape = tuple(
+            grid * tile for grid, tile in zip(grid_size, tile_shape)
+        )
+        return (
+            output.reshape(tiled_shape)
+            .permute(0, channel_axis, *spatial_axes)
+            .reshape(batch_size, self.out_channels, *spatial_shape)
+        )
+
     def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        batch_size = x.shape[0]
         self._validate_scores(x, scores)
-        weight = self._blend_experts(scores)
-        output = torch.bmm(weight, x.flatten(2))
-        return output.reshape(batch_size, self.out_channels, *x.shape[2:])
+        grid_size = tuple(int(grid) for grid in scores.shape[1:-1])
+        tiled_input, tile_shape = self._flatten_tiles(x, grid_size)
+        weight = self._blend_experts(scores.reshape(-1, self.num_experts))
+        output = torch.bmm(weight, tiled_input)
+        return self._restore_tiles(output, x.shape[0], grid_size, tile_shape)
 
 
 def _expand_expansion_ratios(
@@ -445,6 +482,54 @@ def _expand_int_param(
     ):
         raise ValueError(f"{name} values must be integers >= {min_value}")
     return [int(v) for v in values]
+
+
+def _expand_grid_sizes(
+    conv_op: Type[_ConvNd],
+    value: GridConfig,
+    n_stages: int,
+    name: str,
+) -> List[Tuple[int, ...]]:
+    """Normalize an isotropic scalar, one spatial grid, or per-stage grids."""
+    spatial_dims = convert_conv_op_to_dim(conv_op)
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        grid = tuple(_normalize_spatial_param(conv_op, int(value), name))
+        return [grid] * n_stages
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        raise TypeError(
+            f"{name} must be a positive integer, a {spatial_dims}D grid shape, "
+            "or a sequence containing one grid shape per stage"
+        )
+
+    values = list(value)
+    if len(values) == spatial_dims and all(
+        isinstance(item, (int, np.integer)) and not isinstance(item, bool)
+        for item in values
+    ):
+        grid = tuple(_normalize_spatial_param(conv_op, values, name))
+        return [grid] * n_stages
+    if any(
+        not isinstance(stage_grid, (list, tuple, np.ndarray))
+        for stage_grid in values
+    ):
+        raise ValueError(
+            f"{name} must be one {spatial_dims}D grid shape or a nested sequence "
+            "containing one grid shape per stage"
+        )
+    if len(values) != n_stages:
+        raise ValueError(
+            f"{name} must be one {spatial_dims}D grid shape or contain exactly "
+            f"{n_stages} per-stage grid shapes, got {len(values)} values"
+        )
+
+    return [
+        tuple(
+            _normalize_spatial_param(
+                conv_op, stage_grid, f"{name}[{stage_idx}]"
+            )
+        )
+        for stage_idx, stage_grid in enumerate(values)
+    ]
 
 
 def _expand_block_config(
@@ -507,7 +592,7 @@ class _StageSettings:
     n_blocks: int
     expansion_ratio: float
     num_experts: int
-    num_groups: int
+    grid_size: Tuple[int, ...]
     cc_blocks: Tuple[bool, ...]
 
 
@@ -516,9 +601,10 @@ def _normalize_stage_settings(
     n_blocks_per_stage: Union[int, Sequence[int]],
     expansion_ratio: Union[float, Sequence[float]],
     num_experts: Union[int, Sequence[int]],
-    num_groups: Union[int, Sequence[int]],
+    grid_size: GridConfig,
     cc: BoolConfig,
     context: str,
+    conv_op: Type[_ConvNd],
 ) -> List[_StageSettings]:
     block_counts = _expand_int_param(
         n_blocks_per_stage, n_stages, f"{context} n_blocks_per_stage", min_value=1
@@ -529,8 +615,8 @@ def _normalize_stage_settings(
     expert_counts = _expand_int_param(
         num_experts, n_stages, f"{context} num_experts", min_value=0
     )
-    group_counts = _expand_int_param(
-        num_groups, n_stages, f"{context} num_groups", min_value=1
+    grid_sizes = _expand_grid_sizes(
+        conv_op, grid_size, n_stages, f"{context} grid_size"
     )
     cc_blocks = _expand_block_config(cc, n_stages, block_counts, f"{context} cc")
 
@@ -546,7 +632,7 @@ def _normalize_stage_settings(
                 n_blocks=block_counts[stage_idx],
                 expansion_ratio=expansion_ratios[stage_idx],
                 num_experts=expert_counts[stage_idx],
-                num_groups=group_counts[stage_idx],
+                grid_size=grid_sizes[stage_idx],
                 cc_blocks=tuple(cc_blocks[stage_idx]),
             )
         )
@@ -564,18 +650,11 @@ def _forward_routed_conv_block(
 def _expertify_pointwise(
     conv_block: ConvDropoutNormReLU,
     num_experts: int,
-    num_groups: int = 1,
-    group_on_out: bool = True,
 ) -> None:
     conv = conv_block.conv
     if conv.groups != 1 or any(kernel_size != 1 for kernel_size in conv.kernel_size):
         raise ValueError("CondMobileNet only expertifies dense pointwise convolutions")
-    conditional_conv = CondPWConv(
-        conv,
-        num_experts,
-        num_groups=num_groups,
-        group_on_out=group_on_out,
-    )
+    conditional_conv = CondPWConv(conv, num_experts)
     conv_block.conv = conditional_conv
     conv_block.all_modules[0] = conditional_conv
 
@@ -648,7 +727,7 @@ class InvertedBottleneckBlock(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc: bool = False,
-        num_groups: int = 1,
+        grid_size: Union[int, Sequence[int]] = 1,
         reduction: float = 8.0,
     ):
         super().__init__()
@@ -715,40 +794,23 @@ class InvertedBottleneckBlock(nn.Module):
         )
 
         self.num_experts = num_experts if cc else 0
-        self.num_groups = num_groups
+        self.grid_size = grid_size
         if cc:
             if num_experts <= 0:
                 raise ValueError(
                     f"CondConv is enabled (cc=True) but num_experts is {num_experts}. "
                     "num_experts must be greater than 0 to configure a dynamic mixture of experts."
                 )
-            if num_groups <= 0:
-                raise ValueError("num_groups must be greater than 0")
-            if self.expanded_channels % num_groups != 0:
-                raise ValueError(
-                    f"Expanded channels ({self.expanded_channels}) must be divisible by num_groups ({num_groups})"
-                )
-
             self.router = Router(
                 input_channels,
                 num_experts,
-                num_groups=num_groups,
+                grid_size=grid_size,
                 reduction=reduction,
                 nonlin=nonlin,
                 nonlin_kwargs=nonlin_kwargs,
             )
-            _expertify_pointwise(
-                self.expand,
-                num_experts,
-                num_groups=num_groups,
-                group_on_out=True,
-            )
-            _expertify_pointwise(
-                self.project,
-                num_experts,
-                num_groups=num_groups,
-                group_on_out=False,
-            )
+            _expertify_pointwise(self.expand, num_experts)
+            _expertify_pointwise(self.project, num_experts)
         else:
             self.router = None
 
@@ -800,7 +862,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         expansion_ratio: float = 3.0,
         num_experts: int = 0,
         cc_config: List[bool] = None,
-        num_groups: int = 1,
+        grid_size: Union[int, Sequence[int]] = 1,
         reduction: float = 8.0,
     ):
         super().__init__()
@@ -835,7 +897,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 expansion_ratio=expansion_ratio,
                 num_experts=num_experts,
                 cc=block_cc,
-                num_groups=num_groups,
+                grid_size=grid_size,
                 reduction=reduction,
             )
 
@@ -893,7 +955,7 @@ class CondUNetEncoder(nn.Module):
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
         cc: BoolConfig = False,
-        num_groups: Union[int, Sequence[int]] = 1,
+        grid_size: GridConfig = 1,
         reduction: float = 8.0,
     ):
         super().__init__()
@@ -945,12 +1007,13 @@ class CondUNetEncoder(nn.Module):
             n_blocks_per_stage,
             expansion_ratio,
             num_experts,
-            num_groups,
+            grid_size,
             cc,
             "encoder",
+            conv_op,
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
-        self.num_groups = [settings.num_groups for settings in stage_settings]
+        self.grid_sizes = [settings.grid_size for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
@@ -1006,7 +1069,7 @@ class CondUNetEncoder(nn.Module):
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
                     cc_config=list(settings.cc_blocks),
-                    num_groups=settings.num_groups,
+                    grid_size=settings.grid_size,
                     reduction=reduction,
                 )
             )
@@ -1065,7 +1128,7 @@ class CondUNetDecoder(nn.Module):
         expansion_ratio: Union[float, Sequence[float]] = 3.0,
         num_experts: Union[int, Sequence[int]] = 0,
         cc: BoolConfig = False,
-        num_groups: Union[int, Sequence[int]] = 1,
+        grid_size: GridConfig = 1,
         reduction: float = 8.0,
     ):
         super().__init__()
@@ -1091,12 +1154,13 @@ class CondUNetDecoder(nn.Module):
             n_blocks_per_stage,
             expansion_ratio,
             num_experts,
-            num_groups,
+            grid_size,
             cc,
             "decoder",
+            encoder.conv_op,
         )
         self.num_experts = [settings.num_experts for settings in stage_settings]
-        self.num_groups = [settings.num_groups for settings in stage_settings]
+        self.grid_sizes = [settings.grid_size for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
@@ -1124,7 +1188,7 @@ class CondUNetDecoder(nn.Module):
                     expansion_ratio=settings.expansion_ratio,
                     num_experts=settings.num_experts,
                     cc_config=list(settings.cc_blocks),
-                    num_groups=settings.num_groups,
+                    grid_size=settings.grid_size,
                     reduction=reduction,
                 )
             )
@@ -1250,7 +1314,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_stride=stem.stride,
             num_experts=cc.encoder_num_experts,
             cc=cc.encoder,
-            num_groups=cc.encoder_num_groups,
+            grid_size=cc.encoder_grid_size,
             reduction=cc.reduction,
         )
         self.decoder = CondUNetDecoder(
@@ -1261,7 +1325,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             expansion_ratio=decoder_expansion_ratio,
             num_experts=cc.decoder_num_experts,
             cc=cc.decoder,
-            num_groups=cc.decoder_num_groups,
+            grid_size=cc.decoder_grid_size,
             reduction=cc.reduction,
         )
 
