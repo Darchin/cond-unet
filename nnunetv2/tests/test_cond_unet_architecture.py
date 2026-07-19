@@ -240,19 +240,35 @@ def test_tiled_squeeze_excitation_supports_3d_features():
     torch.testing.assert_close(se(x), x)
 
 
-def test_se_is_between_depthwise_activation_and_projection():
-    model = _small_model(se={"encoder": [[True], [False, False], [False]]})
+@pytest.mark.parametrize(
+    ("placement", "expected_order"),
+    [
+        ("start", ["expand", "se", "depthwise", "project"]),
+        ("middle", ["expand", "depthwise", "se", "project"]),
+        ("end", ["expand", "depthwise", "project", "se"]),
+    ],
+)
+def test_se_placement_within_inverted_bottleneck(placement, expected_order):
+    model = _small_model(
+        se={
+            "encoder": [[True], [False, False], [False]],
+            "placement": placement,
+        }
+    )
     block = model.encoder.stages[0].blocks[0]
     calls = []
     handles = [
+        block.expand.register_forward_hook(
+            lambda _module, _inputs, _output: calls.append("expand")
+        ),
         block.depthwise.register_forward_hook(
-            lambda _module, _inputs, output: calls.append(("depthwise", output))
+            lambda _module, _inputs, _output: calls.append("depthwise")
         ),
         block.se.register_forward_pre_hook(
-            lambda _module, inputs: calls.append(("se", inputs[0]))
+            lambda _module, _inputs: calls.append("se")
         ),
-        block.project.conv.register_forward_pre_hook(
-            lambda _module, inputs: calls.append(("project", inputs[0]))
+        block.project.norm.register_forward_hook(
+            lambda _module, _inputs, _output: calls.append("project")
         ),
     ]
     try:
@@ -261,8 +277,11 @@ def test_se_is_between_depthwise_activation_and_projection():
         for handle in handles:
             handle.remove()
 
-    assert [name for name, _tensor in calls] == ["depthwise", "se", "project"]
-    assert calls[0][1] is calls[1][1]
+    assert calls == expected_order
+    expected_channels = (
+        block.output_channels if placement == "end" else block.expanded_channels
+    )
+    assert block.se.input_projection.in_features == expected_channels
 
 
 def test_one_block_reuses_its_router_scores_for_both_pointwise_convolutions():
@@ -516,11 +535,13 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "encoder_grid_size",
         "decoder_grid_size",
         "reduction",
+        "placement",
     }
     assert CCConfig().encoder_grid_size is None
     assert CCConfig().decoder_grid_size is None
     assert SEConfig().encoder_grid_size is None
     assert SEConfig().decoder_grid_size is None
+    assert SEConfig().placement == "middle"
     model_parameters = inspect.signature(CondUNet).parameters
     assert "se" in model_parameters
     assert "upsample_mode" not in model_parameters
@@ -569,3 +590,9 @@ def test_cc_router_settings_are_validated(config, error):
 def test_se_settings_are_validated(config, error):
     with pytest.raises(ValueError, match=error):
         _small_model(se=config)
+
+
+@pytest.mark.parametrize("placement", [None, "before", 1])
+def test_se_placement_is_validated(placement):
+    with pytest.raises(ValueError, match="se.placement"):
+        _small_model(se={"placement": placement})

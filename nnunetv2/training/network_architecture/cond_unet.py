@@ -83,6 +83,8 @@ class SEConfig:
         decoder_grid_size: SE grid shape shared by all decoder stages or one
             explicit grid shape (or None) per decoder stage.
         reduction: Reduction factor for the SE MLP hidden width.
+        placement: Position of enabled SE blocks within each inverted bottleneck.
+            Must be ``"start"``, ``"middle"``, or ``"end"``.
     """
 
     encoder: BoolConfig = False
@@ -90,9 +92,11 @@ class SEConfig:
     encoder_grid_size: GridConfig = None
     decoder_grid_size: GridConfig = None
     reduction: float = 8.0
+    placement: str = "middle"
 
     def __post_init__(self):
         self.reduction = _validate_reduction(self.reduction, "se.reduction")
+        self.placement = _validate_se_placement(self.placement)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SEConfig":
@@ -147,6 +151,15 @@ def _validate_reduction(value: float, name: str) -> float:
     ):
         raise ValueError(f"{name} must be a finite number greater than or equal to 1")
     return float(value)
+
+
+def _validate_se_placement(value: str) -> str:
+    valid_placements = ("start", "middle", "end")
+    if not isinstance(value, str) or value not in valid_placements:
+        raise ValueError(
+            f"se.placement must be one of {valid_placements}, got {value!r}"
+        )
+    return value
 
 
 def _same_padding(
@@ -837,7 +850,8 @@ class DepthwiseConvBlock(nn.Module):
 class InvertedBottleneckBlock(nn.Module):
     """Inverted bottleneck with optional pointwise expert routing and SE.
 
-    The basic block format is: PW -> Norm/Act -> DW -> Norm/Act -> SE -> PW -> Norm.
+    SE can be placed after expansion (start), after depthwise convolution
+    (middle), or after projection normalization (end).
     Bias is set to False for all these convolutions as they have a proceeding normalization layer.
     """
 
@@ -860,6 +874,7 @@ class InvertedBottleneckBlock(nn.Module):
         se: bool = False,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
+        se_placement: str = "middle",
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -944,9 +959,13 @@ class InvertedBottleneckBlock(nn.Module):
             _expertify_pointwise(self.project, num_experts)
         else:
             self.router = None
+        self.se_placement = _validate_se_placement(se_placement)
+        se_channels = (
+            output_channels if self.se_placement == "end" else self.expanded_channels
+        )
         self.se = (
             SqueezeExcitation(
-                self.expanded_channels,
+                se_channels,
                 grid_size=se_grid_size,
                 reduction=se_reduction,
                 nonlin=nonlin,
@@ -961,11 +980,12 @@ class InvertedBottleneckBlock(nn.Module):
         if self.router is not None:
             scores = self.router(x)
             x = _forward_routed_conv_block(self.expand, x, scores)
-            x = self.depthwise(x)
         else:
             x = self.expand(x)
-            x = self.depthwise(x)
-        if self.se is not None:
+        if self.se is not None and self.se_placement == "start":
+            x = self.se(x)
+        x = self.depthwise(x)
+        if self.se is not None and self.se_placement == "middle":
             x = self.se(x)
         if self.router is not None:
             x = self.project.conv(x, scores)
@@ -974,6 +994,8 @@ class InvertedBottleneckBlock(nn.Module):
 
         if hasattr(self.project, "norm"):
             x = self.project.norm(x)
+        if self.se is not None and self.se_placement == "end":
+            x = self.se(x)
         if self.add_identity:
             x = x + residual
         return x
@@ -1013,6 +1035,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         se_config: List[bool] = None,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
+        se_placement: str = "middle",
     ):
         super().__init__()
         if (
@@ -1063,6 +1086,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 se=block_se,
                 se_grid_size=se_grid_size,
                 se_reduction=se_reduction,
+                se_placement=se_placement,
             )
 
         self.blocks = nn.ModuleList(
@@ -1125,6 +1149,7 @@ class CondUNetEncoder(nn.Module):
         se: BoolConfig = False,
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
+        se_placement: str = "middle",
     ):
         super().__init__()
         if (
@@ -1248,6 +1273,7 @@ class CondUNetEncoder(nn.Module):
                     se_config=list(settings.se_blocks),
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
+                    se_placement=se_placement,
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -1310,6 +1336,7 @@ class CondUNetDecoder(nn.Module):
         se: BoolConfig = False,
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
+        se_placement: str = "middle",
     ):
         super().__init__()
         if (
@@ -1379,6 +1406,7 @@ class CondUNetDecoder(nn.Module):
                     se_config=list(settings.se_blocks),
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
+                    se_placement=se_placement,
                 )
             )
 
@@ -1510,6 +1538,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se=se.encoder,
             se_grid_size=se.encoder_grid_size,
             se_reduction=se.reduction,
+            se_placement=se.placement,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1524,6 +1553,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se=se.decoder,
             se_grid_size=se.decoder_grid_size,
             se_reduction=se.reduction,
+            se_placement=se.placement,
         )
 
     def forward(self, x: torch.Tensor):
