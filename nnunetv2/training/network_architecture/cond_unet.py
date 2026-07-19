@@ -1352,8 +1352,8 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
     @staticmethod
     def initialize(module):
         if isinstance(module, CondPWConv):
-            for expert_group_weight in module.expert_weights.flatten(0, 1):
-                nn.init.kaiming_normal_(expert_group_weight, a=1e-2)
+            for expert_weight in module.expert_weights:
+                nn.init.kaiming_normal_(expert_weight, a=1e-2)
         InitWeights_He(1e-2)(module)
         # Zero-init the projection norm for residual blocks so that the residual
         # path starts as identity. This is safe because CondPWConv is not a

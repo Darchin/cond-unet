@@ -313,6 +313,22 @@ def test_tiled_cc_model_backward_populates_router_and_expert_gradients():
     assert block.project.conv.expert_weights.grad is not None
 
 
+def test_condunet_initializer_handles_ungrouped_expert_weights():
+    model = _small_model(
+        cc={
+            "encoder": True,
+            "encoder_num_experts": 4,
+        }
+    )
+
+    model.apply(model.initialize)
+
+    for module in model.modules():
+        if isinstance(module, CondPWConv):
+            assert module.expert_weights.shape[0] == 4
+            assert torch.count_nonzero(module.expert_weights) > 0
+
+
 def test_cc_router_settings_are_propagated():
     model = _small_model(
         nonlin_kwargs={"inplace": True},
