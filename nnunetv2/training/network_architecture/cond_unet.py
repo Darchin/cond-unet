@@ -1591,13 +1591,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         cc = _normalize_config(cc, CCConfig)
         se = _normalize_config(se, SEConfig)
 
-        # CondUNet intentionally uses channel-first LayerNorm throughout.
-        # Keep norm_op and norm_op_kwargs in the public signature for
-        # compatibility with nnU-Net architecture configurations, but ignore
-        # their values.
-        norm_op = LayerNorm
-        norm_op_kwargs = {}
-
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,
             n_stages=n_stages,

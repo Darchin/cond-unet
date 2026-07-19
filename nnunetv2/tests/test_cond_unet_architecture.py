@@ -354,13 +354,15 @@ def test_layer_norm_functional_and_non_affine_module_match():
 
 
 @pytest.mark.parametrize(
-    ("norm_op", "norm_op_kwargs"),
+    ("norm_op", "norm_op_kwargs", "expected_eps"),
     [
-        (nn.BatchNorm2d, {"eps": 1e-3, "momentum": 0.2}),
-        (None, None),
+        (nn.BatchNorm2d, {"eps": 1e-3, "momentum": 0.2}, 1e-3),
+        (LayerNorm, {"eps": 1e-4, "affine": False}, 1e-4),
     ],
 )
-def test_model_ignores_normalization_arguments(norm_op, norm_op_kwargs):
+def test_model_uses_configured_normalization(
+    norm_op, norm_op_kwargs, expected_eps
+):
     model = _small_model(
         norm_op=norm_op,
         norm_op_kwargs=norm_op_kwargs,
@@ -377,9 +379,12 @@ def test_model_ignores_normalization_arguments(norm_op, norm_op_kwargs):
         decoder_block.project.norm,
         model.decoder.seg_norm,
     ]
-    assert all(isinstance(norm, LayerNorm) for norm in norms)
-    assert all(norm.eps == pytest.approx(1e-5) for norm in norms)
-    assert all(norm.affine for norm in norms)
+    assert all(isinstance(norm, norm_op) for norm in norms)
+    assert all(norm.eps == pytest.approx(expected_eps) for norm in norms)
+    if norm_op is LayerNorm:
+        assert all(not norm.affine for norm in norms)
+    else:
+        assert all(norm.momentum == pytest.approx(0.2) for norm in norms)
     model(torch.randn(1, 1, 32, 32))
 
 
