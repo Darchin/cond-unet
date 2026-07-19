@@ -10,6 +10,8 @@ from nnunetv2.training.network_architecture.cond_unet import (
     CondPWConv,
     CondUNet,
     Router,
+    SEConfig,
+    SqueezeExcitation,
 )
 
 
@@ -138,7 +140,7 @@ def test_router_is_bottlenecked_and_uniformly_initialized():
 
 
 def test_router_uses_sigmoid_normalized_mixture():
-    router = Router(3, 3, grid_size=1, reduction=2, nonlin=nn.ReLU)
+    router = Router(3, 3, grid_size=None, reduction=2, nonlin=nn.ReLU)
     with torch.no_grad():
         router.output_projection.weight.zero_()
         router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
@@ -176,6 +178,91 @@ def test_each_cc_block_has_an_independent_router():
     assert isinstance(blocks[0].router, Router)
     assert isinstance(blocks[1].router, Router)
     assert blocks[0].router is not blocks[1].router
+
+
+def test_squeeze_excitation_is_bottlenecked_and_identity_initialized():
+    se = SqueezeExcitation(
+        17,
+        grid_size=(2, 3),
+        reduction=8,
+        nonlin=nn.LeakyReLU,
+        nonlin_kwargs={"negative_slope": 0.2, "inplace": True},
+    )
+    assert se.hidden_channels == 2
+    assert se.input_projection.in_features == 17
+    assert se.input_projection.out_features == 2
+    assert se.output_projection.out_features == 17
+    assert isinstance(se.nonlin, nn.LeakyReLU)
+    torch.testing.assert_close(
+        se.output_projection.weight,
+        torch.zeros_like(se.output_projection.weight),
+    )
+    torch.testing.assert_close(
+        se.output_projection.bias,
+        torch.zeros_like(se.output_projection.bias),
+    )
+
+    x = torch.randn(2, 17, 4, 6)
+    torch.testing.assert_close(se(x), x)
+
+
+def test_tiled_squeeze_excitation_linearly_interpolates_scores():
+    se = SqueezeExcitation(2, grid_size=(2, 2), reduction=2, nonlin=nn.Identity)
+    with torch.no_grad():
+        se.input_projection.weight.fill_(1)
+        se.input_projection.bias.zero_()
+        se.output_projection.weight.copy_(torch.tensor([[0.01], [-0.01]]))
+        se.output_projection.bias.zero_()
+    x = torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4)
+    descriptor = torch.nn.functional.adaptive_avg_pool2d(x, (2, 2)).movedim(1, -1)
+    logits = se.output_projection(se.input_projection(descriptor))
+    expected_scores = torch.nn.functional.interpolate(
+        (2 * torch.sigmoid(logits)).movedim(-1, 1),
+        size=x.shape[2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    torch.testing.assert_close(se(x), x * expected_scores)
+    assert torch.all(expected_scores > 0)
+    assert torch.all(expected_scores < 2)
+
+
+def test_squeeze_excitation_rejects_non_divisible_grid():
+    se = SqueezeExcitation(3, grid_size=(2, 2), nonlin=nn.ReLU)
+    with pytest.raises(ValueError, match="must be divisible by SE grid"):
+        se(torch.randn(1, 3, 5, 4))
+
+
+def test_tiled_squeeze_excitation_supports_3d_features():
+    se = SqueezeExcitation(3, grid_size=(2, 3, 2), nonlin=nn.ReLU)
+    x = torch.randn(1, 3, 4, 6, 8)
+    torch.testing.assert_close(se(x), x)
+
+
+def test_se_is_between_depthwise_activation_and_projection():
+    model = _small_model(se={"encoder": [[True], [False, False], [False]]})
+    block = model.encoder.stages[0].blocks[0]
+    calls = []
+    handles = [
+        block.depthwise.register_forward_hook(
+            lambda _module, _inputs, output: calls.append(("depthwise", output))
+        ),
+        block.se.register_forward_pre_hook(
+            lambda _module, inputs: calls.append(("se", inputs[0]))
+        ),
+        block.project.conv.register_forward_pre_hook(
+            lambda _module, inputs: calls.append(("project", inputs[0]))
+        ),
+    ]
+    try:
+        model(torch.randn(1, 1, 32, 32))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [name for name, _tensor in calls] == ["depthwise", "se", "project"]
+    assert calls[0][1] is calls[1][1]
 
 
 def test_one_block_reuses_its_router_scores_for_both_pointwise_convolutions():
@@ -277,11 +364,28 @@ def test_one_grid_shape_is_broadcast_to_every_stage():
     model = _small_model(
         cc={
             "encoder_grid_size": [2, 1],
-            "decoder_grid_size": 2,
+            "decoder_grid_size": [2, 2],
         }
     )
     assert model.encoder.grid_sizes == [(2, 1)] * 3
     assert model.decoder.grid_sizes == [(2, 2)] * 2
+
+
+def test_none_grid_sizes_are_global_for_all_or_individual_stages():
+    model = _small_model(
+        cc={"encoder_grid_size": None},
+        se={
+            "encoder": True,
+            "decoder": True,
+            "encoder_grid_size": [None, [2, 2], None],
+            "decoder_grid_size": None,
+        },
+    )
+    assert model.encoder.grid_sizes == [(1, 1)] * 3
+    assert model.encoder.se_grid_sizes == [(1, 1), (2, 2), (1, 1)]
+    assert model.decoder.se_grid_sizes == [(1, 1)] * 2
+    assert model.encoder.stages[1].blocks[0].se.grid_size == (2, 2)
+    model(torch.randn(1, 1, 32, 32))
 
 
 def test_strided_cc_block_validates_projection_feature_map_divisibility():
@@ -309,6 +413,28 @@ def test_tiled_cc_model_backward_populates_router_and_expert_gradients():
     model(torch.randn(1, 1, 32, 32)).mean().backward()
 
     assert block.router.output_projection.weight.grad is not None
+    assert block.expand.conv.expert_weights.grad is not None
+    assert block.project.conv.expert_weights.grad is not None
+
+
+def test_tiled_se_and_cc_model_backward_populates_addon_gradients():
+    model = _small_model(
+        cc={
+            "encoder": [[False], [True, False], [False]],
+            "encoder_num_experts": [0, 2, 0],
+            "encoder_grid_size": [[1, 1], [2, 2], [1, 1]],
+        },
+        se={
+            "encoder": [[False], [True, False], [False]],
+            "encoder_grid_size": [[1, 1], [2, 2], [1, 1]],
+        },
+    )
+    block = model.encoder.stages[1].blocks[0]
+
+    model(torch.randn(1, 1, 32, 32)).mean().backward()
+
+    assert block.router.output_projection.weight.grad is not None
+    assert block.se.output_projection.weight.grad is not None
     assert block.expand.conv.expert_weights.grad is not None
     assert block.project.conv.expert_weights.grad is not None
 
@@ -346,7 +472,7 @@ def test_cc_router_settings_are_propagated():
     assert block.router.nonlin.inplace
 
 
-@pytest.mark.parametrize("obsolete_key", ["se", "upsample_mode", "num_groups"])
+@pytest.mark.parametrize("obsolete_key", ["upsample_mode", "num_groups"])
 def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
     with pytest.raises(TypeError, match=obsolete_key):
         _small_model(**{obsolete_key: None})
@@ -383,8 +509,20 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "decoder_grid_size",
         "reduction",
     }
+    se_fields = set(SEConfig.__dataclass_fields__)
+    assert se_fields == {
+        "encoder",
+        "decoder",
+        "encoder_grid_size",
+        "decoder_grid_size",
+        "reduction",
+    }
+    assert CCConfig().encoder_grid_size is None
+    assert CCConfig().decoder_grid_size is None
+    assert SEConfig().encoder_grid_size is None
+    assert SEConfig().decoder_grid_size is None
     model_parameters = inspect.signature(CondUNet).parameters
-    assert "se" not in model_parameters
+    assert "se" in model_parameters
     assert "upsample_mode" not in model_parameters
     assert "num_groups" not in model_parameters
 
@@ -392,7 +530,8 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
 @pytest.mark.parametrize(
     ("grid_size", "error"),
     [
-        (0, "positive"),
+        (1, "explicit"),
+        (0, "explicit"),
         ([1, 2, 3], "grid shape"),
         ([[1, 1], [2, 2]], "exactly 3"),
         ([[1, 1], [2, 0], [1, 1]], "positive"),
@@ -418,3 +557,15 @@ def test_cc_requires_experts_when_enabled():
 def test_cc_router_settings_are_validated(config, error):
     with pytest.raises(ValueError, match=error):
         _small_model(cc=config)
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        ({"reduction": 0.5}, "reduction"),
+        ({"reduction": float("inf")}, "reduction"),
+    ],
+)
+def test_se_settings_are_validated(config, error):
+    with pytest.raises(ValueError, match=error):
+        _small_model(se=config)
