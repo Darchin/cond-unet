@@ -449,12 +449,13 @@ class SqueezeExcitation(nn.Module):
         descriptor = adaptive_avg_pool(x, grid_size).movedim(1, -1)
         logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
         scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
-        scores = F.interpolate(
-            scores,
-            size=x.shape[2:],
-            mode=("linear", "bilinear", "trilinear")[spatial_dims - 1],
-            align_corners=False,
-        )
+        if grid_size != (1,) * spatial_dims:
+            scores = F.interpolate(
+                scores,
+                size=x.shape[2:],
+                mode=("linear", "bilinear", "trilinear")[spatial_dims - 1],
+                align_corners=False,
+            )
         return x * scores
 
 

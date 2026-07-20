@@ -206,6 +206,31 @@ def test_squeeze_excitation_is_bottlenecked_and_identity_initialized():
     torch.testing.assert_close(se(x), x)
 
 
+@pytest.mark.parametrize("grid_size", [None, (1, 1)])
+def test_global_squeeze_excitation_broadcasts_scores_without_interpolation(
+    grid_size, monkeypatch
+):
+    se = SqueezeExcitation(
+        3,
+        grid_size=grid_size,
+        reduction=2,
+        nonlin=nn.ReLU,
+    )
+    x = torch.randn(2, 3, 4, 6, requires_grad=True)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("global SE scores should be broadcast without interpolation")
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", fail_if_called)
+    output = se(x)
+    output.sum().backward()
+
+    torch.testing.assert_close(output, x)
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+    assert se.output_projection.weight.grad is not None
+    assert se.output_projection.bias.grad is not None
+
+
 def test_tiled_squeeze_excitation_linearly_interpolates_scores():
     se = SqueezeExcitation(2, grid_size=(2, 2), reduction=2, nonlin=nn.Identity)
     with torch.no_grad():
