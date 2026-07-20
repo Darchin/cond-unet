@@ -245,9 +245,9 @@ def test_tiled_squeeze_excitation_supports_3d_features():
 @pytest.mark.parametrize(
     ("placement", "expected_order"),
     [
-        ("start", ["expand", "se", "depthwise", "project"]),
-        ("middle", ["expand", "depthwise", "se", "project"]),
-        ("end", ["expand", "depthwise", "project", "se"]),
+        ("start", ["pre_depthwise", "expand", "se", "depthwise", "project"]),
+        ("middle", ["pre_depthwise", "expand", "depthwise", "se", "project"]),
+        ("end", ["pre_depthwise", "expand", "depthwise", "project", "se"]),
     ],
 )
 def test_se_placement_within_inverted_bottleneck(placement, expected_order):
@@ -260,6 +260,9 @@ def test_se_placement_within_inverted_bottleneck(placement, expected_order):
     block = model.encoder.stages[0].blocks[0]
     calls = []
     handles = [
+        block.pre_depthwise.register_forward_hook(
+            lambda _module, _inputs, _output: calls.append("pre_depthwise")
+        ),
         block.expand.register_forward_hook(
             lambda _module, _inputs, _output: calls.append("expand")
         ),
@@ -284,6 +287,23 @@ def test_se_placement_within_inverted_bottleneck(placement, expected_order):
         block.output_channels if placement == "end" else block.expanded_channels
     )
     assert block.se.input_projection.in_features == expected_channels
+
+
+def test_inverted_bottleneck_is_depthwise_first_and_strides_on_second_depthwise():
+    model = _small_model()
+    block = model.encoder.stages[1].blocks[0]
+
+    assert block.pre_depthwise.conv.in_channels == block.input_channels
+    assert block.pre_depthwise.conv.groups == block.input_channels
+    assert block.pre_depthwise.conv.kernel_size == block.depthwise.conv.kernel_size
+    assert block.pre_depthwise.conv.stride == (1, 1)
+    assert block.expand.conv.stride == (1, 1)
+    assert block.depthwise.conv.stride == (2, 2)
+    assert block.project.conv.stride == (1, 1)
+    assert isinstance(block.pre_depthwise.norm, nn.Identity)
+    assert isinstance(block.pre_depthwise.nonlin, nn.Identity)
+    assert isinstance(block.depthwise.norm, nn.Identity)
+    assert isinstance(block.depthwise.nonlin, nn.Identity)
 
 
 def test_one_block_reuses_its_router_scores_for_both_pointwise_convolutions():
@@ -372,10 +392,8 @@ def test_model_uses_configured_normalization(
     norms = [
         model.encoder.stem.convs[0].norm,
         encoder_block.expand.norm,
-        encoder_block.depthwise.norm,
         encoder_block.project.norm,
         decoder_block.expand.norm,
-        decoder_block.depthwise.norm,
         decoder_block.project.norm,
         model.decoder.seg_norm,
     ]

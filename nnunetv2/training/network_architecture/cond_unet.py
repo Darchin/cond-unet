@@ -928,11 +928,11 @@ class DepthwiseConvBlock(nn.Module):
 
 
 class InvertedBottleneckBlock(nn.Module):
-    """Inverted bottleneck with optional pointwise expert routing and SE.
+    """Depthwise-first inverted bottleneck with optional pointwise routing and SE.
 
-    SE can be placed after expansion (start), after depthwise convolution
+    The block layout is DW -> PW -> Norm -> Act -> DW -> PW -> Norm. SE can be
+    placed after expansion (start), after the second depthwise convolution
     (middle), or after projection normalization (end).
-    Bias is set to False for all these convolutions as they have a proceeding normalization layer.
     """
 
     def __init__(
@@ -972,6 +972,14 @@ class InvertedBottleneckBlock(nn.Module):
                 f"expansion_ratio must produce at least one channel, got {expansion_ratio}"
             )
 
+        # Pre-expansion depthwise: DW
+        self.pre_depthwise = DepthwiseConvBlock(
+            conv_op,
+            input_channels,
+            kernel_size,
+            1,
+        )
+
         # PW expansion: PW -> Norm/Act
         self.expand = ConvDropoutNormReLU(
             conv_op,
@@ -988,16 +996,12 @@ class InvertedBottleneckBlock(nn.Module):
             nonlin_kwargs,
         )
 
-        # Depthwise DW: DW -> Norm/Act
+        # Expanded depthwise: DW. Downsampling happens here.
         self.depthwise = DepthwiseConvBlock(
             conv_op,
             self.expanded_channels,
             kernel_size,
             self.stride,
-            norm_op,
-            norm_op_kwargs,
-            nonlin,
-            nonlin_kwargs,
         )
 
         # PW projection: PW -> Norm
@@ -1057,8 +1061,9 @@ class InvertedBottleneckBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        if self.router is not None:
-            scores = self.router(x)
+        scores = self.router(x) if self.router is not None else None
+        x = self.pre_depthwise(x)
+        if scores is not None:
             x = _forward_routed_conv_block(self.expand, x, scores)
         else:
             x = self.expand(x)
@@ -1067,7 +1072,7 @@ class InvertedBottleneckBlock(nn.Module):
         x = self.depthwise(x)
         if self.se is not None and self.se_placement == "middle":
             x = self.se(x)
-        if self.router is not None:
+        if scores is not None:
             x = self.project.conv(x, scores)
         else:
             x = self.project.conv(x)
@@ -1088,7 +1093,8 @@ class InvertedBottleneckBlock(nn.Module):
         size_after_stride = _conv_output_shape(
             input_size, self.depthwise.conv.kernel_size, self.stride
         )
-        output = np.prod([self.expanded_channels, *input_size], dtype=np.int64)
+        output = np.prod([self.input_channels, *input_size], dtype=np.int64)
+        output += np.prod([self.expanded_channels, *input_size], dtype=np.int64)
         output += np.prod([self.expanded_channels, *size_after_stride], dtype=np.int64)
         output += np.prod([self.output_channels, *size_after_stride], dtype=np.int64)
         return output
