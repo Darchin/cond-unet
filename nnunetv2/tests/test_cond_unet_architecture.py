@@ -231,7 +231,7 @@ def test_global_squeeze_excitation_broadcasts_scores_without_interpolation(
     assert se.output_projection.bias.grad is not None
 
 
-def test_tiled_squeeze_excitation_linearly_interpolates_scores():
+def test_tiled_squeeze_excitation_replicates_scores_within_tiles():
     se = SqueezeExcitation(2, grid_size=(2, 2), reduction=2, nonlin=nn.Identity)
     with torch.no_grad():
         se.input_projection.weight.fill_(1)
@@ -241,11 +241,9 @@ def test_tiled_squeeze_excitation_linearly_interpolates_scores():
     x = torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4)
     descriptor = torch.nn.functional.adaptive_avg_pool2d(x, (2, 2)).movedim(1, -1)
     logits = se.output_projection(se.input_projection(descriptor))
-    expected_scores = torch.nn.functional.interpolate(
-        (2 * torch.sigmoid(logits)).movedim(-1, 1),
-        size=x.shape[2:],
-        mode="bilinear",
-        align_corners=False,
+    expected_scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
+    expected_scores = expected_scores.repeat_interleave(2, dim=2).repeat_interleave(
+        2, dim=3
     )
 
     torch.testing.assert_close(se(x), x * expected_scores)

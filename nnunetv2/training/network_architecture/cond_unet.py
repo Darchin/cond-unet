@@ -384,7 +384,7 @@ class Router(nn.Module):
 
 
 class SqueezeExcitation(nn.Module):
-    """Global or tiled channel gating with interpolated per-cell scores."""
+    """Global or tiled channel gating with per-cell scores replicated across tiles."""
 
     def __init__(
         self,
@@ -453,8 +453,7 @@ class SqueezeExcitation(nn.Module):
             scores = F.interpolate(
                 scores,
                 size=x.shape[2:],
-                mode=("linear", "bilinear", "trilinear")[spatial_dims - 1],
-                align_corners=False,
+                mode="nearest",
             )
         return x * scores
 
