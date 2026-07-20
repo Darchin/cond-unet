@@ -930,9 +930,10 @@ class DepthwiseConvBlock(nn.Module):
 class InvertedBottleneckBlock(nn.Module):
     """Depthwise-first inverted bottleneck with optional pointwise routing and SE.
 
-    The block layout is DW -> PW -> Norm -> Act -> DW -> PW -> Norm. SE can be
-    placed after expansion (start), after the second depthwise convolution
-    (middle), or after projection normalization (end).
+    The default block layout is DW -> PW -> Norm -> Act -> DW -> PW -> Norm.
+    With ``pre_norm=True`` it becomes Norm -> DW -> PW -> Act -> Norm -> DW
+    -> PW. SE can be placed after expansion (start), after the second depthwise
+    convolution (middle), or at the end of the main branch.
     """
 
     def __init__(
@@ -955,8 +956,12 @@ class InvertedBottleneckBlock(nn.Module):
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
         se_placement: str = "middle",
+        pre_norm: bool = False,
     ):
         super().__init__()
+        if not isinstance(pre_norm, bool):
+            raise TypeError("pre_norm must be a bool")
+        self.pre_norm = pre_norm
         self.input_channels = input_channels
         self.output_channels = output_channels
         self.stride = _normalize_spatial_param(conv_op, stride, "stride")
@@ -965,12 +970,21 @@ class InvertedBottleneckBlock(nn.Module):
         )
         norm_op_kwargs = {} if norm_op_kwargs is None else norm_op_kwargs
         nonlin_kwargs = {} if nonlin_kwargs is None else nonlin_kwargs
-
         self.expanded_channels = int(round(expansion_ratio * input_channels))
         if self.expanded_channels <= 0:
             raise ValueError(
                 f"expansion_ratio must produce at least one channel, got {expansion_ratio}"
             )
+        self.pre_expand_norm = (
+            norm_op(input_channels, **norm_op_kwargs)
+            if pre_norm and norm_op is not None
+            else nn.Identity()
+        )
+        self.pre_project_norm = (
+            norm_op(self.expanded_channels, **norm_op_kwargs)
+            if pre_norm and norm_op is not None
+            else nn.Identity()
+        )
 
         # Pre-expansion depthwise: DW
         self.pre_depthwise = DepthwiseConvBlock(
@@ -988,7 +1002,7 @@ class InvertedBottleneckBlock(nn.Module):
             1,
             1,
             False,
-            norm_op,
+            None if pre_norm else norm_op,
             norm_op_kwargs,
             None,
             None,
@@ -1012,7 +1026,7 @@ class InvertedBottleneckBlock(nn.Module):
             1,
             1,
             False,
-            norm_op,
+            None if pre_norm else norm_op,
             norm_op_kwargs,
             None,
             None,
@@ -1062,6 +1076,7 @@ class InvertedBottleneckBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         scores = self.router(x) if self.router is not None else None
+        x = self.pre_expand_norm(x)
         x = self.pre_depthwise(x)
         if scores is not None:
             x = _forward_routed_conv_block(self.expand, x, scores)
@@ -1069,6 +1084,7 @@ class InvertedBottleneckBlock(nn.Module):
             x = self.expand(x)
         if self.se is not None and self.se_placement == "start":
             x = self.se(x)
+        x = self.pre_project_norm(x)
         x = self.depthwise(x)
         if self.se is not None and self.se_placement == "middle":
             x = self.se(x)
@@ -1122,6 +1138,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
         se_placement: str = "middle",
+        pre_norm: bool = False,
     ):
         super().__init__()
         if (
@@ -1173,6 +1190,7 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 se_grid_size=se_grid_size,
                 se_reduction=se_reduction,
                 se_placement=se_placement,
+                pre_norm=pre_norm,
             )
 
         self.blocks = nn.ModuleList(
@@ -1236,6 +1254,7 @@ class CondUNetEncoder(nn.Module):
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
         se_placement: str = "middle",
+        pre_norm: bool = False,
     ):
         super().__init__()
         if (
@@ -1360,6 +1379,7 @@ class CondUNetEncoder(nn.Module):
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
                     se_placement=se_placement,
+                    pre_norm=pre_norm,
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -1423,6 +1443,7 @@ class CondUNetDecoder(nn.Module):
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
         se_placement: str = "middle",
+        pre_norm: bool = False,
     ):
         super().__init__()
         if (
@@ -1493,6 +1514,7 @@ class CondUNetDecoder(nn.Module):
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
                     se_placement=se_placement,
+                    pre_norm=pre_norm,
                 )
             )
 
@@ -1577,6 +1599,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         stem: Union[StemConfig, dict, None] = None,
         cc: Union[CCConfig, dict, None] = None,
         se: Union[SEConfig, dict, None] = None,
+        pre_norm: bool = False,
     ):
         super().__init__()
         self.key_to_encoder = "encoder.stages"
@@ -1625,6 +1648,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se_grid_size=se.encoder_grid_size,
             se_reduction=se.reduction,
             se_placement=se.placement,
+            pre_norm=pre_norm,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1640,6 +1664,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             se_grid_size=se.decoder_grid_size,
             se_reduction=se.reduction,
             se_placement=se.placement,
+            pre_norm=pre_norm,
         )
 
     def forward(self, x: torch.Tensor):

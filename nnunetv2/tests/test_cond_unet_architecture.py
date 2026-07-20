@@ -9,6 +9,7 @@ from nnunetv2.training.network_architecture.cond_unet import (
     CCConfig,
     CondPWConv,
     CondUNet,
+    InvertedBottleneckBlock,
     LayerNorm,
     Router,
     SEConfig,
@@ -306,6 +307,98 @@ def test_inverted_bottleneck_is_depthwise_first_and_strides_on_second_depthwise(
     assert isinstance(block.depthwise.nonlin, nn.Identity)
 
 
+@pytest.mark.parametrize(
+    ("pre_norm", "expected_order"),
+    [
+        (
+            False,
+            [
+                "pre_depthwise",
+                "expand_conv",
+                "expand_norm",
+                "act",
+                "depthwise",
+                "project_conv",
+                "project_norm",
+            ],
+        ),
+        (
+            True,
+            [
+                "pre_expand_norm",
+                "pre_depthwise",
+                "expand_conv",
+                "act",
+                "pre_project_norm",
+                "depthwise",
+                "project_conv",
+            ],
+        ),
+    ],
+)
+def test_inverted_bottleneck_normalization_order(pre_norm, expected_order):
+    block = InvertedBottleneckBlock(
+        conv_op=nn.Conv2d,
+        input_channels=4,
+        output_channels=4,
+        kernel_size=3,
+        stride=1,
+        norm_op=nn.BatchNorm2d,
+        nonlin=nn.ReLU,
+        pre_norm=pre_norm,
+    )
+    calls = []
+    named_modules = {
+        "pre_expand_norm": block.pre_expand_norm,
+        "pre_depthwise": block.pre_depthwise.conv,
+        "expand_conv": block.expand.conv,
+        "act": block.expand.nonlin,
+        "pre_project_norm": block.pre_project_norm,
+        "depthwise": block.depthwise.conv,
+        "project_conv": block.project.conv,
+    }
+    if hasattr(block.expand, "norm"):
+        named_modules["expand_norm"] = block.expand.norm
+    if hasattr(block.project, "norm"):
+        named_modules["project_norm"] = block.project.norm
+    handles = [
+        module.register_forward_hook(
+            lambda _module, _inputs, _output, name=name: calls.append(name)
+        )
+        for name, module in named_modules.items()
+        if not isinstance(module, nn.Identity)
+    ]
+    try:
+        block(torch.randn(2, 4, 8, 8))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert calls == expected_order
+
+
+def test_condunet_pre_norm_is_applied_to_all_ib_blocks():
+    model = _small_model(pre_norm=True)
+    blocks = [
+        block
+        for stage in (*model.encoder.stages, *model.decoder.stages)
+        for block in stage.blocks
+    ]
+
+    assert blocks
+    assert all(block.pre_norm for block in blocks)
+    assert all(isinstance(block.pre_expand_norm, nn.InstanceNorm2d) for block in blocks)
+    assert all(isinstance(block.pre_project_norm, nn.InstanceNorm2d) for block in blocks)
+    assert all(not hasattr(block.expand, "norm") for block in blocks)
+    assert all(not hasattr(block.project, "norm") for block in blocks)
+    assert model(torch.randn(1, 1, 32, 32)).shape == (1, 2, 32, 32)
+
+
+def test_pre_norm_must_be_bool():
+    with pytest.raises(TypeError, match="pre_norm must be a bool"):
+        _small_model(pre_norm=1)
+
+
 def test_one_block_reuses_its_router_scores_for_both_pointwise_convolutions():
     model = _small_model(
         cc={
@@ -591,6 +684,7 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
     assert SEConfig().placement == "middle"
     model_parameters = inspect.signature(CondUNet).parameters
     assert "se" in model_parameters
+    assert model_parameters["pre_norm"].default is False
     assert "upsample_mode" not in model_parameters
     assert "num_groups" not in model_parameters
 
