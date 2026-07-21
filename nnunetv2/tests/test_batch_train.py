@@ -15,6 +15,7 @@ from nnunetv2.run.batch_train import (
     format_finish_message,
     format_start_message,
     format_verbose_duration,
+    group_gpu_tokens,
     load_job_pairs_from_json,
     make_worker_command,
     parse_args,
@@ -24,6 +25,7 @@ from nnunetv2.run.batch_train import (
     resolve_plans_file,
     schedule_jobs,
     validate_requested_configurations,
+    validate_ddp_batch_sizes,
     visible_gpu_tokens,
 )
 
@@ -49,6 +51,16 @@ class TestBatchTrain(unittest.TestCase):
         self.assertFalse(args.disable_tta)
         self.assertEqual(args.ckpt_interval, 50)
         self.assertFalse(args.disable_train_val)
+        self.assertEqual(args.ddp, 1)
+
+    def test_parse_args_accepts_ddp(self):
+        args = parse_args(["-d", "1", "-c", "2x", "-f", "0", "--ddp", "2"])
+
+        self.assertEqual(args.ddp, 2)
+
+    def test_parse_args_rejects_non_positive_ddp(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["-d", "1", "-c", "2x", "-f", "0", "--ddp", "0"])
 
     def test_parse_args_disable_tta(self):
         args = parse_args(["-d", "1", "-t", "nnUNetTrainer", "-c", "2x", "-f", "0", "--disable-tta"])
@@ -69,11 +81,12 @@ class TestBatchTrain(unittest.TestCase):
             parse_args(["-d", "1", "-c", "2x", "-f", "0", "--ckpt-interval", "0"])
 
     def test_worker_command_propagates_training_behavior_options(self):
-        command = make_worker_command("plans.json", "2x", 0, "nnUNetTrainer", True, 25, True)
+        command = make_worker_command("plans.json", "2x", 0, "nnUNetTrainer", True, 25, True, 2)
 
         self.assertIn("--disable-tta", command)
         self.assertIn("--disable_train_val", command)
         self.assertEqual(command[command.index("--ckpt-interval") + 1], "25")
+        self.assertEqual(command[command.index("--ddp") + 1], "2")
 
     def test_parse_args_include_and_exclude_job_pairs(self):
         args = parse_args([
@@ -355,6 +368,9 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual(visible_gpu_tokens("2, 4", 2), ["2", "4"])
         self.assertEqual(visible_gpu_tokens(None, 3), ["0", "1", "2"])
 
+    def test_group_gpu_tokens_assigns_ddp_groups_and_leaves_remainder_idle(self):
+        self.assertEqual(group_gpu_tokens(["0", "2", "3", "5", "7"], 2), ["0,2", "3,5"])
+
     def test_resolve_plan_path_accepts_direct_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             plans_file = os.path.join(tmpdir, "plans.json")
@@ -381,14 +397,34 @@ class TestBatchTrain(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "3x"):
                 validate_requested_configurations(plans_file, ["2x", "3x"])
 
+    def test_validate_ddp_batch_sizes_checks_inherited_configurations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plans_file = os.path.join(tmpdir, "plans.json")
+            save_json(
+                {
+                    "dataset_name": "Dataset001_Test",
+                    "plans_name": "plans",
+                    "configurations": {
+                        "base": {"batch_size": 6, "architecture": {}},
+                        "child": {"inherits_from": "base"},
+                        "small": {"batch_size": 3, "architecture": {}},
+                    },
+                },
+                plans_file,
+            )
+
+            validate_ddp_batch_sizes(plans_file, ["child"], 2)
+            with self.assertRaisesRegex(RuntimeError, r"small \(batch size 3\)"):
+                validate_ddp_batch_sizes(plans_file, ["child", "small"], 2)
+
     def test_scheduler_reuses_gpus_and_continues_after_failure(self):
         jobs = build_jobs(["2x", "3x"], [0, 1])
         launches = []
         returncodes = [0, 1, 0, 0]
 
-        def launcher(job, gpu, plans_file, trainer_name, disable_tta, checkpoint_interval, disable_train_val):
+        def launcher(job, gpu, plans_file, trainer_name, disable_tta, checkpoint_interval, disable_train_val, ddp):
             launches.append((job.index, gpu, plans_file, trainer_name, disable_tta,
-                             checkpoint_interval, disable_train_val))
+                             checkpoint_interval, disable_train_val, ddp))
             return FakeProcess(returncodes[job.index])
 
         now = {"value": 0.0}
@@ -408,6 +444,7 @@ class TestBatchTrain(unittest.TestCase):
                 25,
                 True,
                 console,
+                1,
                 launcher=launcher,
                 monotonic=monotonic,
                 sleep=lambda _: None,
@@ -418,7 +455,7 @@ class TestBatchTrain(unittest.TestCase):
         self.assertEqual([i[0] for i in launches], [0, 1, 2, 3])
         self.assertEqual([i[1] for i in launches], ["0", "1", "0", "1"])
         self.assertTrue(all(i[4] for i in launches))
-        self.assertTrue(all(i[5:] == (25, True) for i in launches))
+        self.assertTrue(all(i[5:] == (25, True, 1) for i in launches))
         self.assertEqual([i.returncode for i in results], [0, 1, 0, 0])
 
 

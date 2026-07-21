@@ -11,12 +11,14 @@ from os.path import abspath, dirname, isabs, isfile, join
 from typing import Callable, Sequence
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from batchgenerators.utilities.file_and_folder_operations import load_json
 from rich.console import Console
 from rich.table import Table
 
 from nnunetv2.paths import nnUNet_preprocessed
-from nnunetv2.run.run_training import maybe_load_checkpoint
+from nnunetv2.run.run_training import find_free_network_port, maybe_load_checkpoint
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
@@ -328,6 +330,10 @@ def visible_gpu_tokens(cuda_visible_devices: str | None, device_count: int) -> l
     return [str(i) for i in range(device_count)]
 
 
+def group_gpu_tokens(gpu_tokens: Sequence[str], ddp: int) -> list[str]:
+    return [",".join(gpu_tokens[i:i + ddp]) for i in range(0, len(gpu_tokens) - ddp + 1, ddp)]
+
+
 def parse_job_pair(value: str) -> JobPair:
     parts = value.split(",")
     if len(parts) != 2:
@@ -382,6 +388,20 @@ def validate_requested_configurations(plans_file: str, configurations: Sequence[
         )
 
 
+def validate_ddp_batch_sizes(plans_file: str, configurations: Sequence[str], ddp: int) -> None:
+    plans_manager = PlansManager(plans_file)
+    invalid = []
+    for configuration in configurations:
+        batch_size = plans_manager.get_configuration(configuration).batch_size
+        if batch_size % ddp != 0:
+            invalid.append(f"{configuration} (batch size {batch_size})")
+    if invalid:
+        raise RuntimeError(
+            f"--ddp {ddp} must divide the batch size of every requested configuration; incompatible: "
+            + ", ".join(invalid)
+        )
+
+
 def validate_plans_dataset(plans_file: str, dataset_name_or_id: str) -> None:
     plans_manager = PlansManager(plans_file)
     dataset_name = maybe_convert_to_dataset_name(dataset_name_or_id)
@@ -399,13 +419,19 @@ def load_dataset_json_for_plans(plans_file: str) -> dict:
     return load_json(dataset_json_file)
 
 
-def run_training_worker(plans_file: str,
-                        configuration: str,
-                        fold: int,
-                        trainer_name: str,
-                        disable_tta: bool,
-                        checkpoint_interval: int,
-                        disable_train_val: bool) -> None:
+def run_training_worker_process(rank: int,
+                                world_size: int,
+                                plans_file: str,
+                                configuration: str,
+                                fold: int,
+                                trainer_name: str,
+                                disable_tta: bool,
+                                checkpoint_interval: int,
+                                disable_train_val: bool) -> None:
+    if world_size > 1:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
@@ -418,7 +444,7 @@ def run_training_worker(plans_file: str,
         configuration=configuration,
         fold=fold,
         dataset_json=dataset_json,
-        device=torch.device("cuda"),
+        device=torch.device("cuda", rank) if world_size > 1 else torch.device("cuda"),
     )
     trainer.checkpoint_interval = checkpoint_interval
     trainer.disable_train_val = disable_train_val
@@ -432,6 +458,37 @@ def run_training_worker(plans_file: str,
     trainer.run_training()
     trainer.perform_actual_validation(False, not disable_tta)
 
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+def run_training_worker(plans_file: str,
+                        configuration: str,
+                        fold: int,
+                        trainer_name: str,
+                        disable_tta: bool,
+                        checkpoint_interval: int,
+                        disable_train_val: bool,
+                        ddp: int) -> None:
+    if ddp == 1:
+        run_training_worker_process(
+            0, 1, plans_file, configuration, fold, trainer_name, disable_tta,
+            checkpoint_interval, disable_train_val,
+        )
+        return
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(find_free_network_port())
+    mp.spawn(
+        run_training_worker_process,
+        args=(
+            ddp, plans_file, configuration, fold, trainer_name, disable_tta,
+            checkpoint_interval, disable_train_val,
+        ),
+        nprocs=ddp,
+        join=True,
+    )
+
 
 def make_worker_command(plans_file: str,
                         configuration: str,
@@ -439,7 +496,8 @@ def make_worker_command(plans_file: str,
                         trainer_name: str,
                         disable_tta: bool,
                         checkpoint_interval: int,
-                        disable_train_val: bool) -> list[str]:
+                        disable_train_val: bool,
+                        ddp: int = 1) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -455,6 +513,8 @@ def make_worker_command(plans_file: str,
         trainer_name,
         "--ckpt-interval",
         str(checkpoint_interval),
+        "--ddp",
+        str(ddp),
     ]
     if disable_tta:
         command.append("--disable-tta")
@@ -469,12 +529,13 @@ def launch_job(job: TrainingJob,
                trainer_name: str,
                disable_tta: bool,
                checkpoint_interval: int,
-               disable_train_val: bool) -> subprocess.Popen:
+               disable_train_val: bool,
+               ddp: int) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     return subprocess.Popen(
         make_worker_command(plans_file, job.configuration, job.fold, trainer_name, disable_tta,
-                            checkpoint_interval, disable_train_val),
+                            checkpoint_interval, disable_train_val, ddp),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -513,13 +574,16 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
                   checkpoint_interval: int,
                   disable_train_val: bool,
                   console: Console,
-                  launcher: Callable[[TrainingJob, str, str, str, bool, int, bool], subprocess.Popen] = launch_job,
+                  ddp: int = 1,
+                  launcher: Callable[[TrainingJob, str, str, str, bool, int, bool, int], subprocess.Popen] = launch_job,
                   monotonic: Callable[[], float] = time.monotonic,
                   wall_clock: Callable[[], datetime] = datetime.now,
                   sleep: Callable[[float], None] = time.sleep,
                   poll_interval: float = 5.0) -> list[FinishedJob]:
     pending = list(jobs)
-    free_gpus = list(gpu_tokens)
+    free_gpus = group_gpu_tokens(gpu_tokens, ddp)
+    if pending and not free_gpus:
+        raise ValueError(f"Cannot schedule jobs with --ddp {ddp} across {len(gpu_tokens)} GPU(s).")
     running: list[RunningJob] = []
     results: list[FinishedJob] = []
 
@@ -528,7 +592,7 @@ def schedule_jobs(jobs: Sequence[TrainingJob],
             gpu = free_gpus.pop(0)
             job = pending.pop(0)
             process = launcher(job, gpu, plans_file, trainer_name, disable_tta,
-                               checkpoint_interval, disable_train_val)
+                               checkpoint_interval, disable_train_val, ddp)
             started_at = wall_clock()
             running.append(RunningJob(job, gpu, process, monotonic(), started_at))
             log_start(console, job, gpu, started_at)
@@ -566,7 +630,7 @@ def get_visible_gpus() -> list[str]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Schedule multiple single-GPU nnU-Net training jobs.")
+    parser = argparse.ArgumentParser(description="Schedule multiple nnU-Net training jobs across GPUs.")
     parser.add_argument("-d", "--dataset", help="Dataset ID or DatasetXXX_name.")
     parser.add_argument(
         "-t",
@@ -603,6 +667,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Individual jobs to remove from the schedule, for example: -e 3x-s,0 4x-m,1",
     )
     parser.add_argument(
+        "--ddp",
+        type=int,
+        default=1,
+        help="Number of GPUs assigned to each job. Default: 1.",
+    )
+    parser.add_argument(
         "--disable-tta",
         action="store_true",
         default=False,
@@ -628,6 +698,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     if args.ckpt_interval <= 0:
         parser.error("--ckpt-interval must be greater than 0")
+    if args.ddp <= 0:
+        parser.error("--ddp must be greater than 0")
 
     if args.worker:
         missing = [i for i in ("plans_file", "configuration", "fold", "trainer") if getattr(args, i) is None]
@@ -645,7 +717,7 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
 
     if args.worker:
         run_training_worker(args.plans_file, args.configuration, args.fold, args.trainer, args.disable_tta,
-                            args.ckpt_interval, args.disable_train_val)
+                            args.ckpt_interval, args.disable_train_val, args.ddp)
         return 0
 
     console = Console()
@@ -656,17 +728,21 @@ def batch_train_entry(argv: Sequence[str] | None = None) -> int:
         plans_file,
         requested_configurations_from_jobs(jobs, args.exclude),
     )
+    validate_ddp_batch_sizes(plans_file, requested_configurations_from_jobs(jobs), args.ddp)
 
     gpu_tokens = get_visible_gpus()
     if not gpu_tokens:
         raise RuntimeError("No visible CUDA GPUs found.")
+    if len(gpu_tokens) < args.ddp:
+        raise RuntimeError(f"--ddp {args.ddp} requires at least {args.ddp} visible GPUs, found {len(gpu_tokens)}.")
 
     console.print(
         f"[bold]Scheduling {len(jobs)} jobs[/bold] across [bold]{len(gpu_tokens)} GPUs[/bold] "
+        f"using [bold]{args.ddp} GPU(s) per job[/bold] "
         f"with plans [bold]{plans_file}[/bold]"
     )
     results = schedule_jobs(jobs, gpu_tokens, plans_file, args.trainer, args.disable_tta,
-                            args.ckpt_interval, args.disable_train_val, console)
+                            args.ckpt_interval, args.disable_train_val, console, args.ddp)
     print_summary(console, results)
     return 1 if any(i.returncode != 0 for i in results) else 0
 
