@@ -518,7 +518,7 @@ class BaselinePlanner(CondUNetPlanner):
 
 class TemporaryPlanner(BaselinePlanner):
     _temporary_configurations = {
-        "4x-m_tcc_tse-6-3-1-1": {
+        "4x-m_tcc_tse-6-3-1-1_dp-0.2": {
             "inherits_from": "4x-m",
             "architecture": {
                 "arch_kwargs": {
@@ -537,6 +537,7 @@ class TemporaryPlanner(BaselinePlanner):
                             [1, 1, 1],
                         ],
                     },
+                    "drop_rate": 0.2
                 },
             },
         }
