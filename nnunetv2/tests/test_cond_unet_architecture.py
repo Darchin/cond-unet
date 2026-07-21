@@ -140,8 +140,15 @@ def test_router_is_bottlenecked_and_uniformly_initialized():
     torch.testing.assert_close(scores.sum(dim=-1), torch.ones(2, 2, 3))
 
 
-def test_router_uses_sigmoid_normalized_mixture():
+def test_global_router_uses_adaptive_pooling_and_sigmoid_normalized_mixture(
+    monkeypatch,
+):
     router = Router(3, 3, grid_size=None, reduction=2, nonlin=nn.ReLU)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("global routing should use adaptive average pooling")
+
+    monkeypatch.setattr(torch.nn.functional, "avg_pool2d", fail_if_called)
     with torch.no_grad():
         router.output_projection.weight.zero_()
         router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
@@ -153,18 +160,25 @@ def test_router_uses_sigmoid_normalized_mixture():
     torch.testing.assert_close(actual.sum(dim=-1), torch.ones(2, 1, 1))
 
 
-def test_router_uses_adaptive_average_pooling_for_tile_descriptors():
+def test_router_uses_fixed_average_pooling_for_tile_descriptors(monkeypatch):
     router = Router(2, 3, grid_size=(2, 3), reduction=2, nonlin=nn.ReLU)
     descriptors = []
     handle = router.input_projection.register_forward_pre_hook(
         lambda _module, inputs: descriptors.append(inputs[0].detach().clone())
     )
     x = torch.arange(48, dtype=torch.float32).reshape(1, 2, 4, 6)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("tiled routing should use fixed average pooling")
+
+    monkeypatch.setattr(torch.nn.functional, "adaptive_avg_pool2d", fail_if_called)
     try:
         router(x)
     finally:
         handle.remove()
-    expected = torch.nn.functional.adaptive_avg_pool2d(x, (2, 3)).movedim(1, -1)
+    expected = torch.nn.functional.avg_pool2d(
+        x, kernel_size=(2, 2), stride=(2, 2)
+    ).movedim(1, -1)
     torch.testing.assert_close(descriptors[0], expected)
 
 
@@ -223,6 +237,7 @@ def test_global_squeeze_excitation_broadcasts_scores_without_interpolation(
         raise AssertionError("global SE scores should be broadcast without interpolation")
 
     monkeypatch.setattr(torch.nn.functional, "interpolate", fail_if_called)
+    monkeypatch.setattr(torch.nn.functional, "avg_pool2d", fail_if_called)
     output = se(x)
     output.sum().backward()
 
@@ -240,7 +255,9 @@ def test_tiled_squeeze_excitation_replicates_scores_within_tiles():
         se.output_projection.weight.copy_(torch.tensor([[0.01], [-0.01]]))
         se.output_projection.bias.zero_()
     x = torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4)
-    descriptor = torch.nn.functional.adaptive_avg_pool2d(x, (2, 2)).movedim(1, -1)
+    descriptor = torch.nn.functional.avg_pool2d(
+        x, kernel_size=(2, 2), stride=(2, 2)
+    ).movedim(1, -1)
     logits = se.output_projection(se.input_projection(descriptor))
     expected_scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
     expected_scores = expected_scores.repeat_interleave(2, dim=2).repeat_interleave(
@@ -250,6 +267,58 @@ def test_tiled_squeeze_excitation_replicates_scores_within_tiles():
     torch.testing.assert_close(se(x), x * expected_scores)
     assert torch.all(expected_scores > 0)
     assert torch.all(expected_scores < 2)
+
+
+@pytest.mark.parametrize(
+    ("spatial_shape", "grid_size"),
+    [
+        ((4, 6), (2, 3)),
+        ((4, 6, 8), (2, 3, 2)),
+    ],
+)
+def test_tiled_squeeze_excitation_broadcast_matches_interpolation_forward_and_backward(
+    spatial_shape, grid_size, monkeypatch
+):
+    se = SqueezeExcitation(3, grid_size=grid_size, reduction=2, nonlin=nn.ReLU).double()
+    x = torch.randn(2, 3, *spatial_shape, dtype=torch.double, requires_grad=True)
+
+    spatial_dims = len(spatial_shape)
+    adaptive_avg_pool = (
+        torch.nn.functional.adaptive_avg_pool1d,
+        torch.nn.functional.adaptive_avg_pool2d,
+        torch.nn.functional.adaptive_avg_pool3d,
+    )[spatial_dims - 1]
+    descriptor = adaptive_avg_pool(x, grid_size).movedim(1, -1)
+    logits = se.output_projection(se.nonlin(se.input_projection(descriptor)))
+    compact_scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
+    expected = x * torch.nn.functional.interpolate(
+        compact_scores, size=spatial_shape, mode="nearest"
+    )
+    output_gradient = torch.randn_like(expected)
+    expected_gradients = torch.autograd.grad(
+        expected,
+        (x, *se.parameters()),
+        output_gradient,
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError(
+            "tiled SE should use fixed pooling and broadcast scores without interpolation"
+        )
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", fail_if_called)
+    adaptive_avg_pool_name = f"adaptive_avg_pool{spatial_dims}d"
+    monkeypatch.setattr(torch.nn.functional, adaptive_avg_pool_name, fail_if_called)
+    actual = se(x)
+    actual_gradients = torch.autograd.grad(
+        actual,
+        (x, *se.parameters()),
+        output_gradient,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
 def test_squeeze_excitation_rejects_non_divisible_grid():

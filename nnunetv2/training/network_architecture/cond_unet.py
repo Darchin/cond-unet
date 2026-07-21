@@ -312,6 +312,22 @@ def _interpolation_mode(conv_op: Type[_ConvNd]) -> str:
     return "linear"
 
 
+def _pool_to_grid(x: torch.Tensor, grid_size: Sequence[int]) -> torch.Tensor:
+    """Pool globally with adaptive pooling or tiled with fixed non-overlapping windows."""
+    spatial_dims = x.ndim - 2
+    if tuple(grid_size) == (1,) * spatial_dims:
+        adaptive_avg_pool = (
+            F.adaptive_avg_pool1d,
+            F.adaptive_avg_pool2d,
+            F.adaptive_avg_pool3d,
+        )[spatial_dims - 1]
+        return adaptive_avg_pool(x, grid_size)
+
+    tile_size = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
+    avg_pool = (F.avg_pool1d, F.avg_pool2d, F.avg_pool3d)[spatial_dims - 1]
+    return avg_pool(x, kernel_size=tile_size, stride=tile_size)
+
+
 def _conv_output_shape(
     input_size: Sequence[int], kernel_size: Sequence[int], stride: Sequence[int]
 ) -> List[int]:
@@ -323,7 +339,7 @@ def _conv_output_shape(
 
 
 class Router(nn.Module):
-    """Adaptive-average-pooling router with one expert mixture per grid cell."""
+    """Average-pooling router with one expert mixture per grid cell."""
 
     def __init__(
         self,
@@ -386,12 +402,7 @@ class Router(nn.Module):
                 f"input spatial shape {tuple(x.shape[2:])} must be divisible by routing grid {grid_size}"
             )
 
-        adaptive_avg_pool = (
-            F.adaptive_avg_pool1d,
-            F.adaptive_avg_pool2d,
-            F.adaptive_avg_pool3d,
-        )[spatial_dims - 1]
-        descriptor = adaptive_avg_pool(x, grid_size).movedim(1, -1)
+        descriptor = _pool_to_grid(x, grid_size).movedim(1, -1)
         logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
         expert_scores = F.sigmoid(logits)
         expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
@@ -456,20 +467,16 @@ class SqueezeExcitation(nn.Module):
                 f"input spatial shape {tuple(x.shape[2:])} must be divisible by SE grid {grid_size}"
             )
 
-        adaptive_avg_pool = (
-            F.adaptive_avg_pool1d,
-            F.adaptive_avg_pool2d,
-            F.adaptive_avg_pool3d,
-        )[spatial_dims - 1]
-        descriptor = adaptive_avg_pool(x, grid_size).movedim(1, -1)
+        descriptor = _pool_to_grid(x, grid_size).movedim(1, -1)
         logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
         scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
         if grid_size != (1,) * spatial_dims:
-            scores = F.interpolate(
-                scores,
-                size=x.shape[2:],
-                mode="nearest",
-            )
+            tiled_shape = [x.shape[0], x.shape[1]]
+            score_shape = [x.shape[0], x.shape[1]]
+            for size, grid in zip(x.shape[2:], grid_size):
+                tiled_shape.extend((grid, size // grid))
+                score_shape.extend((grid, 1))
+            return (x.reshape(tiled_shape) * scores.reshape(score_shape)).reshape_as(x)
         return x * scores
 
 
