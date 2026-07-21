@@ -36,19 +36,6 @@ GridConfig = Union[
 ]
 
 
-class GroupNorm(nn.GroupNorm):
-    """GroupNorm with ``num_channels`` first for generic norm construction."""
-
-    def __init__(
-        self,
-        num_channels: int,
-        num_groups: int,
-        eps: float = 1e-5,
-        affine: bool = True,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__(num_groups, num_channels, eps, affine, device, dtype)
 
 
 @dataclass
