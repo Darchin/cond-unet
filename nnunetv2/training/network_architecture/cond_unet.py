@@ -432,6 +432,10 @@ class SqueezeExcitation(nn.Module):
     def hidden_channels(self):
         return self.router.hidden_channels
 
+    def reset_parameters(self) -> None:
+        """Restore identity-initialized gates through the shared router."""
+        self.router.reset_parameters()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_dims = x.ndim - 2
         grid_size = (

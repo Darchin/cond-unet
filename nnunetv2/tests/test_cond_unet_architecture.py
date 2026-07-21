@@ -605,6 +605,25 @@ def test_condunet_initializer_handles_ungrouped_expert_weights():
             assert torch.count_nonzero(module.expert_weights) > 0
 
 
+def test_condunet_initializer_resets_shared_se_router():
+    model = _small_model(se={"enabled": True})
+    se = model.encoder.stages[0].blocks[0].se
+    with torch.no_grad():
+        se.router.output_projection.weight.fill_(1)
+        se.router.output_projection.bias.fill_(1)
+
+    model.apply(model.initialize)
+
+    torch.testing.assert_close(
+        se.router.output_projection.weight,
+        torch.zeros_like(se.router.output_projection.weight),
+    )
+    torch.testing.assert_close(
+        se.router.output_projection.bias,
+        torch.zeros_like(se.router.output_projection.bias),
+    )
+
+
 def test_cc_router_settings_are_propagated():
     model = _small_model(
         nonlin_kwargs={"inplace": True},
