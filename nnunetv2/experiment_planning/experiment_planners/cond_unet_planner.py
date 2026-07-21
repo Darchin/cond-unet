@@ -523,9 +523,9 @@ class TemporaryPlanner(BaselinePlanner):
             "architecture": {
                 "arch_kwargs": {
                     "se": {
-                        "encoder": True,
+                        "enabled": True,
                         "placement": "end",
-                        "encoder_grid_size": [
+                        "grid_size": [
                             [6, 6, 6],
                             [3, 3, 3],
                             [1, 1, 1],
@@ -533,9 +533,9 @@ class TemporaryPlanner(BaselinePlanner):
                         ],
                     },
                     "cc": {
-                        "encoder": True,
-                        "encoder_num_experts": 4,
-                        "encoder_grid_size": [
+                        "enabled": True,
+                        "num_experts": 4,
+                        "grid_size": [
                             [6, 6, 6],
                             [3, 3, 3],
                             [1, 1, 1],
@@ -550,9 +550,9 @@ class TemporaryPlanner(BaselinePlanner):
             "architecture": {
                 "arch_kwargs": {
                     "se": {
-                        "encoder": True,
+                        "enabled": True,
                         "placement": "end",
-                        "encoder_grid_size": [
+                        "grid_size": [
                             [6, 6, 6],
                             [3, 3, 3],
                             [1, 1, 1],
@@ -567,9 +567,9 @@ class TemporaryPlanner(BaselinePlanner):
             "architecture": {
                 "arch_kwargs": {
                     "cc": {
-                        "encoder": True,
-                        "encoder_num_experts": 4,
-                        "encoder_grid_size": [
+                        "enabled": True,
+                        "num_experts": 4,
+                        "grid_size": [
                             [6, 6, 6],
                             [3, 3, 3],
                             [1, 1, 1],

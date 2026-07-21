@@ -37,33 +37,29 @@ GridConfig = Union[
 
 
 
-
 @dataclass
 class CCConfig:
     """CondConv (dense mixture-of-experts) addon configuration.
 
     Attributes:
-        encoder: Per-block CC enablement in the encoder.
-        decoder: Per-block CC enablement in the decoder.
-        encoder_num_experts: Number of experts per encoder stage (int or per-stage list).
-        decoder_num_experts: Number of experts per decoder stage.
-        encoder_grid_size: Routing grid shape shared by all encoder stages or
-            one grid shape per encoder stage.
-        decoder_grid_size: Routing grid shape shared by all decoder stages or
-            one grid shape per decoder stage.
+        enabled: Per-block CC enablement in the encoder.
+        num_experts: Number of experts per encoder stage (int or per-stage list).
+        grid_size: Routing grid shape shared by all encoder stages or one grid
+            shape per encoder stage.
         reduction: Reduction factor for the router MLP hidden width.
+        include_std: Include each routing window's standard deviation in its
+            descriptor.
     """
 
-    encoder: BoolConfig = False
-    decoder: BoolConfig = False
-    encoder_num_experts: IntConfig = 0
-    decoder_num_experts: IntConfig = 0
-    encoder_grid_size: GridConfig = None
-    decoder_grid_size: GridConfig = None
+    enabled: BoolConfig = False
+    num_experts: IntConfig = 0
+    grid_size: GridConfig = None
     reduction: float = 8.0
+    include_std: bool = False
 
     def __post_init__(self):
         self.reduction = _validate_reduction(self.reduction, "cc.reduction")
+        self.include_std = _validate_bool(self.include_std, "cc.include_std")
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -78,26 +74,25 @@ class SEConfig:
     """Squeeze-and-Excitation addon configuration.
 
     Attributes:
-        encoder: Per-block SE enablement in the encoder.
-        decoder: Per-block SE enablement in the decoder.
-        encoder_grid_size: SE grid shape shared by all encoder stages or one
+        enabled: Per-block SE enablement in the encoder.
+        grid_size: SE grid shape shared by all encoder stages or one
             explicit grid shape (or None) per encoder stage.
-        decoder_grid_size: SE grid shape shared by all decoder stages or one
-            explicit grid shape (or None) per decoder stage.
         reduction: Reduction factor for the SE MLP hidden width.
+        include_std: Include each SE window's standard deviation in its
+            descriptor.
         placement: Position of enabled SE blocks within each inverted bottleneck.
             Must be ``"start"``, ``"middle"``, or ``"end"``.
     """
 
-    encoder: BoolConfig = False
-    decoder: BoolConfig = False
-    encoder_grid_size: GridConfig = None
-    decoder_grid_size: GridConfig = None
+    enabled: BoolConfig = False
+    grid_size: GridConfig = None
     reduction: float = 8.0
+    include_std: bool = False
     placement: str = "middle"
 
     def __post_init__(self):
         self.reduction = _validate_reduction(self.reduction, "se.reduction")
+        self.include_std = _validate_bool(self.include_std, "se.include_std")
         self.placement = _validate_se_placement(self.placement)
 
     @classmethod
@@ -152,6 +147,24 @@ def _validate_reduction(value: float, name: str) -> float:
         or value < 1
     ):
         raise ValueError(f"{name} must be a finite number greater than or equal to 1")
+    return float(value)
+
+
+def _validate_bool(value: bool, name: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a boolean")
+    return bool(value)
+
+
+def _validate_drop_rate(value: float) -> float:
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or value >= 1
+    ):
+        raise ValueError("drop_rate must be a finite number in the range [0, 1)")
     return float(value)
 
 
@@ -299,22 +312,6 @@ def _interpolation_mode(conv_op: Type[_ConvNd]) -> str:
     return "linear"
 
 
-def _pool_to_grid(x: torch.Tensor, grid_size: Sequence[int]) -> torch.Tensor:
-    """Pool globally with adaptive pooling or tiled with fixed non-overlapping windows."""
-    spatial_dims = x.ndim - 2
-    if tuple(grid_size) == (1,) * spatial_dims:
-        adaptive_avg_pool = (
-            F.adaptive_avg_pool1d,
-            F.adaptive_avg_pool2d,
-            F.adaptive_avg_pool3d,
-        )[spatial_dims - 1]
-        return adaptive_avg_pool(x, grid_size)
-
-    tile_size = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
-    avg_pool = (F.avg_pool1d, F.avg_pool2d, F.avg_pool3d)[spatial_dims - 1]
-    return avg_pool(x, kernel_size=tile_size, stride=tile_size)
-
-
 def _conv_output_shape(
     input_size: Sequence[int], kernel_size: Sequence[int], stride: Sequence[int]
 ) -> List[int]:
@@ -326,51 +323,49 @@ def _conv_output_shape(
 
 
 class Router(nn.Module):
-    """Average-pooling router with one expert mixture per grid cell."""
+    """Window descriptor pooling followed by a bottleneck MLP."""
 
     def __init__(
         self,
         input_channels: int,
-        num_experts: int,
+        output_channels: int,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
+        include_std: bool = False,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
     ):
         super().__init__()
-        if num_experts <= 0:
-            raise ValueError("num_experts must be greater than 0")
+        if output_channels <= 0:
+            raise ValueError("output_channels must be greater than 0")
         if reduction < 1:
             raise ValueError("reduction must be greater than or equal to 1")
 
-        self.num_experts = num_experts
+        self.input_channels = input_channels
+        self.output_channels = output_channels
         self.grid_size = grid_size
+        self.include_std = _validate_bool(include_std, "include_std")
         self.hidden_channels = max(1, int(input_channels / reduction))
-        self.input_projection = nn.Linear(input_channels, self.hidden_channels)
+        descriptor_channels = input_channels * (2 if include_std else 1)
+        self.input_projection = nn.Linear(descriptor_channels, self.hidden_channels)
         self.nonlin = (
             nonlin(**({} if nonlin_kwargs is None else nonlin_kwargs))
             if nonlin is not None
             else nn.Identity()
         )
-        self.output_projection = nn.Linear(self.hidden_channels, num_experts)
+        self.output_projection = nn.Linear(self.hidden_channels, output_channels)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        nn.init.zeros_(self.output_projection.bias)
         nn.init.zeros_(self.output_projection.weight)
-        expert_bias = math.log(math.expm1(1 / self.num_experts))
-        with torch.no_grad():
-            self.output_projection.bias.fill_(expert_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_dims = x.ndim - 2
         if isinstance(self.grid_size, (int, np.integer)):
-            raise TypeError(
-                "grid_size must be None or an explicit spatial grid shape"
-            )
+            raise TypeError("grid_size must be None or an explicit spatial grid shape")
         grid_size = (
-            (1,) * spatial_dims
-            if self.grid_size is None
-            else tuple(self.grid_size)
+            (1,) * spatial_dims if self.grid_size is None else tuple(self.grid_size)
         )
         if len(grid_size) != spatial_dims:
             raise ValueError(
@@ -389,11 +384,19 @@ class Router(nn.Module):
                 f"input spatial shape {tuple(x.shape[2:])} must be divisible by routing grid {grid_size}"
             )
 
-        descriptor = _pool_to_grid(x, grid_size).movedim(1, -1)
-        logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
-        expert_scores = F.sigmoid(logits)
-        expert_mixture = expert_scores / expert_scores.sum(dim=-1, keepdim=True)
-        return expert_mixture
+        tile_size = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
+        tiled_shape = [x.shape[0], x.shape[1]]
+        for grid, tile in zip(grid_size, tile_size):
+            tiled_shape.extend((grid, tile))
+        tiled = x.reshape(tiled_shape)
+        tile_axes = tuple(range(3, tiled.ndim, 2))
+        if self.include_std:
+            std, mean = torch.std_mean(tiled, dim=tile_axes, correction=0)
+            descriptor = torch.cat((mean, std), dim=1)
+        else:
+            descriptor = torch.mean(tiled, dim=tile_axes)
+        descriptor = descriptor.movedim(1, -1)
+        return self.output_projection(self.nonlin(self.input_projection(descriptor)))
 
 
 class SqueezeExcitation(nn.Module):
@@ -404,58 +407,37 @@ class SqueezeExcitation(nn.Module):
         input_channels: int,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
+        include_std: bool = False,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
     ):
         super().__init__()
         if input_channels <= 0:
             raise ValueError("input_channels must be greater than 0")
-        reduction = _validate_reduction(reduction, "reduction")
-        self.grid_size = grid_size
-        self.hidden_channels = max(1, int(input_channels / reduction))
-        self.input_projection = nn.Linear(input_channels, self.hidden_channels)
-        self.nonlin = (
-            nonlin(**({} if nonlin_kwargs is None else nonlin_kwargs))
-            if nonlin is not None
-            else nn.Identity()
+        self.router = Router(
+            input_channels,
+            input_channels,
+            grid_size=grid_size,
+            reduction=reduction,
+            include_std=include_std,
+            nonlin=nonlin,
+            nonlin_kwargs=nonlin_kwargs,
         )
-        self.output_projection = nn.Linear(self.hidden_channels, input_channels)
-        self.reset_parameters()
 
-    def reset_parameters(self) -> None:
-        nn.init.zeros_(self.output_projection.weight)
-        nn.init.zeros_(self.output_projection.bias)
+    @property
+    def grid_size(self):
+        return self.router.grid_size
+
+    @property
+    def hidden_channels(self):
+        return self.router.hidden_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial_dims = x.ndim - 2
-        if isinstance(self.grid_size, (int, np.integer)):
-            raise TypeError(
-                "grid_size must be None or an explicit spatial grid shape"
-            )
         grid_size = (
-            (1,) * spatial_dims
-            if self.grid_size is None
-            else tuple(self.grid_size)
+            (1,) * spatial_dims if self.grid_size is None else tuple(self.grid_size)
         )
-        if len(grid_size) != spatial_dims:
-            raise ValueError(
-                f"grid_size must contain exactly {spatial_dims} values, got {len(grid_size)}"
-            )
-        if any(
-            not isinstance(grid, (int, np.integer))
-            or isinstance(grid, bool)
-            or grid <= 0
-            for grid in grid_size
-        ):
-            raise ValueError("grid_size values must be positive integers")
-        grid_size = tuple(int(grid) for grid in grid_size)
-        if any(size % grid for size, grid in zip(x.shape[2:], grid_size)):
-            raise ValueError(
-                f"input spatial shape {tuple(x.shape[2:])} must be divisible by SE grid {grid_size}"
-            )
-
-        descriptor = _pool_to_grid(x, grid_size).movedim(1, -1)
-        logits = self.output_projection(self.nonlin(self.input_projection(descriptor)))
+        logits = self.router(x)
         scores = (2 * torch.sigmoid(logits)).movedim(-1, 1)
         if grid_size != (1,) * spatial_dims:
             tiled_shape = [x.shape[0], x.shape[1]]
@@ -483,7 +465,9 @@ class CondPWConv(nn.Module):
                 "CondPWConv is only compatible with dense pointwise convolutions."
             )
         if conv.bias is not None:
-            raise ValueError("CondPWConv only supports bias-free pointwise convolutions.")
+            raise ValueError(
+                "CondPWConv only supports bias-free pointwise convolutions."
+            )
 
         self.in_channels = conv.in_channels
         self.out_channels = conv.out_channels
@@ -500,9 +484,7 @@ class CondPWConv(nn.Module):
         for expert_weight in self.expert_weights:
             nn.init.kaiming_uniform_(expert_weight, a=math.sqrt(5))
 
-    def _blend_experts(
-        self, flat_scores: torch.Tensor
-    ) -> torch.Tensor:
+    def _blend_experts(self, flat_scores: torch.Tensor) -> torch.Tensor:
         """Blend expert weights using routing scores.
 
         Args:
@@ -567,9 +549,7 @@ class CondPWConv(nn.Module):
         spatial_axes = []
         for dim in range(self.spatial_dims):
             spatial_axes.extend((1 + dim, channel_axis + 1 + dim))
-        spatial_shape = tuple(
-            grid * tile for grid, tile in zip(grid_size, tile_shape)
-        )
+        spatial_shape = tuple(grid * tile for grid, tile in zip(grid_size, tile_shape))
         return (
             output.reshape(tiled_shape)
             .permute(0, channel_axis, *spatial_axes)
@@ -648,8 +628,7 @@ def _expand_grid_sizes(
         grid = tuple(_normalize_spatial_param(conv_op, values, name))
         return [grid] * n_stages
     if any(
-        stage_grid is not None
-        and not isinstance(stage_grid, (list, tuple, np.ndarray))
+        stage_grid is not None and not isinstance(stage_grid, (list, tuple, np.ndarray))
         for stage_grid in values
     ):
         raise ValueError(
@@ -663,10 +642,12 @@ def _expand_grid_sizes(
         )
 
     return [
-        (1,) * spatial_dims
-        if stage_grid is None
-        else tuple(
-            _normalize_spatial_param(conv_op, stage_grid, f"{name}[{stage_idx}]")
+        (
+            (1,) * spatial_dims
+            if stage_grid is None
+            else tuple(
+                _normalize_spatial_param(conv_op, stage_grid, f"{name}[{stage_idx}]")
+            )
         )
         for stage_idx, stage_grid in enumerate(values)
     ]
@@ -789,6 +770,24 @@ def _normalize_stage_settings(
     return settings
 
 
+def _schedule_encoder_drop_rates(
+    stage_settings: Sequence[_StageSettings], drop_rate: float
+) -> List[List[float]]:
+    drop_rate = _validate_drop_rate(drop_rate)
+    scheduled = [[0.0] * settings.n_blocks for settings in stage_settings]
+    eligible = [(0, 0)] + [
+        (stage_idx, block_idx)
+        for stage_idx, settings in enumerate(stage_settings)
+        for block_idx in range(1, settings.n_blocks)
+    ]
+    if len(eligible) == 1:
+        return scheduled
+    denominator = len(eligible) - 1
+    for position, (stage_idx, block_idx) in enumerate(eligible):
+        scheduled[stage_idx][block_idx] = drop_rate * position / denominator
+    return scheduled
+
+
 def _forward_routed_conv_block(
     conv_block: ConvDropoutNormReLU, x: torch.Tensor, scores: torch.Tensor
 ) -> torch.Tensor:
@@ -880,10 +879,13 @@ class InvertedBottleneckBlock(nn.Module):
         cc: bool = False,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
+        cc_include_std: bool = False,
         se: bool = False,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
+        se_include_std: bool = False,
         se_placement: str = "middle",
+        drop_rate: float = 0.0,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -947,6 +949,7 @@ class InvertedBottleneckBlock(nn.Module):
         self.add_identity = input_channels == output_channels and all(
             i == 1 for i in self.stride
         )
+        self.drop_rate = _validate_drop_rate(drop_rate)
 
         self.num_experts = num_experts if cc else 0
         self.grid_size = grid_size
@@ -961,6 +964,7 @@ class InvertedBottleneckBlock(nn.Module):
                 num_experts,
                 grid_size=grid_size,
                 reduction=reduction,
+                include_std=cc_include_std,
                 nonlin=nonlin,
                 nonlin_kwargs=nonlin_kwargs,
             )
@@ -977,6 +981,7 @@ class InvertedBottleneckBlock(nn.Module):
                 se_channels,
                 grid_size=se_grid_size,
                 reduction=se_reduction,
+                include_std=se_include_std,
                 nonlin=nonlin,
                 nonlin_kwargs=nonlin_kwargs,
             )
@@ -987,7 +992,8 @@ class InvertedBottleneckBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         if self.router is not None:
-            scores = self.router(x)
+            raw_scores = torch.sigmoid(self.router(x))
+            scores = raw_scores / raw_scores.sum(dim=-1, keepdim=True)
             x = _forward_routed_conv_block(self.expand, x, scores)
         else:
             x = self.expand(x)
@@ -1006,6 +1012,13 @@ class InvertedBottleneckBlock(nn.Module):
         if self.se is not None and self.se_placement == "end":
             x = self.se(x)
         if self.add_identity:
+            if self.training and self.drop_rate > 0:
+                keep_probability = 1 - self.drop_rate
+                mask_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+                keep_mask = torch.empty(
+                    mask_shape, dtype=x.dtype, device=x.device
+                ).bernoulli_(keep_probability)
+                x = x * keep_mask / keep_probability
             x = x + residual
         return x
 
@@ -1041,10 +1054,13 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         cc_config: List[bool] = None,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
+        cc_include_std: bool = False,
         se_config: List[bool] = None,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
+        se_include_std: bool = False,
         se_placement: str = "middle",
+        drop_rates: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         if (
@@ -1069,6 +1085,12 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
             raise ValueError(
                 f"se_config length ({len(se_config)}) must match n_blocks ({n_blocks})"
             )
+        if drop_rates is None:
+            drop_rates = [0.0] * n_blocks
+        if len(drop_rates) != n_blocks:
+            raise ValueError(
+                f"drop_rates length ({len(drop_rates)}) must match n_blocks ({n_blocks})"
+            )
 
         def make_block(
             block_idx: int,
@@ -1092,10 +1114,13 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 cc=block_cc,
                 grid_size=grid_size,
                 reduction=reduction,
+                cc_include_std=cc_include_std,
                 se=block_se,
                 se_grid_size=se_grid_size,
                 se_reduction=se_reduction,
+                se_include_std=se_include_std,
                 se_placement=se_placement,
+                drop_rate=drop_rates[block_idx],
             )
 
         self.blocks = nn.ModuleList(
@@ -1153,12 +1178,15 @@ class CondUNetEncoder(nn.Module):
         stem_stride: Union[int, List[int], Tuple[int, ...]] = 1,
         num_experts: Union[int, Sequence[int]] = 0,
         cc: BoolConfig = False,
-        grid_size: GridConfig = None,
-        reduction: float = 8.0,
+        cc_grid_size: GridConfig = None,
+        cc_reduction: float = 8.0,
+        cc_include_std: bool = False,
         se: BoolConfig = False,
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
+        se_include_std: bool = False,
         se_placement: str = "middle",
+        drop_rate: float = 0.0,
     ):
         super().__init__()
         if (
@@ -1209,22 +1237,21 @@ class CondUNetEncoder(nn.Module):
             n_blocks_per_stage,
             expansion_ratio,
             num_experts,
-            grid_size,
+            cc_grid_size,
             cc,
             se_grid_size,
             se,
             "encoder",
             conv_op,
         )
+        stage_drop_rates = _schedule_encoder_drop_rates(stage_settings, drop_rate)
         self.num_experts = [settings.num_experts for settings in stage_settings]
         self.grid_sizes = [settings.grid_size for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
         self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
-        self.se_grid_sizes = [
-            settings.se_grid_size for settings in stage_settings
-        ]
+        self.se_grid_sizes = [settings.se_grid_size for settings in stage_settings]
         self.se_config = [list(settings.se_blocks) for settings in stage_settings]
 
         stem_channels = (
@@ -1278,11 +1305,14 @@ class CondUNetEncoder(nn.Module):
                     num_experts=settings.num_experts,
                     cc_config=list(settings.cc_blocks),
                     grid_size=settings.grid_size,
-                    reduction=reduction,
+                    reduction=cc_reduction,
+                    cc_include_std=cc_include_std,
                     se_config=list(settings.se_blocks),
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
+                    se_include_std=se_include_std,
                     se_placement=se_placement,
+                    drop_rates=stage_drop_rates[stage_idx],
                 )
             )
             stage_input_channels = features_per_stage[stage_idx]
@@ -1338,14 +1368,6 @@ class CondUNetDecoder(nn.Module):
         n_blocks_per_stage: Union[int, Tuple[int, ...], List[int]],
         deep_supervision: bool,
         expansion_ratio: Union[float, Sequence[float]] = 3.0,
-        num_experts: Union[int, Sequence[int]] = 0,
-        cc: BoolConfig = False,
-        grid_size: GridConfig = None,
-        reduction: float = 8.0,
-        se: BoolConfig = False,
-        se_grid_size: GridConfig = None,
-        se_reduction: float = 8.0,
-        se_placement: str = "middle",
     ):
         super().__init__()
         if (
@@ -1369,24 +1391,17 @@ class CondUNetDecoder(nn.Module):
             n_stages_encoder - 1,
             n_blocks_per_stage,
             expansion_ratio,
-            num_experts,
-            grid_size,
-            cc,
-            se_grid_size,
-            se,
+            0,
+            None,
+            False,
+            None,
+            False,
             "decoder",
             encoder.conv_op,
         )
-        self.num_experts = [settings.num_experts for settings in stage_settings]
-        self.grid_sizes = [settings.grid_size for settings in stage_settings]
         self.expansion_ratios = [
             settings.expansion_ratio for settings in stage_settings
         ]
-        self.cc_config = [list(settings.cc_blocks) for settings in stage_settings]
-        self.se_grid_sizes = [
-            settings.se_grid_size for settings in stage_settings
-        ]
-        self.se_config = [list(settings.se_blocks) for settings in stage_settings]
 
         stages = []
         for s in range(1, n_stages_encoder):
@@ -1408,14 +1423,6 @@ class CondUNetDecoder(nn.Module):
                     nonlin=encoder.nonlin,
                     nonlin_kwargs=encoder.nonlin_kwargs,
                     expansion_ratio=settings.expansion_ratio,
-                    num_experts=settings.num_experts,
-                    cc_config=list(settings.cc_blocks),
-                    grid_size=settings.grid_size,
-                    reduction=reduction,
-                    se_config=list(settings.se_blocks),
-                    se_grid_size=settings.se_grid_size,
-                    se_reduction=se_reduction,
-                    se_placement=se_placement,
                 )
             )
 
@@ -1500,6 +1507,7 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         stem: Union[StemConfig, dict, None] = None,
         cc: Union[CCConfig, dict, None] = None,
         se: Union[SEConfig, dict, None] = None,
+        drop_rate: float = 0.0,
     ):
         super().__init__()
         self.key_to_encoder = "encoder.stages"
@@ -1540,14 +1548,17 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             stem_channels=stem.channels,
             stem_kernel_size=stem.kernel_size,
             stem_stride=stem.stride,
-            num_experts=cc.encoder_num_experts,
-            cc=cc.encoder,
-            grid_size=cc.encoder_grid_size,
-            reduction=cc.reduction,
-            se=se.encoder,
-            se_grid_size=se.encoder_grid_size,
+            num_experts=cc.num_experts,
+            cc=cc.enabled,
+            cc_grid_size=cc.grid_size,
+            cc_reduction=cc.reduction,
+            cc_include_std=cc.include_std,
+            se=se.enabled,
+            se_grid_size=se.grid_size,
             se_reduction=se.reduction,
+            se_include_std=se.include_std,
             se_placement=se.placement,
+            drop_rate=drop_rate,
         )
         self.decoder = CondUNetDecoder(
             encoder=self.encoder,
@@ -1555,14 +1566,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             n_blocks_per_stage=decoder_n_blocks_per_stage,
             deep_supervision=deep_supervision,
             expansion_ratio=decoder_expansion_ratio,
-            num_experts=cc.decoder_num_experts,
-            cc=cc.decoder,
-            grid_size=cc.decoder_grid_size,
-            reduction=cc.reduction,
-            se=se.decoder,
-            se_grid_size=se.decoder_grid_size,
-            se_reduction=se.reduction,
-            se_placement=se.placement,
         )
 
     def forward(self, x: torch.Tensor):
