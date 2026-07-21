@@ -523,14 +523,9 @@ class TemporaryPlanner(BaselinePlanner):
             "architecture": {
                 "arch_kwargs": {
                     "se": {
-                        "enabled": True,
+                        "enabled": [True, True, False, False],
                         "placement": "end",
-                        "grid_size": [
-                            [6, 6, 6],
-                            [3, 3, 3],
-                            [1, 1, 1],
-                            [1, 1, 1],
-                        ],
+                        "grid_size": [[6, 6, 6], [3, 3, 3], None, None],
                     },
                     "cc": {
                         "enabled": True,
@@ -544,41 +539,7 @@ class TemporaryPlanner(BaselinePlanner):
                     },
                 },
             },
-        },
-        "4x-m_tse-6-3-1-1": {
-            "inherits_from": "4x-m",
-            "architecture": {
-                "arch_kwargs": {
-                    "se": {
-                        "enabled": True,
-                        "placement": "end",
-                        "grid_size": [
-                            [6, 6, 6],
-                            [3, 3, 3],
-                            [1, 1, 1],
-                            [1, 1, 1],
-                        ],
-                    },
-                },
-            },
-        },
-        "4x-m_tcc-6-3-1-1": {
-            "inherits_from": "4x-m",
-            "architecture": {
-                "arch_kwargs": {
-                    "cc": {
-                        "enabled": True,
-                        "num_experts": 4,
-                        "grid_size": [
-                            [6, 6, 6],
-                            [3, 3, 3],
-                            [1, 1, 1],
-                            [1, 1, 1],
-                        ],
-                    },
-                },
-            },
-        },
+        }
     }
 
     def _additional_configurations(self) -> dict:
