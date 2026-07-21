@@ -141,14 +141,16 @@ def test_router_is_bottlenecked_and_zero_initialized():
     torch.testing.assert_close(logits, torch.zeros_like(logits))
 
 
-def test_global_router_returns_raw_logits_without_pooling_ops(monkeypatch):
+def test_global_router_uses_adaptive_average_pooling(monkeypatch):
     router = Router(3, 3, grid_size=None, reduction=2, nonlin=nn.ReLU)
+    adaptive_avg_pool2d = torch.nn.functional.adaptive_avg_pool2d
+    calls = []
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("routing should use reshaping and torch.mean")
+    def record_call(x, output_size):
+        calls.append(output_size)
+        return adaptive_avg_pool2d(x, output_size)
 
-    monkeypatch.setattr(torch.nn.functional, "avg_pool2d", fail_if_called)
-    monkeypatch.setattr(torch.nn.functional, "adaptive_avg_pool2d", fail_if_called)
+    monkeypatch.setattr(torch.nn.functional, "adaptive_avg_pool2d", record_call)
     with torch.no_grad():
         router.output_projection.weight.zero_()
         router.output_projection.bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
@@ -157,61 +159,31 @@ def test_global_router_returns_raw_logits_without_pooling_ops(monkeypatch):
     torch.testing.assert_close(
         actual, torch.tensor([-2.0, 0.0, 2.0]).expand(2, 1, 1, -1)
     )
+    assert calls == [(1, 1)]
 
 
-def test_router_uses_reshaped_means_for_tile_descriptors(monkeypatch):
+def test_router_uses_fixed_average_pooling_for_tile_descriptors(monkeypatch):
     router = Router(2, 3, grid_size=(2, 3), reduction=2, nonlin=nn.ReLU)
     descriptors = []
     handle = router.input_projection.register_forward_pre_hook(
         lambda _module, inputs: descriptors.append(inputs[0].detach().clone())
     )
     x = torch.arange(48, dtype=torch.float32).reshape(1, 2, 4, 6)
+    avg_pool2d = torch.nn.functional.avg_pool2d
+    calls = []
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("tiled routing should not use pooling operators")
+    def record_call(x, kernel_size, stride):
+        calls.append((kernel_size, stride))
+        return avg_pool2d(x, kernel_size=kernel_size, stride=stride)
 
-    monkeypatch.setattr(torch.nn.functional, "avg_pool2d", fail_if_called)
-    monkeypatch.setattr(torch.nn.functional, "adaptive_avg_pool2d", fail_if_called)
+    monkeypatch.setattr(torch.nn.functional, "avg_pool2d", record_call)
     try:
         router(x)
     finally:
         handle.remove()
-    expected = x.reshape(1, 2, 2, 2, 3, 2).mean(dim=(3, 5)).movedim(1, -1)
+    expected = avg_pool2d(x, kernel_size=(2, 2), stride=(2, 2)).movedim(1, -1)
     torch.testing.assert_close(descriptors[0], expected)
-
-
-def test_router_can_include_population_standard_deviation():
-    router = Router(2, 3, grid_size=(2, 3), reduction=2, include_std=True)
-    descriptors = []
-    handle = router.input_projection.register_forward_pre_hook(
-        lambda _module, inputs: descriptors.append(inputs[0].detach().clone())
-    )
-    x = torch.arange(48, dtype=torch.float32).reshape(1, 2, 4, 6)
-    try:
-        router(x)
-    finally:
-        handle.remove()
-
-    tiled = x.reshape(1, 2, 2, 2, 3, 2)
-    std, mean = torch.std_mean(tiled, dim=(3, 5), correction=0)
-    expected = torch.cat((mean, std), dim=1).movedim(1, -1)
-    assert router.input_projection.in_features == 4
-    assert router.hidden_channels == 1
-    torch.testing.assert_close(descriptors[0], expected)
-
-
-def test_router_population_std_is_finite_for_single_voxel_windows():
-    router = Router(2, 1, grid_size=(2, 3), include_std=True)
-    descriptors = []
-    handle = router.input_projection.register_forward_pre_hook(
-        lambda _module, inputs: descriptors.append(inputs[0].detach().clone())
-    )
-    try:
-        router(torch.randn(1, 2, 2, 3))
-    finally:
-        handle.remove()
-    assert torch.isfinite(descriptors[0]).all()
-    torch.testing.assert_close(descriptors[0][..., 2:], torch.zeros_like(descriptors[0][..., 2:]))
+    assert calls == [((2, 2), (2, 2))]
 
 
 def test_each_cc_block_has_an_independent_router():
@@ -641,20 +613,6 @@ def test_cc_router_settings_are_propagated():
     assert block.router.nonlin.inplace
 
 
-def test_include_std_is_propagated_to_cc_and_se_routers():
-    model = _small_model(
-        cc={"enabled": [[True], [False, False], [False]], "num_experts": 2, "include_std": True},
-        se={"enabled": [[True], [False, False], [False]], "include_std": True},
-    )
-    block = model.encoder.stages[0].blocks[0]
-    assert block.router.include_std
-    assert block.router.input_projection.in_features == 16
-    assert block.router.hidden_channels == 1
-    assert block.se.router.include_std
-    assert block.se.router.input_projection.in_features == 48
-    assert block.se.router.hidden_channels == 3
-
-
 def test_encoder_stochastic_depth_uses_eligible_block_schedule():
     model = _small_model(
         encoder_n_blocks_per_stage=[3, 2, 1],
@@ -728,11 +686,17 @@ def test_removed_top_level_architecture_keys_are_rejected(obsolete_key):
         "decoder_rank",
         "encoder_num_groups",
         "decoder_num_groups",
+        "include_std",
     ],
 )
 def test_removed_cc_keys_are_rejected(obsolete_key):
     with pytest.raises(TypeError, match=obsolete_key):
         _small_model(cc={obsolete_key: None})
+
+
+def test_removed_se_include_std_is_rejected():
+    with pytest.raises(TypeError, match="include_std"):
+        _small_model(se={"include_std": False})
 
 
 def test_public_config_and_model_signatures_exclude_removed_parameters():
@@ -742,20 +706,16 @@ def test_public_config_and_model_signatures_exclude_removed_parameters():
         "num_experts",
         "grid_size",
         "reduction",
-        "include_std",
     }
     se_fields = set(SEConfig.__dataclass_fields__)
     assert se_fields == {
         "enabled",
         "grid_size",
         "reduction",
-        "include_std",
         "placement",
     }
     assert CCConfig().grid_size is None
     assert SEConfig().grid_size is None
-    assert not CCConfig().include_std
-    assert not SEConfig().include_std
     assert SEConfig().placement == "middle"
     model_parameters = inspect.signature(CondUNet).parameters
     assert "se" in model_parameters
@@ -800,7 +760,6 @@ def test_cc_requires_experts_when_enabled():
     [
         ({"reduction": 0.5}, "reduction"),
         ({"reduction": float("inf")}, "reduction"),
-        ({"include_std": 1}, "include_std"),
     ],
 )
 def test_cc_router_settings_are_validated(config, error):
@@ -813,7 +772,6 @@ def test_cc_router_settings_are_validated(config, error):
     [
         ({"reduction": 0.5}, "reduction"),
         ({"reduction": float("inf")}, "reduction"),
-        ({"include_std": 1}, "include_std"),
     ],
 )
 def test_se_settings_are_validated(config, error):

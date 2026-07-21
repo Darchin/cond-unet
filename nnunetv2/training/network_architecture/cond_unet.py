@@ -47,19 +47,15 @@ class CCConfig:
         grid_size: Routing grid shape shared by all encoder stages or one grid
             shape per encoder stage.
         reduction: Reduction factor for the router MLP hidden width.
-        include_std: Include each routing window's standard deviation in its
-            descriptor.
     """
 
     enabled: BoolConfig = False
     num_experts: IntConfig = 0
     grid_size: GridConfig = None
     reduction: float = 8.0
-    include_std: bool = False
 
     def __post_init__(self):
         self.reduction = _validate_reduction(self.reduction, "cc.reduction")
-        self.include_std = _validate_bool(self.include_std, "cc.include_std")
 
     @classmethod
     def from_dict(cls, d: dict) -> "CCConfig":
@@ -78,8 +74,6 @@ class SEConfig:
         grid_size: SE grid shape shared by all encoder stages or one
             explicit grid shape (or None) per encoder stage.
         reduction: Reduction factor for the SE MLP hidden width.
-        include_std: Include each SE window's standard deviation in its
-            descriptor.
         placement: Position of enabled SE blocks within each inverted bottleneck.
             Must be ``"start"``, ``"middle"``, or ``"end"``.
     """
@@ -87,12 +81,10 @@ class SEConfig:
     enabled: BoolConfig = False
     grid_size: GridConfig = None
     reduction: float = 8.0
-    include_std: bool = False
     placement: str = "middle"
 
     def __post_init__(self):
         self.reduction = _validate_reduction(self.reduction, "se.reduction")
-        self.include_std = _validate_bool(self.include_std, "se.include_std")
         self.placement = _validate_se_placement(self.placement)
 
     @classmethod
@@ -322,8 +314,24 @@ def _conv_output_shape(
     ]
 
 
+def _pool_to_grid(x: torch.Tensor, grid_size: Sequence[int]) -> torch.Tensor:
+    """Pool globally with adaptive pooling or tiled with fixed windows."""
+    spatial_dims = x.ndim - 2
+    if tuple(grid_size) == (1,) * spatial_dims:
+        adaptive_avg_pool = (
+            F.adaptive_avg_pool1d,
+            F.adaptive_avg_pool2d,
+            F.adaptive_avg_pool3d,
+        )[spatial_dims - 1]
+        return adaptive_avg_pool(x, grid_size)
+
+    tile_size = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
+    avg_pool = (F.avg_pool1d, F.avg_pool2d, F.avg_pool3d)[spatial_dims - 1]
+    return avg_pool(x, kernel_size=tile_size, stride=tile_size)
+
+
 class Router(nn.Module):
-    """Window descriptor pooling followed by a bottleneck MLP."""
+    """Average-pooling window descriptors followed by a bottleneck MLP."""
 
     def __init__(
         self,
@@ -331,7 +339,6 @@ class Router(nn.Module):
         output_channels: int,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
-        include_std: bool = False,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
     ):
@@ -344,10 +351,8 @@ class Router(nn.Module):
         self.input_channels = input_channels
         self.output_channels = output_channels
         self.grid_size = grid_size
-        self.include_std = _validate_bool(include_std, "include_std")
         self.hidden_channels = max(1, int(input_channels / reduction))
-        descriptor_channels = input_channels * (2 if include_std else 1)
-        self.input_projection = nn.Linear(descriptor_channels, self.hidden_channels)
+        self.input_projection = nn.Linear(input_channels, self.hidden_channels)
         self.nonlin = (
             nonlin(**({} if nonlin_kwargs is None else nonlin_kwargs))
             if nonlin is not None
@@ -384,18 +389,7 @@ class Router(nn.Module):
                 f"input spatial shape {tuple(x.shape[2:])} must be divisible by routing grid {grid_size}"
             )
 
-        tile_size = tuple(size // grid for size, grid in zip(x.shape[2:], grid_size))
-        tiled_shape = [x.shape[0], x.shape[1]]
-        for grid, tile in zip(grid_size, tile_size):
-            tiled_shape.extend((grid, tile))
-        tiled = x.reshape(tiled_shape)
-        tile_axes = tuple(range(3, tiled.ndim, 2))
-        if self.include_std:
-            std, mean = torch.std_mean(tiled, dim=tile_axes, correction=0)
-            descriptor = torch.cat((mean, std), dim=1)
-        else:
-            descriptor = torch.mean(tiled, dim=tile_axes)
-        descriptor = descriptor.movedim(1, -1)
+        descriptor = _pool_to_grid(x, grid_size).movedim(1, -1)
         return self.output_projection(self.nonlin(self.input_projection(descriptor)))
 
 
@@ -407,7 +401,6 @@ class SqueezeExcitation(nn.Module):
         input_channels: int,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
-        include_std: bool = False,
         nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
     ):
@@ -419,7 +412,6 @@ class SqueezeExcitation(nn.Module):
             input_channels,
             grid_size=grid_size,
             reduction=reduction,
-            include_std=include_std,
             nonlin=nonlin,
             nonlin_kwargs=nonlin_kwargs,
         )
@@ -883,11 +875,9 @@ class InvertedBottleneckBlock(nn.Module):
         cc: bool = False,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
-        cc_include_std: bool = False,
         se: bool = False,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
-        se_include_std: bool = False,
         se_placement: str = "middle",
         drop_rate: float = 0.0,
     ):
@@ -968,7 +958,6 @@ class InvertedBottleneckBlock(nn.Module):
                 num_experts,
                 grid_size=grid_size,
                 reduction=reduction,
-                include_std=cc_include_std,
                 nonlin=nonlin,
                 nonlin_kwargs=nonlin_kwargs,
             )
@@ -985,7 +974,6 @@ class InvertedBottleneckBlock(nn.Module):
                 se_channels,
                 grid_size=se_grid_size,
                 reduction=se_reduction,
-                include_std=se_include_std,
                 nonlin=nonlin,
                 nonlin_kwargs=nonlin_kwargs,
             )
@@ -1058,11 +1046,9 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
         cc_config: List[bool] = None,
         grid_size: Optional[Sequence[int]] = None,
         reduction: float = 8.0,
-        cc_include_std: bool = False,
         se_config: List[bool] = None,
         se_grid_size: Optional[Sequence[int]] = None,
         se_reduction: float = 8.0,
-        se_include_std: bool = False,
         se_placement: str = "middle",
         drop_rates: Optional[Sequence[float]] = None,
     ):
@@ -1118,11 +1104,9 @@ class StackedCondInvertedBottleneckBlocks(nn.Module):
                 cc=block_cc,
                 grid_size=grid_size,
                 reduction=reduction,
-                cc_include_std=cc_include_std,
                 se=block_se,
                 se_grid_size=se_grid_size,
                 se_reduction=se_reduction,
-                se_include_std=se_include_std,
                 se_placement=se_placement,
                 drop_rate=drop_rates[block_idx],
             )
@@ -1184,11 +1168,9 @@ class CondUNetEncoder(nn.Module):
         cc: BoolConfig = False,
         cc_grid_size: GridConfig = None,
         cc_reduction: float = 8.0,
-        cc_include_std: bool = False,
         se: BoolConfig = False,
         se_grid_size: GridConfig = None,
         se_reduction: float = 8.0,
-        se_include_std: bool = False,
         se_placement: str = "middle",
         drop_rate: float = 0.0,
     ):
@@ -1310,11 +1292,9 @@ class CondUNetEncoder(nn.Module):
                     cc_config=list(settings.cc_blocks),
                     grid_size=settings.grid_size,
                     reduction=cc_reduction,
-                    cc_include_std=cc_include_std,
                     se_config=list(settings.se_blocks),
                     se_grid_size=settings.se_grid_size,
                     se_reduction=se_reduction,
-                    se_include_std=se_include_std,
                     se_placement=se_placement,
                     drop_rates=stage_drop_rates[stage_idx],
                 )
@@ -1556,11 +1536,9 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
             cc=cc.enabled,
             cc_grid_size=cc.grid_size,
             cc_reduction=cc.reduction,
-            cc_include_std=cc.include_std,
             se=se.enabled,
             se_grid_size=se.grid_size,
             se_reduction=se.reduction,
-            se_include_std=se.include_std,
             se_placement=se.placement,
             drop_rate=drop_rate,
         )
