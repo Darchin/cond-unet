@@ -9,6 +9,7 @@ from nnunetv2.training.network_architecture.cond_unet import (
     CCConfig,
     CondPWConv,
     CondUNet,
+    GroupNorm,
     Router,
     SEConfig,
     SqueezeExcitation,
@@ -368,6 +369,20 @@ def test_provided_normalization_is_used_throughout_model():
     assert all(isinstance(norm, nn.BatchNorm2d) for norm in norms)
     assert all(norm.eps == pytest.approx(1e-3) for norm in norms)
     assert all(norm.momentum == pytest.approx(0.2) for norm in norms)
+    model(torch.randn(1, 1, 32, 32))
+
+
+def test_group_norm_wrapper_accepts_num_channels_first():
+    norm = GroupNorm(16, num_groups=4, eps=1e-3, affine=False)
+
+    assert isinstance(norm, nn.GroupNorm)
+    assert norm.num_channels == 16
+    assert norm.num_groups == 4
+    assert norm.eps == pytest.approx(1e-3)
+    assert not norm.affine
+
+    model = _small_model(norm_op=GroupNorm, norm_op_kwargs={"num_groups": 4})
+    assert isinstance(model.encoder.stem.convs[0].norm, GroupNorm)
     model(torch.randn(1, 1, 32, 32))
 
 

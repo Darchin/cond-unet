@@ -36,24 +36,19 @@ GridConfig = Union[
 ]
 
 
-def _group_norm(num_channels: int, **_ignored_kwargs) -> nn.GroupNorm:
-    """Build GroupNorm with the largest valid group count for ``num_channels``."""
-    max_groups = min(32, num_channels // 8)
-    if max_groups < 1:
-        raise ValueError(
-            f"GroupNorm requires at least 8 channels, got {num_channels}"
-        )
-    num_groups = next(
-        groups
-        for groups in range(max_groups, 0, -1)
-        if num_channels % groups == 0
-    )
-    return nn.GroupNorm(
-        num_groups=num_groups,
-        num_channels=num_channels,
-        eps=1e-5,
-        affine=True,
-    )
+class GroupNorm(nn.GroupNorm):
+    """GroupNorm with ``num_channels`` first for generic norm construction."""
+
+    def __init__(
+        self,
+        num_channels: int,
+        num_groups: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(num_groups, num_channels, eps, affine, device, dtype)
 
 
 @dataclass
@@ -1530,12 +1525,6 @@ class CondUNet(AbstractDynamicNetworkArchitectures):
         stem = _normalize_config(stem, StemConfig)
         cc = _normalize_config(cc, CCConfig)
         se = _normalize_config(se, SEConfig)
-
-        # CondUNet deliberately uses dynamic GroupNorm throughout. Keep the
-        # norm arguments in the public signature for plan compatibility, but
-        # ignore their values.
-        norm_op = _group_norm
-        norm_op_kwargs = {}
 
         self.encoder = CondUNetEncoder(
             input_channels=input_channels,
