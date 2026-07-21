@@ -515,3 +515,73 @@ class BaselinePlanner(CondUNetPlanner):
             name: self._configuration(preset) for name, preset in self._presets.items()
         }
 
+
+class TemporaryPlanner(BaselinePlanner):
+    _temporary_configurations = {
+        "4x-m_tcc_tse-6-3-1-1": {
+            "inherits_from": "4x-m",
+            "architecture": {
+                "arch_kwargs": {
+                    "se": {
+                        "encoder": True,
+                        "placement": "end",
+                        "encoder_grid_size": [
+                            [6, 6, 6],
+                            [3, 3, 3],
+                            [1, 1, 1],
+                            [1, 1, 1],
+                        ],
+                    },
+                    "cc": {
+                        "encoder": True,
+                        "encoder_num_experts": 4,
+                        "encoder_grid_size": [
+                            [6, 6, 6],
+                            [3, 3, 3],
+                            [1, 1, 1],
+                            [1, 1, 1],
+                        ],
+                    },
+                },
+            },
+        },
+        "4x-m_tse-6-3-1-1": {
+            "inherits_from": "4x-m",
+            "architecture": {
+                "arch_kwargs": {
+                    "se": {
+                        "encoder": True,
+                        "placement": "end",
+                        "encoder_grid_size": [
+                            [6, 6, 6],
+                            [3, 3, 3],
+                            [1, 1, 1],
+                            [1, 1, 1],
+                        ],
+                    },
+                },
+            },
+        },
+        "4x-m_tcc-6-3-1-1": {
+            "inherits_from": "4x-m",
+            "architecture": {
+                "arch_kwargs": {
+                    "cc": {
+                        "encoder": True,
+                        "encoder_num_experts": 4,
+                        "encoder_grid_size": [
+                            [6, 6, 6],
+                            [3, 3, 3],
+                            [1, 1, 1],
+                            [1, 1, 1],
+                        ],
+                    },
+                },
+            },
+        },
+    }
+
+    def _additional_configurations(self) -> dict:
+        configurations = super()._additional_configurations()
+        configurations.update(deepcopy(self._temporary_configurations))
+        return configurations
