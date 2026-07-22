@@ -517,30 +517,79 @@ class BaselinePlanner(CondUNetPlanner):
 
 
 class TemporaryPlanner(BaselinePlanner):
-    _temporary_configurations = {
-        "4x-m_tcc_tse-6-3-1-1_dp-0.2": {
-            "inherits_from": "4x-m",
-            "architecture": {
-                "arch_kwargs": {
-                    "se": {
-                        "enabled": [True, True, False, False],
-                        "placement": "end",
-                        "grid_size": [[6, 6, 6], [3, 3, 3], None, None],
-                    },
-                    "cc": {
-                        "enabled": True,
-                        "num_experts": 4,
-                        "grid_size": [
-                            [6, 6, 6],
-                            [3, 3, 3],
-                            [1, 1, 1],
-                            [1, 1, 1],
-                        ],
-                    },
-                    "drop_rate": 0.2
+    _temporary_configurations = {}
+
+    _temporary_configurations["4x-m_tcc_tse-6-3-1-1"] = {
+        "inherits_from": "4x-m",
+        "architecture": {
+            "arch_kwargs": {
+                "se": {
+                    "enabled": [True, True, False, False],
+                    "placement": "end",
+                    "grid_size": [[6, 6, 6], [3, 3, 3], None, None],
+                },
+                "cc": {
+                    "enabled": True,
+                    "num_experts": 4,
+                    "grid_size": [
+                        [6, 6, 6],
+                        [3, 3, 3],
+                        [1, 1, 1],
+                        [1, 1, 1],
+                    ],
                 },
             },
-        }
+        },
+    }
+
+    _temporary_configurations["4x-m_tcc_tse-6-3-1-1_dp-0.1"] = {
+        "inherits_from": "4x-m_tcc_tse-6-3-1-1",
+        "architecture": {
+            "arch_kwargs": {"drop_rate": 0.1},
+        },
+    }
+
+    _temporary_configurations["4x-m_tcc_tse-6-3-1-1_dp-0.3"] = {
+        "inherits_from": "4x-m_tcc_tse-6-3-1-1",
+        "architecture": {
+            "arch_kwargs": {"drop_rate": 0.3},
+        },
+    }
+
+    _temporary_configurations["4x-m_tcc_tse-3-3-3-3"] = {
+        "inherits_from": "4x-m",
+        "architecture": {
+            "arch_kwargs": {
+                "se": {
+                    "enabled": True,
+                    "placement": "end",
+                    "grid_size": [3, 3, 3],
+                },
+                "cc": {
+                    "enabled": True,
+                    "num_experts": 4,
+                    "grid_size": [3, 3, 3],
+                },
+            },
+        },
+    }
+
+    _temporary_configurations["4x-m_gcc_tse-6-6-6-6"] = {
+        "inherits_from": "4x-m",
+        "architecture": {
+            "arch_kwargs": {
+                "se": {
+                    "enabled": True,
+                    "placement": "end",
+                    "grid_size": [6, 6, 6],
+                },
+                "cc": {
+                    "enabled": True,
+                    "num_experts": 4,
+                    "grid_size": [1, 1, 1],
+                },
+            },
+        },
     }
 
     def _additional_configurations(self) -> dict:
