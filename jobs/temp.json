@@ -5,10 +5,10 @@
             "4x-m_cc-e4-g1-r8",
             "4x-m_cc-e4-g1-std",
             "4x-m_cc-e4-g8",
-            "4x-m_cc-e4-g1-edp0.15",
-            "4x-m_cc-e4-g1-edp0.15-annealed",
-            "4x-m_cc-e4-g1_dp0.15",
-            "4x-m_cc-e4-g1_pdp0.15"
+            "4x-m_cc-e4-g1-edp0.1",
+            "4x-m_cc-e4-g1-edp0.1-annealed",
+            "4x-m_cc-e4-g1_dp0.1",
+            "4x-m_cc-e4-g1_pdp0.1"
         ],
         "folds": [
             0

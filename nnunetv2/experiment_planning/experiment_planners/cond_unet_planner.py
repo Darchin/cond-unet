@@ -558,40 +558,40 @@ class TemporaryPlanner(BaselinePlanner):
         },
     }
 
-    _temporary_configurations["4x-m_cc-e4-g1-edp0.15"] = {
+    _temporary_configurations["4x-m_cc-e4-g1-edp0.1"] = {
         "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "cc": {"expert_dropout": 0.15},
+                "cc": {"expert_dropout": 0.1},
             },
         },
     }
 
-    _temporary_configurations["4x-m_cc-e4-g1-edp0.15-annealed"] = {
+    _temporary_configurations["4x-m_cc-e4-g1-edp0.1-annealed"] = {
         "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "cc": {"expert_dropout": 0.15},
+                "cc": {"expert_dropout": 0.1},
             },
         },
         "trainer": {"expert_dropout_anneal_epochs": 50},
     }
 
-    _temporary_configurations["4x-m_cc-e4-g1_dp0.15"] = {
+    _temporary_configurations["4x-m_cc-e4-g1_dp0.1"] = {
         "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
                 "dropout_op": "torch.nn.Dropout3d",
-                "dropout_op_kwargs": {"inplace": False, "p": 0.15},
+                "dropout_op_kwargs": {"inplace": False, "p": 0.1},
             },
         },
     }
     
-    _temporary_configurations["4x-m_cc-e4-g1_pdp0.15"] = {
+    _temporary_configurations["4x-m_cc-e4-g1_pdp0.1"] = {
         "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "drop_rate": 0.15
+                "drop_rate": 0.1
             },
         },
     }
