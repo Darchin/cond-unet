@@ -574,7 +574,7 @@ class TemporaryPlanner(BaselinePlanner):
                 "cc": {"expert_dropout": 0.1},
             },
         },
-        "trainer": {"expert_dropout_anneal_epochs": 50},
+        "trainer": {"expert_dropout_anneal_epochs": 25},
     }
 
     _temporary_configurations["4x-m_cc-e4-g1_dp0.1"] = {
