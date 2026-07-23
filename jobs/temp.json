@@ -1,8 +1,14 @@
 [
     {
         "configs": [
-            "4x-m_tcc_tse-8-4-2-1_dp-0.2",
-            "4x-m_tcc_tse-3-3-3-3_dp-0.2"
+            "4x-m_cc-e4-g1",
+            "4x-m_cc-e4-g1-r8",
+            "4x-m_cc-e4-g1-std",
+            "4x-m_cc-e4-g8",
+            "4x-m_cc-e4-g1-edp0.15",
+            "4x-m_cc-e4-g1-edp0.15-annealed",
+            "4x-m_cc-e4-g1_dp0.15",
+            "4x-m_cc-e4-g1_pdp0.15"
         ],
         "folds": [
             0

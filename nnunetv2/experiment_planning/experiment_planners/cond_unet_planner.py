@@ -519,79 +519,79 @@ class BaselinePlanner(CondUNetPlanner):
 class TemporaryPlanner(BaselinePlanner):
     _temporary_configurations = {}
 
-    _temporary_configurations["4x-m_tcc_tse-8-4-2-1_dp-0.2"] = {
+    _temporary_configurations["4x-m_cc-e4-g1"] = {
         "inherits_from": "4x-m",
         "architecture": {
             "arch_kwargs": {
-                "se": {
-                    "enabled": [True, True, True, False],
-                    "placement": "end",
-                    "grid_size": [[8, 8, 8], [4, 4, 4], [2, 2, 2], None],
-                },
                 "cc": {
                     "enabled": True,
                     "num_experts": 4,
-                    "grid_size": [
-                        [8, 8, 8],
-                        [4, 4, 4],
-                        [2, 2, 2],
-                        [1, 1, 1],
-                    ],
                 },
-                "drop_rate": 0.2,
             },
         },
     }
 
-    _temporary_configurations["4x-m_tcc_tse-3-3-3-3_dp-0.2"] = {
-        "inherits_from": "4x-m",
+    _temporary_configurations["4x-m_cc-e4-g1-r8"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "se": {
-                    "enabled": True,
-                    "placement": "end",
-                    "grid_size": [3, 3, 3],
-                },
-                "cc": {
-                    "enabled": True,
-                    "num_experts": 4,
-                    "grid_size": [3, 3, 3],
-                },
-                "drop_rate": 0.2,
+                "cc": {"reduction": 8.0},
             },
         },
     }
 
-    _temporary_configurations["4x-m_gcc_tse-6-6-6-6_dp-0.2"] = {
-        "inherits_from": "4x-m",
+    _temporary_configurations["4x-m_cc-e4-g1-std"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "se": {
-                    "enabled": True,
-                    "placement": "end",
-                    "grid_size": [6, 6, 6],
-                },
-                "cc": {"enabled": True, "num_experts": 4},
-                "drop_rate": 0.2,
+                "cc": {"use_std": True},
             },
         },
     }
 
-    _temporary_configurations["4x-m_gcc_dp-0.2"] = {
-        "inherits_from": "4x-m",
+    _temporary_configurations["4x-m_cc-e4-g8"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "cc": {"enabled": True, "num_experts": 4},
-                "drop_rate": 0.2,
+                "cc": {"num_groups": 8},
             },
         },
     }
 
-    _temporary_configurations["4x-m_dp-0.2"] = {
-        "inherits_from": "4x-m",
+    _temporary_configurations["4x-m_cc-e4-g1-edp0.15"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
         "architecture": {
             "arch_kwargs": {
-                "drop_rate": 0.2,
+                "cc": {"expert_dropout": 0.15},
+            },
+        },
+    }
+
+    _temporary_configurations["4x-m_cc-e4-g1-edp0.15-annealed"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
+        "architecture": {
+            "arch_kwargs": {
+                "cc": {"expert_dropout": 0.15},
+            },
+        },
+        "trainer": {"expert_dropout_anneal_epochs": 50},
+    }
+
+    _temporary_configurations["4x-m_cc-e4-g1_dp0.15"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
+        "architecture": {
+            "arch_kwargs": {
+                "dropout_op": "torch.nn.Dropout3d",
+                "dropout_op_kwargs": {"inplace": True, "p": 0.15},
+            },
+        },
+    }
+    
+    _temporary_configurations["4x-m_cc-e4-g1_pdp0.15"] = {
+        "inherits_from": "4x-m_cc-e4-g1",
+        "architecture": {
+            "arch_kwargs": {
+                "drop_rate": 0.15
             },
         },
     }

@@ -3,6 +3,7 @@ import math
 import torch
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.network_architecture.cond_unet import Router
 
 
 class LinearWarmupCosineAnnealingLR:
@@ -49,6 +50,7 @@ class nnUNetTrainerAdamW(nnUNetTrainer):
         'warmup_epochs',
         'min_lr',
         'enable_deep_supervision',
+        'expert_dropout_anneal_epochs',
     }
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -61,6 +63,7 @@ class nnUNetTrainerAdamW(nnUNetTrainer):
         self.warmup_epochs = 5
         self.min_lr = 1e-6
         self.enable_deep_supervision = False
+        self.expert_dropout_anneal_epochs = None
         self._apply_trainer_configuration()
 
     @staticmethod
@@ -113,6 +116,16 @@ class nnUNetTrainerAdamW(nnUNetTrainer):
                     f"{type(trainer_config['enable_deep_supervision']).__name__}"
                 )
             self.enable_deep_supervision = trainer_config['enable_deep_supervision']
+        if 'expert_dropout_anneal_epochs' in trainer_config:
+            value = trainer_config['expert_dropout_anneal_epochs']
+            if value is not None:
+                value = self._require_int(value, 'expert_dropout_anneal_epochs')
+                if value <= 0:
+                    raise ValueError(
+                        "trainer.expert_dropout_anneal_epochs must be a positive "
+                        f"integer or None, got {value}"
+                    )
+            self.expert_dropout_anneal_epochs = value
 
         if self.warmup_epochs < 2:
             raise ValueError(
@@ -132,3 +145,18 @@ class nnUNetTrainerAdamW(nnUNetTrainer):
             optimizer, self.initial_lr, self.warmup_epochs, self.num_epochs, self.min_lr
         )
         return optimizer, lr_scheduler
+
+    def _update_expert_dropout(self) -> None:
+        if self.expert_dropout_anneal_epochs is None:
+            return
+        factor = max(
+            0.0,
+            1.0 - self.current_epoch / self.expert_dropout_anneal_epochs,
+        )
+        for module in self.network.modules():
+            if isinstance(module, Router):
+                module.set_expert_dropout(module.expert_dropout * factor)
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        self._update_expert_dropout()
