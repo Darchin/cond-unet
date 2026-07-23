@@ -76,20 +76,25 @@ def _explicit_grouped_condconv(
 
 
 @pytest.mark.parametrize(
-    ("group_axis", "in_channels", "out_channels"),
-    [("output", 4, 6), ("input", 6, 4)],
+    ("group_axis", "in_channels", "out_channels", "num_groups"),
+    [
+        ("output", 4, 6, 1),
+        ("input", 6, 4, 1),
+        ("output", 4, 6, 2),
+        ("input", 6, 4, 2),
+    ],
 )
 def test_condpwconv_matches_explicit_grouped_mixture(
-    group_axis, in_channels, out_channels
+    group_axis, in_channels, out_channels, num_groups
 ):
     layer = CondPWConv(
         nn.Conv2d(in_channels, out_channels, 1, bias=False),
         num_experts=3,
-        num_groups=2,
+        num_groups=num_groups,
         group_axis=group_axis,
     )
     x = torch.randn(2, in_channels, 5, 7, requires_grad=True)
-    scores = torch.softmax(torch.randn(2, 2, 3), dim=-1)
+    scores = torch.softmax(torch.randn(2, num_groups, 3), dim=-1)
 
     actual = layer(x, scores)
     expected = _explicit_grouped_condconv(layer, x, scores)
