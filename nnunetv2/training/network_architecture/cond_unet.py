@@ -367,15 +367,37 @@ class Router(nn.Module):
         return torch.mean(x, dim=spatial_dims)
 
     def _drop_experts(self, scores: torch.Tensor) -> torch.Tensor:
-        if not self.training:
+        if not self.training or self.expert_dropout == 0:
             return scores
-        keep_mask = torch.rand_like(scores) >= self._active_expert_dropout
-        invalid = ~keep_mask.any(dim=-1)
-        while invalid.any():
-            keep_mask[invalid] = (
-                torch.rand_like(scores[invalid]) >= self._active_expert_dropout
+
+        # Draw independent Bernoulli keep decisions conditioned on at least one
+        # expert being kept. This is the exact distribution produced by
+        # repeatedly rejecting all-dropped masks, without a data-dependent
+        # Python loop that forces torch.compile graph breaks.
+        drop_probability = self._active_expert_dropout.to(dtype=scores.dtype)
+        keep_probability = 1 - drop_probability
+        any_kept = torch.zeros(
+            scores.shape[:-1], dtype=torch.bool, device=scores.device
+        )
+        keep_decisions = []
+        for expert_idx in range(self.num_experts):
+            remaining_experts = self.num_experts - expert_idx
+            if remaining_experts == 1:
+                conditioned_keep_probability = torch.ones_like(keep_probability)
+            else:
+                conditioned_keep_probability = keep_probability / (
+                    1 - drop_probability.pow(remaining_experts)
+                )
+            current_keep_probability = torch.where(
+                any_kept, keep_probability, conditioned_keep_probability
             )
-            invalid = ~keep_mask.any(dim=-1)
+            keep = (
+                torch.rand_like(scores[..., expert_idx])
+                < current_keep_probability
+            )
+            keep_decisions.append(keep)
+            any_kept = any_kept | keep
+        keep_mask = torch.stack(keep_decisions, dim=-1)
         return scores * keep_mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -443,6 +465,9 @@ class CondPWConv(nn.Module):
             nn.init.kaiming_uniform_(expert_weight, a=math.sqrt(5))
 
     def _blend_experts(self, scores: torch.Tensor) -> torch.Tensor:
+        # Keep the small expert-axis reduction explicit. Inductor can fuse this
+        # form, while einsum lowers to progressively skinnier batched GEMMs as
+        # num_groups grows and makes their backward pass disproportionately slow.
         if self.group_axis == "output":
             weights = self.expert_weights.reshape(
                 self.num_experts,
@@ -450,7 +475,10 @@ class CondPWConv(nn.Module):
                 self.out_channels // self.num_groups,
                 self.in_channels,
             )
-            return torch.einsum("bgk,kgoi->bgoi", scores, weights).reshape(
+            grouped_weights = weights.permute(1, 0, 2, 3)
+            return (
+                scores[..., None, None] * grouped_weights[None]
+            ).sum(dim=2).reshape(
                 scores.shape[0], self.out_channels, self.in_channels
             )
         weights = self.expert_weights.reshape(
@@ -459,8 +487,12 @@ class CondPWConv(nn.Module):
             self.num_groups,
             self.in_channels // self.num_groups,
         )
-        return torch.einsum("bgk,kogj->bogj", scores, weights).reshape(
-            scores.shape[0], self.out_channels, self.in_channels
+        grouped_weights = weights.permute(2, 0, 1, 3)
+        return (
+            (scores[..., None, None] * grouped_weights[None])
+            .sum(dim=2)
+            .permute(0, 2, 1, 3)
+            .reshape(scores.shape[0], self.out_channels, self.in_channels)
         )
 
     def _validate_scores(self, x: torch.Tensor, scores: torch.Tensor) -> None:

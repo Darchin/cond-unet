@@ -582,7 +582,7 @@ class TemporaryPlanner(BaselinePlanner):
         "architecture": {
             "arch_kwargs": {
                 "dropout_op": "torch.nn.Dropout3d",
-                "dropout_op_kwargs": {"inplace": True, "p": 0.15},
+                "dropout_op_kwargs": {"inplace": False, "p": 0.15},
             },
         },
     }

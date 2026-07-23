@@ -193,6 +193,34 @@ def test_expert_dropout_is_groupwise_normalized_and_training_only():
     torch.testing.assert_close(scores, torch.full_like(scores, 0.2))
 
 
+@pytest.mark.parametrize("expert_dropout", [0.0, 0.5])
+def test_all_stage_cc_routing_has_no_torch_compile_graph_breaks(expert_dropout):
+    model = CondUNet(
+        input_channels=1,
+        n_stages=3,
+        features_per_stage=[4, 8, 16],
+        conv_op=nn.Conv2d,
+        kernel_sizes=3,
+        strides=[[1, 1], [2, 2], [2, 2]],
+        encoder_n_blocks_per_stage=[1, 1, 1],
+        num_classes=2,
+        decoder_n_blocks_per_stage=[1, 1],
+        norm_op=nn.InstanceNorm2d,
+        nonlin=nn.ReLU,
+        cc={
+            "enabled": True,
+            "num_experts": 4,
+            "expert_dropout": expert_dropout,
+        },
+    ).train()
+
+    explanation = torch._dynamo.explain(model)(torch.randn(2, 1, 16, 16))
+
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0
+    assert explanation.break_reasons == []
+
+
 @pytest.mark.parametrize("rate", [-0.1, 1.0, float("inf"), True])
 def test_expert_dropout_rejects_invalid_rates(rate):
     with pytest.raises(ValueError, match="expert_dropout"):
