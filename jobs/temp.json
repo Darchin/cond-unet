@@ -1,8 +1,8 @@
 [
     {
         "configs": [
-            "4x-m_dp-0.2",
-            "4x-m_gcc_dp-0.2"
+            "4x-m_tcc_tse-8-4-2-1_dp-0.2",
+            "4x-m_tcc_tse-3-3-3-3_dp-0.2"
         ],
         "folds": [
             0
